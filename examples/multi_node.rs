@@ -4,9 +4,14 @@
 use anyhow::Result;
 use kameo_remote::{ActorLocation, GossipConfig, GossipRegistryHandle, NodeId};
 use tokio::time::{sleep, Duration};
+use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::new("info"))
+        .init();
+
     println!("=== TCP Gossip Registry Multi-Node Demo ===\n");
 
     let config = GossipConfig::default();
