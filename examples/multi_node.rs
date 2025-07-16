@@ -2,7 +2,7 @@
 // Run with: cargo run --example multi_node
 
 use anyhow::Result;
-use kameo_remote::{ActorLocation, GossipConfig, GossipRegistryHandle, NodeId};
+use kameo_remote::{GossipConfig, GossipRegistryHandle, NodeId};
 use tokio::time::{sleep, Duration};
 use tracing_subscriber::EnvFilter;
 
@@ -31,20 +31,16 @@ async fn main() -> Result<()> {
     node1
         .register(
             "user_service".to_string(),
-            ActorLocation {
-                node_id: node1_id,
-                address: "127.0.0.1:9001".parse().unwrap(),
-            },
+            node1_id,
+            "127.0.0.1:9001".parse().unwrap(),
         )
         .await?;
 
     node1
         .register(
             "auth_service".to_string(),
-            ActorLocation {
-                node_id: node1_id,
-                address: "127.0.0.1:9002".parse().unwrap(),
-            },
+            node1_id,
+            "127.0.0.1:9002".parse().unwrap(),
         )
         .await?;
 
@@ -67,20 +63,16 @@ async fn main() -> Result<()> {
     node2
         .register(
             "payment_service".to_string(),
-            ActorLocation {
-                node_id: node2_id,
-                address: "127.0.0.1:9003".parse().unwrap(),
-            },
+            node2_id,
+            "127.0.0.1:9003".parse().unwrap(),
         )
         .await?;
 
     node2
         .register(
             "notification_service".to_string(),
-            ActorLocation {
-                node_id: node2_id,
-                address: "127.0.0.1:9004".parse().unwrap(),
-            },
+            node2_id,
+            "127.0.0.1:9004".parse().unwrap(),
         )
         .await?;
 
@@ -103,20 +95,16 @@ async fn main() -> Result<()> {
     node3
         .register(
             "order_service".to_string(),
-            ActorLocation {
-                node_id: node3_id,
-                address: "127.0.0.1:9005".parse().unwrap(),
-            },
+            node3_id,
+            "127.0.0.1:9005".parse().unwrap(),
         )
         .await?;
 
     node3
         .register(
             "inventory_service".to_string(),
-            ActorLocation {
-                node_id: node3_id,
-                address: "127.0.0.1:9006".parse().unwrap(),
-            },
+            node3_id,
+            "127.0.0.1:9006".parse().unwrap(),
         )
         .await?;
 
