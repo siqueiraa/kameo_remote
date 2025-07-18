@@ -98,7 +98,7 @@ impl Default for GossipConfig {
             small_cluster_threshold: DEFAULT_SMALL_CLUSTER_THRESHOLD,
             bootstrap_readiness_timeout: Duration::from_secs(30),
             bootstrap_readiness_check_interval: Duration::from_millis(100),
-            bootstrap_max_retries: 5,  // Increased from 3 to handle startup race conditions
+            bootstrap_max_retries: 5, // Increased from 3 to handle startup race conditions
             bootstrap_retry_delay: Duration::from_secs(5),
             immediate_propagation_enabled: true,
             urgent_gossip_fanout: 5,
@@ -116,7 +116,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = GossipConfig::default();
-        
+
         assert_eq!(config.gossip_interval, Duration::from_secs(5));
         assert_eq!(config.max_gossip_peers, 3);
         assert_eq!(config.actor_ttl, Duration::from_secs(300));
@@ -125,23 +125,35 @@ mod tests {
         assert_eq!(config.response_timeout, Duration::from_secs(5));
         assert_eq!(config.max_message_size, 10 * 1024 * 1024);
         assert_eq!(config.max_peer_failures, 3);
-        assert_eq!(config.peer_retry_interval, Duration::from_secs(DEFAULT_PEER_RETRY_SECONDS));
+        assert_eq!(
+            config.peer_retry_interval,
+            Duration::from_secs(DEFAULT_PEER_RETRY_SECONDS)
+        );
         assert_eq!(config.max_delta_history, 100);
         assert_eq!(config.full_sync_interval, 50);
         assert_eq!(config.max_pooled_connections, 20);
         assert_eq!(config.idle_connection_timeout, Duration::from_secs(300));
         assert_eq!(config.checkout_timeout, Duration::from_secs(60));
         assert_eq!(config.vector_clock_gc_frequency, Duration::from_secs(300));
-        assert_eq!(config.vector_clock_retention_period, Duration::from_secs(7200));
+        assert_eq!(
+            config.vector_clock_retention_period,
+            Duration::from_secs(7200)
+        );
         assert_eq!(config.small_cluster_threshold, 5);
         assert_eq!(config.bootstrap_readiness_timeout, Duration::from_secs(30));
-        assert_eq!(config.bootstrap_readiness_check_interval, Duration::from_millis(100));
-        assert_eq!(config.bootstrap_max_retries, 3);
+        assert_eq!(
+            config.bootstrap_readiness_check_interval,
+            Duration::from_millis(100)
+        );
+        assert_eq!(config.bootstrap_max_retries, 5);
         assert_eq!(config.bootstrap_retry_delay, Duration::from_secs(5));
         assert!(config.immediate_propagation_enabled);
         assert_eq!(config.urgent_gossip_fanout, 5);
         assert_eq!(config.max_immediate_retries, 3);
-        assert_eq!(config.causal_consistency_timeout, Duration::from_millis(500));
+        assert_eq!(
+            config.causal_consistency_timeout,
+            Duration::from_millis(500)
+        );
         assert_eq!(config.dead_peer_timeout, Duration::from_secs(900));
     }
 
@@ -149,7 +161,7 @@ mod tests {
     fn test_config_clone() {
         let config = GossipConfig::default();
         let cloned = config.clone();
-        
+
         assert_eq!(config.gossip_interval, cloned.gossip_interval);
         assert_eq!(config.max_gossip_peers, cloned.max_gossip_peers);
         assert_eq!(config.dead_peer_timeout, cloned.dead_peer_timeout);
@@ -159,7 +171,7 @@ mod tests {
     fn test_config_debug() {
         let config = GossipConfig::default();
         let debug_str = format!("{:?}", config);
-        
+
         assert!(debug_str.contains("GossipConfig"));
         assert!(debug_str.contains("gossip_interval"));
         assert!(debug_str.contains("max_gossip_peers"));
@@ -173,7 +185,7 @@ mod tests {
             peer_retry_interval: Duration::from_secs(2),
             ..Default::default()
         };
-        
+
         assert_eq!(config.gossip_interval, Duration::from_secs(10));
         assert_eq!(config.max_gossip_peers, 5);
         assert_eq!(config.peer_retry_interval, Duration::from_secs(2));

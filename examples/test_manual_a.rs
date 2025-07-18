@@ -19,12 +19,12 @@ async fn main() {
 
     println!("Starting Node A on 127.0.0.1:8001...");
     let handle = GossipRegistryHandle::new(
-        "127.0.0.1:8001".parse().unwrap(), 
+        "127.0.0.1:8001".parse().unwrap(),
         vec!["127.0.0.1:8002".parse().unwrap()], // Connect to Node B
-        Some(config)
+        Some(config),
     )
-        .await
-        .expect("Failed to create node A");
+    .await
+    .expect("Failed to create node A");
 
     println!("Node A started at {}", handle.registry.bind_addr);
     println!("Node A is ready to accept connections from Node B");
@@ -32,9 +32,9 @@ async fn main() {
     // Register a local actor with immediate priority
     handle
         .register_with_priority(
-            "actor_a".to_string(), 
+            "actor_a".to_string(),
             "127.0.0.1:9001".parse().unwrap(),
-            RegistrationPriority::Immediate
+            RegistrationPriority::Immediate,
         )
         .await
         .expect("Failed to register actor");

@@ -44,7 +44,9 @@ async fn main() {
     loop {
         sleep(Duration::from_secs(2)).await;
         let stats = handle.stats().await;
-        println!("Node B - Active peers: {}, Failed peers: {}, Known actors: {}", 
-            stats.active_peers, stats.failed_peers, stats.known_actors);
+        println!(
+            "Node B - Active peers: {}, Failed peers: {}, Known actors: {}",
+            stats.active_peers, stats.failed_peers, stats.known_actors
+        );
     }
 }

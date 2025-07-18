@@ -59,12 +59,12 @@ async fn test_node_b_killed_a_detects_immediately() {
     sleep(Duration::from_millis(200)).await;
     
     // Debug: Check stats before assertion
-    eprintln!("Node A bind addr: {}", handle_a.registry.bind_addr);
-    eprintln!("Node B bind addr: {}", handle_b.registry.bind_addr);
     let stats_a = handle_a.stats().await;
     let stats_b = handle_b.stats().await;
-    eprintln!("Node A stats: {:?}", stats_a);
-    eprintln!("Node B stats: {:?}", stats_b);
+    if stats_a.active_peers == 0 || stats_b.active_peers == 0 {
+        eprintln!("Connection issue detected - Node A: {} peers, Node B: {} peers", 
+                  stats_a.active_peers, stats_b.active_peers);
+    }
     
     // Verify A knows about B's actor
     let found = handle_a.lookup("test_actor_b").await;

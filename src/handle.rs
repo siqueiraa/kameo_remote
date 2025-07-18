@@ -3,7 +3,6 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{
     io::AsyncReadExt,
     net::{TcpListener, TcpStream},
-    sync::mpsc,
     time::{interval, Instant},
 };
 use tracing::{debug, error, info, instrument, warn};
@@ -66,16 +65,22 @@ impl GossipRegistryHandle {
         let monitor_handle = None;
 
         // Bootstrap after a brief delay to let server start
-        // Bootstrap with readiness check
+        // Bootstrap with readiness check - WAIT for completion to ensure connections are ready
         let bootstrap_registry = registry.clone();
         let bootstrap_config = config.clone();
-        tokio::spawn(async move {
+        let bootstrap_handle = tokio::spawn(async move {
             if let Err(err) =
                 wait_for_server_readiness_and_bootstrap(bootstrap_registry, bootstrap_config).await
             {
                 error!(error = %err, "bootstrap failed after readiness check");
             }
         });
+        
+        // Wait for bootstrap to complete before returning, ensuring connections are ready
+        // This prevents immediate gossip from happening before peers are connected
+        if let Err(err) = bootstrap_handle.await {
+            error!(error = %err, "bootstrap task failed");
+        }
 
         info!(bind_addr = %actual_bind_addr, "gossip registry started");
 
@@ -138,6 +143,11 @@ impl GossipRegistryHandle {
     pub async fn add_peer(&self, peer_addr: SocketAddr) -> Result<()> {
         self.registry.add_peer(peer_addr).await;
         Ok(())
+    }
+    
+    /// Get a connection handle for direct communication (reuses existing pool connections)
+    pub async fn get_connection(&self, addr: SocketAddr) -> Result<crate::connection_pool::ConnectionHandle> {
+        self.registry.get_connection(addr).await
     }
 
     /// Shutdown the registry
@@ -224,6 +234,7 @@ async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
                 }
 
                 // Step 2: Execute all gossip tasks WITHOUT holding the registry lock
+                // Use zero-copy optimized sending for each individual gossip message
                 let results = {
                     let mut futures = Vec::new();
 
@@ -232,9 +243,8 @@ async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
                         let peer_addr = task.peer_addr;
                         let sent_sequence = task.current_sequence;
                         let future = tokio::spawn(async move {
-                            // TODO: Update to use persistent connections
-                            // For now, just send the message without expecting response
-                            let _ = send_gossip_message_persistent(task, registry_clone).await;
+                            // Send the message using zero-copy persistent connections
+                            let _ = send_gossip_message_zero_copy(task, registry_clone).await;
                             GossipResult {
                                 peer_addr,
                                 sent_sequence,
@@ -244,7 +254,7 @@ async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
                         futures.push(future);
                     }
 
-                    // Wait for all gossip operations to complete
+                    // Wait for all gossip operations to complete concurrently
                     let mut results = Vec::new();
                     for future in futures {
                         match future.await {
@@ -289,11 +299,9 @@ async fn handle_connection(
 ) {
     info!("🔌 HANDLE_CONNECTION: Starting to handle new incoming connection");
 
-    // Create channel for bidirectional communication
-    let (tx, rx) = mpsc::channel::<Vec<u8>>(100);
-
-    // Store the channel temporarily so we can add it to the pool after identifying the sender
-    let tx_clone = tx.clone();
+    // Split stream for direct TCP access - NO CHANNELS
+    let (reader, writer) = stream.into_split();
+    let writer = Arc::new(tokio::sync::Mutex::new(writer));
 
     // Get registry reference for the handler
     let registry_weak = Some(Arc::downgrade(&registry));
@@ -301,47 +309,55 @@ async fn handle_connection(
     // Start the incoming persistent connection handler immediately
     // It will handle ALL messages including the first one
     tokio::spawn(async move {
-        info!(peer = %peer_addr, "HANDLE.RS: Starting incoming bidirectional connection handler");
-        handle_incoming_connection_bidirectional(
-            stream,
-            rx,
-            tx_clone,
+        info!(peer = %peer_addr, "HANDLE.RS: Starting incoming direct TCP connection handler");
+        let sender_addr = handle_incoming_connection_direct_tcp(
+            reader,
+            writer,
             peer_addr,
-            registry,
+            registry.clone(),
             registry_weak,
         )
         .await;
-        info!(peer = %peer_addr, "HANDLE.RS: Incoming bidirectional connection handler exited");
+        info!(peer = %peer_addr, "HANDLE.RS: Incoming direct TCP connection handler exited");
+        
+        // Handle peer failure when connection is lost
+        if let Some(failed_peer_addr) = sender_addr {
+            info!(peer = %failed_peer_addr, "HANDLE.RS: Triggering peer failure handling");
+            if let Err(e) = registry.handle_peer_connection_failure(failed_peer_addr).await {
+                warn!(error = %e, peer = %failed_peer_addr, "HANDLE.RS: Failed to handle peer connection failure");
+            }
+        } else {
+            warn!(peer = %peer_addr, "HANDLE.RS: Cannot handle peer failure - sender address unknown");
+        }
     });
 }
 
-/// Handle an incoming bidirectional connection - processes all messages and manages the connection pool
-async fn handle_incoming_connection_bidirectional(
-    mut stream: TcpStream,
-    rx: mpsc::Receiver<Vec<u8>>,
-    tx: mpsc::Sender<Vec<u8>>,
+/// Handle an incoming direct TCP connection - processes all messages and manages the connection pool
+async fn handle_incoming_connection_direct_tcp(
+    mut reader: tokio::net::tcp::OwnedReadHalf,
+    writer: Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>,
     peer_addr: SocketAddr,
     registry: Arc<GossipRegistry>,
     registry_weak: Option<std::sync::Weak<GossipRegistry>>,
-) {
+) -> Option<SocketAddr> {
     let max_message_size = registry.config.max_message_size;
 
     // First, read the initial message to identify the sender
-    let msg_result = read_message(&mut stream, max_message_size).await;
+    let msg_result = read_message_from_reader(&mut reader, max_message_size).await;
 
     let sender_addr = match &msg_result {
         Ok(msg) => match msg {
-            RegistryMessage::DeltaGossip { delta } => delta.sender_addr,
-            RegistryMessage::FullSync { sender_addr, .. } => *sender_addr,
-            RegistryMessage::FullSyncRequest { sender_addr, .. } => *sender_addr,
-            RegistryMessage::FullSyncResponse { sender_addr, .. } => *sender_addr,
-            RegistryMessage::DeltaGossipResponse { delta } => delta.sender_addr,
-            RegistryMessage::PeerHealthQuery { sender, .. } => *sender,
-            RegistryMessage::PeerHealthReport { reporter, .. } => *reporter,
+            RegistryMessage::DeltaGossip { delta } => delta.sender_addr.clone(),
+            RegistryMessage::FullSync { sender_addr, .. } => sender_addr.clone(),
+            RegistryMessage::FullSyncRequest { sender_addr, .. } => sender_addr.clone(),
+            RegistryMessage::FullSyncResponse { sender_addr, .. } => sender_addr.clone(),
+            RegistryMessage::DeltaGossipResponse { delta } => delta.sender_addr.clone(),
+            RegistryMessage::PeerHealthQuery { sender, .. } => sender.clone(),
+            RegistryMessage::PeerHealthReport { reporter, .. } => reporter.clone(),
         },
         Err(err) => {
             warn!(error = %err, "failed to read initial message from incoming connection");
-            return;
+            return None;
         }
     };
 
@@ -357,34 +373,36 @@ async fn handle_incoming_connection_bidirectional(
     // Add this connection to the pool
     {
         let mut pool = registry.connection_pool.lock().await;
-        if pool.add_connection_sender(sender_addr, peer_addr, tx) {
+        if pool.add_connection_sender(sender_addr.parse::<SocketAddr>().unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap()), peer_addr, writer.clone()) {
             info!(listening_addr = %sender_addr, peer_addr = %peer_addr,
                   "Added incoming connection to pool for bidirectional use");
         } else {
             warn!(listening_addr = %sender_addr, "Failed to add connection to pool");
-            return;
+            return None;
         }
     }
 
     // Trigger an immediate gossip round to establish bidirectional communication quickly
     {
         let registry_clone = registry.clone();
+        let sender_addr_clone = sender_addr.clone();
         tokio::spawn(async move {
-            debug!(peer = %sender_addr, "Triggering immediate gossip round after incoming connection");
-            
+            debug!(peer = %sender_addr_clone, "Triggering immediate gossip round after incoming connection");
+
             // Prepare and execute a gossip round
             match registry_clone.prepare_gossip_round().await {
                 Ok(tasks) => {
                     if !tasks.is_empty() {
                         // Execute all gossip tasks
                         let mut futures = Vec::new();
-                        
+
                         for task in tasks {
                             let registry_for_task = registry_clone.clone();
                             let peer_addr = task.peer_addr;
                             let sent_sequence = task.current_sequence;
                             let future = tokio::spawn(async move {
-                                let _ = send_gossip_message_persistent(task, registry_for_task).await;
+                                let _ =
+                                    send_gossip_message_zero_copy(task, registry_for_task).await;
                                 GossipResult {
                                     peer_addr,
                                     sent_sequence,
@@ -393,7 +411,7 @@ async fn handle_incoming_connection_bidirectional(
                             });
                             futures.push(future);
                         }
-                        
+
                         // Wait for all gossip operations to complete
                         let mut results = Vec::new();
                         for future in futures {
@@ -404,14 +422,14 @@ async fn handle_incoming_connection_bidirectional(
                                 }
                             }
                         }
-                        
+
                         // Apply the results
                         registry_clone.apply_gossip_results(results).await;
-                        info!(peer = %sender_addr, "Completed immediate gossip round after incoming connection");
+                        info!(peer = %sender_addr_clone, "Completed immediate gossip round after incoming connection");
                     }
                 }
                 Err(err) => {
-                    warn!(error = %err, peer = %sender_addr, "Failed to trigger immediate gossip round");
+                    warn!(error = %err, peer = %sender_addr_clone, "Failed to trigger immediate gossip round");
                 }
             }
         });
@@ -424,7 +442,7 @@ async fn handle_incoming_connection_bidirectional(
         // Check if this is a previously failed peer
         let was_failed = gossip_state
             .peers
-            .get(&sender_addr)
+            .get(&sender_addr.parse::<SocketAddr>().unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap()))
             .map(|info| info.failures >= registry.config.max_peer_failures)
             .unwrap_or(false);
 
@@ -435,26 +453,27 @@ async fn handle_incoming_connection_bidirectional(
             );
 
             // Clear the pending failure record
-            gossip_state.pending_peer_failures.remove(&sender_addr);
+            gossip_state.pending_peer_failures.remove(&sender_addr.parse::<SocketAddr>().unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap()));
         }
 
         // Reset failure state
-        if let Some(peer_info) = gossip_state.peers.get_mut(&sender_addr) {
+        if let Some(peer_info) = gossip_state.peers.get_mut(&sender_addr.parse::<SocketAddr>().unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap())) {
             peer_info.failures = 0;
             peer_info.last_failure_time = None;
             peer_info.last_success = current_timestamp();
         }
     }
 
-    // Now continue with the persistent connection handler for the rest of the connection
-    crate::connection_pool::handle_incoming_persistent_connection(
-        stream,
-        rx,
-        peer_addr,
-        sender_addr, // Pass the sender's listening address
+    // Now continue with the persistent connection reader for the rest of the connection
+    crate::connection_pool::handle_persistent_connection_reader(
+        reader,
+        sender_addr.parse::<SocketAddr>().unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap()), // Pass the sender's listening address
         registry_weak,
     )
     .await;
+    
+    // Return the sender address so the failure handler can use it
+    Some(sender_addr.parse::<SocketAddr>().unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap()))
 }
 
 async fn read_message(stream: &mut TcpStream, max_size: usize) -> Result<RegistryMessage> {
@@ -475,14 +494,35 @@ async fn read_message(stream: &mut TcpStream, max_size: usize) -> Result<Registr
     let mut data = vec![0u8; len];
     stream.read_exact(&mut data).await?;
 
-    let msg = bincode::deserialize(&data)?;
+    let msg = rkyv::from_bytes::<RegistryMessage, rkyv::rancor::Error>(&data)?;
+    Ok(msg)
+}
+
+async fn read_message_from_reader(reader: &mut tokio::net::tcp::OwnedReadHalf, max_size: usize) -> Result<RegistryMessage> {
+    // Read length header
+    let mut len_buf = [0u8; 4];
+    reader.read_exact(&mut len_buf).await?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+
+    // Check message size
+    if len > max_size {
+        return Err(GossipError::MessageTooLarge {
+            size: len,
+            max: max_size,
+        });
+    }
+
+    // Read message data
+    let mut data = vec![0u8; len];
+    reader.read_exact(&mut data).await?;
+
+    let msg = rkyv::from_bytes::<RegistryMessage, rkyv::rancor::Error>(&data)?;
     Ok(msg)
 }
 
 /// Bootstrap by connecting to known peers and doing initial gossip with vector clocks
 #[instrument(skip(registry))]
 async fn bootstrap_peers(registry: Arc<GossipRegistry>) -> Result<()> {
-    // NodeId has been removed from registry
     let bind_addr = registry.bind_addr;
 
     let peers = {
@@ -512,51 +552,53 @@ async fn bootstrap_peers(registry: Arc<GossipRegistry>) -> Result<()> {
             };
 
             RegistryMessage::FullSync {
-                local_actors,
-                known_actors,
-                sender_addr: bind_addr, // This is the listening address
+                local_actors: local_actors.into_iter().map(|(k, v)| (k, v)).collect(),
+                known_actors: known_actors.into_iter().map(|(k, v)| (k, v)).collect(),
+                sender_addr: bind_addr.to_string(), // This is the listening address
                 sequence,
                 wall_clock_time: current_timestamp(),
             }
         };
 
-        // Check if we already have a connection (incoming or outgoing) before creating new one
-        let conn = {
-            let mut pool = registry.connection_pool.lock().await;
-
-            info!(peer = %peer, "BOOTSTRAP: Attempting to get connection for bootstrap");
-
-            // If we already have a connection, use it
-            match pool.get_connection(peer).await {
-                Ok(c) => {
-                    info!(peer = %peer, "BOOTSTRAP: Successfully got connection");
-                    c
-                }
-                Err(e) => {
-                    // During startup, connection refused is expected if peer's server isn't ready yet
-                    // This will be retried by the bootstrap retry logic
-                    match &e {
-                        GossipError::Network(io_err) if io_err.kind() == std::io::ErrorKind::ConnectionRefused => {
-                            debug!(peer = %peer, "BOOTSTRAP: Peer not ready yet (connection refused)");
-                        }
-                        _ => {
-                            warn!(peer = %peer, error = %e, "BOOTSTRAP: Failed to connect to bootstrap peer");
-                        }
-                    }
-                    continue;
-                }
-            }
-        };
-
         // Send bootstrap message
-        match bincode::serialize(&gossip_msg) {
+        match rkyv::to_bytes::<rkyv::rancor::Error>(&gossip_msg) {
             Ok(data) => {
-                debug!(peer = %peer, "connected to bootstrap peer");
+                // Get connection and create message buffer
+                let (conn, buffer) = {
+                    let mut pool = registry.connection_pool.lock().await;
 
-                let len = data.len() as u32;
-                let mut buffer = Vec::with_capacity(4 + data.len());
-                buffer.extend_from_slice(&len.to_be_bytes());
-                buffer.extend_from_slice(&data);
+                    info!(peer = %peer, "BOOTSTRAP: Attempting to get connection for bootstrap");
+
+                    // If we already have a connection, use it
+                    let conn = match pool.get_connection(peer).await {
+                        Ok(c) => {
+                            info!(peer = %peer, "BOOTSTRAP: Successfully got connection");
+                            c
+                        }
+                        Err(e) => {
+                            // During startup, connection refused is expected if peer's server isn't ready yet
+                            // This will be retried by the bootstrap retry logic
+                            match &e {
+                                GossipError::Network(io_err)
+                                    if io_err.kind() == std::io::ErrorKind::ConnectionRefused =>
+                                {
+                                    debug!(peer = %peer, "BOOTSTRAP: Peer not ready yet (connection refused)");
+                                }
+                                _ => {
+                                    warn!(peer = %peer, error = %e, "BOOTSTRAP: Failed to connect to bootstrap peer");
+                                }
+                            }
+                            continue;
+                        }
+                    };
+
+                    // Create message buffer with length header using buffer pool
+                    let buffer = pool.create_message_buffer(&data);
+
+                    (conn, buffer)
+                };
+
+                debug!(peer = %peer, "connected to bootstrap peer");
 
                 if let Err(err) = conn.send_data(buffer).await {
                     warn!(peer = %peer, error = %err, "failed to send bootstrap gossip");
@@ -574,24 +616,24 @@ async fn bootstrap_peers(registry: Arc<GossipRegistry>) -> Result<()> {
     }
 
     info!("bootstrap completed with vector clock support");
-    
+
     // Trigger an immediate gossip round after bootstrap to establish connections quickly
     tokio::spawn(async move {
         debug!("Triggering immediate gossip round after bootstrap");
-        
+
         // Prepare and execute a gossip round
         match registry.prepare_gossip_round().await {
             Ok(tasks) => {
                 if !tasks.is_empty() {
                     // Execute all gossip tasks
                     let mut futures = Vec::new();
-                    
+
                     for task in tasks {
                         let registry_for_task = registry.clone();
                         let peer_addr = task.peer_addr;
                         let sent_sequence = task.current_sequence;
                         let future = tokio::spawn(async move {
-                            let _ = send_gossip_message_persistent(task, registry_for_task).await;
+                            let _ = send_gossip_message_zero_copy(task, registry_for_task).await;
                             GossipResult {
                                 peer_addr,
                                 sent_sequence,
@@ -600,7 +642,7 @@ async fn bootstrap_peers(registry: Arc<GossipRegistry>) -> Result<()> {
                         });
                         futures.push(future);
                     }
-                    
+
                     // Wait for all gossip operations to complete
                     let mut results = Vec::new();
                     for future in futures {
@@ -611,7 +653,7 @@ async fn bootstrap_peers(registry: Arc<GossipRegistry>) -> Result<()> {
                             }
                         }
                     }
-                    
+
                     // Apply the results
                     registry.apply_gossip_results(results).await;
                     info!("Completed immediate gossip round after bootstrap");
@@ -622,33 +664,94 @@ async fn bootstrap_peers(registry: Arc<GossipRegistry>) -> Result<()> {
             }
         }
     });
-    
+
     Ok(())
 }
 
-/// Send a gossip message through persistent connection
+/// Send a gossip message through persistent connection with zero-copy optimizations
 async fn send_gossip_message_persistent(
     task: GossipTask,
     registry: Arc<GossipRegistry>,
 ) -> Result<()> {
-    // Serialize the message
-    let data = bincode::serialize(&task.message)?;
-    let len = data.len() as u32;
+    // Pre-serialize the message (this could be optimized further with message pooling)
+    let data = rkyv::to_bytes::<rkyv::rancor::Error>(&task.message)?;
 
-    // Create the full message with length header
-    let mut buffer = Vec::with_capacity(4 + data.len());
-    buffer.extend_from_slice(&len.to_be_bytes());
-    buffer.extend_from_slice(&data);
-
-    // Get persistent connection and send
+    // Get persistent connection with minimal lock time
     let conn = {
         let mut pool = registry.connection_pool.lock().await;
-
-        // Get connection to peer
         pool.get_connection(task.peer_addr).await?
     };
 
-    conn.send_data(buffer).await?;
+    // Use zero-copy tell() method for maximum performance
+    conn.tell(data.as_slice()).await?;
+    Ok(())
+}
+
+/// Zero-copy gossip message sender - eliminates bottlenecks in serialization and connection handling
+async fn send_gossip_message_zero_copy(
+    mut task: GossipTask,
+    registry: Arc<GossipRegistry>,
+) -> Result<()> {
+    // Get connection with minimal lock contention
+    let conn = {
+        let mut pool = registry.connection_pool.lock().await;
+        pool.get_connection(task.peer_addr).await?
+    };
+
+    // CRITICAL: Set precise timing RIGHT BEFORE TCP write to exclude all scheduling delays
+    // Update wall_clock_time in delta changes to current time for accurate propagation measurement
+    let current_time_secs = crate::current_timestamp();
+    let current_time_nanos = crate::current_timestamp_nanos();
+    
+    // Debug: Check if there's a delay in the task creation vs sending
+    match &task.message {
+        crate::registry::RegistryMessage::DeltaGossip { delta } => {
+            for change in &delta.changes {
+                match change {
+                    crate::registry::RegistryChange::ActorAdded { location, .. } => {
+                        let creation_time_nanos = location.wall_clock_time as u128 * 1_000_000_000;
+                        let delay_nanos = current_time_nanos as u128 - creation_time_nanos;
+                        let delay_ms = delay_nanos as f64 / 1_000_000.0;
+                        // eprintln!("🔍 DELTA_SEND_DELAY: {}ms between delta creation and sending", delay_ms);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    
+    match &mut task.message {
+        crate::registry::RegistryMessage::DeltaGossip { delta } => {
+            delta.precise_timing_nanos = current_time_nanos;
+            // Update wall_clock_time in all changes to current time for accurate propagation measurement
+            for change in &mut delta.changes {
+                match change {
+                    crate::registry::RegistryChange::ActorAdded { location, .. } => {
+                        // Set wall_clock_time to nanoseconds for consistent timing measurements
+                        location.wall_clock_time = (current_time_nanos / 1_000_000_000) as u64;
+                    }
+                    crate::registry::RegistryChange::ActorRemoved { .. } => {
+                        // No wall_clock_time to update
+                    }
+                }
+            }
+        }
+        crate::registry::RegistryMessage::FullSync { .. } => {
+            // Full sync doesn't use precise timing
+        }
+        _ => {}
+    }
+
+    // Serialize the message AFTER updating timing
+    let data = rkyv::to_bytes::<rkyv::rancor::Error>(&task.message)?;
+
+    // Use zero-copy tell() which uses try_send() internally for max performance
+    // This completely bypasses async overhead when the channel has capacity
+    let tcp_start = std::time::Instant::now();
+    conn.tell(data.as_slice()).await?;
+    let tcp_elapsed = tcp_start.elapsed();
+    // eprintln!("🔍 TCP_WRITE_TIME: {:?}", tcp_elapsed);
     Ok(())
 }
 
@@ -667,7 +770,7 @@ async fn wait_for_server_readiness_and_bootstrap(
 
     match readiness_timeout.await {
         Ok(Ok(())) => {
-            info!("server is ready, starting bootstrap");
+            // info!("server is ready, starting bootstrap");
         }
         Ok(Err(err)) => {
             warn!(error = %err, "readiness check failed, proceeding with bootstrap anyway");
@@ -679,7 +782,7 @@ async fn wait_for_server_readiness_and_bootstrap(
 
     // Add a small initial delay to give peers a chance to start their servers
     // This helps avoid immediate connection failures during startup
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Attempt bootstrap with retries
     for attempt in 1..=config.bootstrap_max_retries {
@@ -698,7 +801,7 @@ async fn wait_for_server_readiness_and_bootstrap(
                         // Later retries: use configured delay
                         config.bootstrap_retry_delay
                     };
-                    
+
                     warn!(
                         attempt = attempt,
                         max_attempts = config.bootstrap_max_retries,

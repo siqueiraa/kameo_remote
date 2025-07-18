@@ -5,7 +5,7 @@ use std::{
 };
 
 use rand::seq::SliceRandom;
-use serde::{Deserialize, Serialize};
+use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 
@@ -15,7 +15,7 @@ use crate::{
 };
 
 /// Registry change types for delta tracking
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Archive, RkyvSerialize, RkyvDeserialize, Debug, Clone)]
 pub enum RegistryChange {
     /// Actor was added or updated
     ActorAdded {
@@ -31,17 +31,18 @@ pub enum RegistryChange {
 }
 
 /// Delta representing changes since a specific sequence number
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Archive, RkyvSerialize, RkyvDeserialize, Debug, Clone)]
 pub struct RegistryDelta {
     pub since_sequence: u64,
     pub current_sequence: u64,
     pub changes: Vec<RegistryChange>,
-    pub sender_addr: SocketAddr, // The bind address of the sending node
-    pub wall_clock_time: u64,    // For debugging/monitoring only
+    pub sender_addr: String,       // Use String instead of SocketAddr for rkyv compatibility
+    pub wall_clock_time: u64,      // For debugging/monitoring only
+    pub precise_timing_nanos: u64, // High precision timing for latency measurements
 }
 
 /// Peer health status from a reporter's perspective
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
 pub struct PeerHealthStatus {
     /// Is the peer reachable from this reporter
     pub is_alive: bool,
@@ -63,7 +64,7 @@ pub struct PendingFailure {
 }
 
 /// Message types for the gossip protocol
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Archive, RkyvSerialize, RkyvDeserialize, Debug, Clone)]
 pub enum RegistryMessage {
     /// Delta gossip message containing only changes
     DeltaGossip { delta: RegistryDelta },
@@ -71,42 +72,42 @@ pub enum RegistryMessage {
     DeltaGossipResponse { delta: RegistryDelta },
     /// Request for full sync (fallback when deltas are unavailable)
     FullSyncRequest {
-        sender_addr: SocketAddr, // The bind address of the sending node
+        sender_addr: String, // Use String instead of SocketAddr for rkyv compatibility
         sequence: u64,
         wall_clock_time: u64,
     },
     /// Full synchronization message
     FullSync {
-        local_actors: HashMap<String, ActorLocation>,
-        known_actors: HashMap<String, ActorLocation>,
-        sender_addr: SocketAddr, // The bind address of the sending node
+        local_actors: Vec<(String, ActorLocation)>, // Use Vec instead of HashMap for rkyv compatibility
+        known_actors: Vec<(String, ActorLocation)>, // Use Vec instead of HashMap for rkyv compatibility
+        sender_addr: String, // Use String instead of SocketAddr for rkyv compatibility
         sequence: u64,
         wall_clock_time: u64,
     },
     /// Response to full sync
     FullSyncResponse {
-        local_actors: HashMap<String, ActorLocation>,
-        known_actors: HashMap<String, ActorLocation>,
-        sender_addr: SocketAddr, // The bind address of the sending node
+        local_actors: Vec<(String, ActorLocation)>, // Use Vec instead of HashMap for rkyv compatibility
+        known_actors: Vec<(String, ActorLocation)>, // Use Vec instead of HashMap for rkyv compatibility
+        sender_addr: String, // Use String instead of SocketAddr for rkyv compatibility
         sequence: u64,
         wall_clock_time: u64,
     },
     /// Peer health status report
     PeerHealthReport {
-        reporter: SocketAddr,
-        peer_statuses: HashMap<SocketAddr, PeerHealthStatus>,
+        reporter: String,
+        peer_statuses: Vec<(String, PeerHealthStatus)>, // Use Vec instead of HashMap for rkyv compatibility
         timestamp: u64,
     },
     /// Query for peer health consensus
     PeerHealthQuery {
-        sender: SocketAddr,
-        target_peer: SocketAddr,
+        sender: String,
+        target_peer: String,
         timestamp: u64,
     },
 }
 
 /// Statistics about the gossip registry
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
 pub struct RegistryStats {
     pub local_actors: usize,
     pub known_actors: usize,
@@ -320,24 +321,18 @@ impl GossipRegistry {
         mut location: ActorLocation,
         priority: RegistrationPriority,
     ) -> Result<()> {
-        // Check if actor already exists
-        {
-            let actor_state = self.actor_state.read().await;
-            if actor_state.local_actors.contains_key(&name)
-                || actor_state.known_actors.contains_key(&name)
-            {
-                return Err(GossipError::ActorAlreadyExists(name));
-            }
-        }
+        let register_start_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
 
         // Update the location with current wall time and priority
         location.wall_clock_time = current_timestamp();
         location.priority = priority;
 
-        // Update actor state
+        // Single write lock acquisition for actor state
         {
             let mut actor_state = self.actor_state.write().await;
-            // Double-check after acquiring write lock
             if actor_state.local_actors.contains_key(&name)
                 || actor_state.known_actors.contains_key(&name)
             {
@@ -373,10 +368,18 @@ impl GossipRegistry {
         };
 
         if priority.should_trigger_immediate_gossip() {
-            error!(
+            let gossip_trigger_time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let registration_duration_ms =
+                (gossip_trigger_time - register_start_time) as f64 / 1_000_000.0;
+
+            info!(
                 actor_name = %name,
                 bind_addr = %self.bind_addr,
                 priority = ?priority,
+                registration_duration_ms = registration_duration_ms,
                 "🚀 REGISTERED_ACTOR_IMMEDIATE: Will trigger immediate propagation"
             );
         } else {
@@ -536,7 +539,7 @@ impl GossipRegistry {
         let total_changes = delta.changes.len();
         let sender_addr = delta.sender_addr;
 
-        // Check if any changes are immediate priority
+        // Pre-compute priority flags to avoid redundant checks
         let has_immediate = delta.changes.iter().any(|change| match change {
             RegistryChange::ActorAdded { priority, .. } => {
                 priority.should_trigger_immediate_gossip()
@@ -555,6 +558,14 @@ impl GossipRegistry {
 
         let mut peer_actors = std::collections::HashSet::new();
 
+        // Pre-capture timing info outside lock for better performance
+        let received_timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        
+        eprintln!("🔍 RECEIVED_TIMESTAMP: {}ns", received_timestamp);
+
         // Apply changes atomically under write lock
         let applied_count = {
             let mut actor_state = self.actor_state.write().await;
@@ -567,8 +578,8 @@ impl GossipRegistry {
                         location,
                         priority: _,
                     } => {
-                        // Don't override local actors
-                        if actor_state.local_actors.contains_key(name) {
+                        // Don't override local actors - early exit
+                        if actor_state.local_actors.contains_key(name.as_str()) {
                             debug!(
                                 actor_name = %name,
                                 "skipping remote actor update - actor is local"
@@ -577,7 +588,7 @@ impl GossipRegistry {
                         }
 
                         // Check if we already know about this actor
-                        let should_apply = match actor_state.known_actors.get(name) {
+                        let should_apply = match actor_state.known_actors.get(name.as_str()) {
                             Some(existing_location) => {
                                 // Use wall clock time as the primary decision factor
                                 // If times are equal, use address as tiebreaker for consistency
@@ -596,34 +607,47 @@ impl GossipRegistry {
                         };
 
                         if should_apply {
+                            // Only clone when actually inserting
+                            let actor_name = name.clone();
                             actor_state
                                 .known_actors
-                                .insert(name.clone(), location.clone());
+                                .insert(actor_name.clone(), location.clone());
                             applied += 1;
 
                             // Track this actor as belonging to the sender
-                            peer_actors.insert(name.clone());
+                            peer_actors.insert(actor_name);
 
-                            let received_timestamp = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_nanos();
+                            // Move timing calculations outside critical section for logging
+                            if tracing::enabled!(tracing::Level::INFO) {
+                                let propagation_time_nanos =
+                                    received_timestamp - location.local_registration_time;
+                                let propagation_time_ms =
+                                    propagation_time_nanos as f64 / 1_000_000.0;
 
-                            let propagation_time_nanos =
-                                received_timestamp - location.local_registration_time;
-                            let propagation_time_ms = propagation_time_nanos as f64 / 1_000_000.0;
+                                // Calculate time from when delta was sent (network + processing)
+                                let network_processing_time_nanos =
+                                    received_timestamp - delta.precise_timing_nanos as u128;
+                                let network_processing_time_ms =
+                                    network_processing_time_nanos as f64 / 1_000_000.0;
 
-                            info!(
-                                actor_name = %name,
-                                priority = ?location.priority,
-                                propagation_time_ms = propagation_time_ms,
-                                "RECEIVED_ACTOR"
-                            );
+                                // Calculate pure serialization + processing time (excluding network)
+                                let processing_only_time_ms =
+                                    propagation_time_ms - network_processing_time_ms;
+
+                                info!(
+                                    actor_name = %name,
+                                    priority = ?location.priority,
+                                    propagation_time_ms = propagation_time_ms,
+                                    network_processing_time_ms = network_processing_time_ms,
+                                    processing_only_time_ms = processing_only_time_ms,
+                                    "RECEIVED_ACTOR"
+                                );
+                            }
                         }
                     }
                     RegistryChange::ActorRemoved { name, priority: _ } => {
-                        // Don't remove local actors
-                        if actor_state.local_actors.contains_key(name) {
+                        // Don't remove local actors - early exit
+                        if actor_state.local_actors.contains_key(name.as_str()) {
                             debug!(
                                 actor_name = %name,
                                 "skipping actor removal - actor is local"
@@ -632,7 +656,7 @@ impl GossipRegistry {
                         }
 
                         // Simply remove the actor if it exists in known_actors
-                        if actor_state.known_actors.remove(name).is_some() {
+                        if actor_state.known_actors.remove(name.as_str()).is_some() {
                             applied += 1;
                             debug!(actor_name = %name, "applied actor removal");
                         }
@@ -645,12 +669,14 @@ impl GossipRegistry {
 
         // Update peer-to-actors mapping for failure tracking
         if !peer_actors.is_empty() {
-            let mut gossip_state = self.gossip_state.lock().await;
-            gossip_state
-                .peer_to_actors
-                .entry(sender_addr)
-                .or_insert_with(std::collections::HashSet::new)
-                .extend(peer_actors.clone());
+            if let Ok(sender_socket_addr) = sender_addr.parse::<SocketAddr>() {
+                let mut gossip_state = self.gossip_state.lock().await;
+                gossip_state
+                    .peer_to_actors
+                    .entry(sender_socket_addr)
+                    .or_insert_with(std::collections::HashSet::new)
+                    .extend(peer_actors.clone());
+            }
         }
 
         debug!(
@@ -756,8 +782,9 @@ impl GossipRegistry {
             since_sequence,
             current_sequence: gossip_state.gossip_sequence,
             changes: deduped_changes,
-            sender_addr: self.bind_addr,
+            sender_addr: self.bind_addr.to_string(),
             wall_clock_time: current_time,
+            precise_timing_nanos: crate::current_timestamp_nanos(), // Set high precision timing
         })
     }
 
@@ -774,9 +801,9 @@ impl GossipRegistry {
             known_actors.len()
         );
         RegistryMessage::FullSync {
-            local_actors: local_actors.clone(),
-            known_actors: known_actors.clone(),
-            sender_addr: self.bind_addr,
+            local_actors: local_actors.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            known_actors: known_actors.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            sender_addr: self.bind_addr.to_string(),
             sequence,
             wall_clock_time: current_timestamp(),
         }
@@ -790,9 +817,9 @@ impl GossipRegistry {
         sequence: u64,
     ) -> RegistryMessage {
         RegistryMessage::FullSyncResponse {
-            local_actors: local_actors.clone(),
-            known_actors: known_actors.clone(),
-            sender_addr: self.bind_addr,
+            local_actors: local_actors.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            known_actors: known_actors.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            sender_addr: self.bind_addr.to_string(),
             sequence,
             wall_clock_time: current_timestamp(),
         }
@@ -913,7 +940,8 @@ impl GossipRegistry {
             for peer in &selected_peers {
                 if let Some(peer_info) = gossip_state.peers.get(peer) {
                     if peer_info.failures >= self.config.max_peer_failures {
-                        let time_since_failure = peer_info.last_failure_time
+                        let time_since_failure = peer_info
+                            .last_failure_time
                             .map(|t| current_time - t)
                             .unwrap_or(0);
                         info!(
@@ -1094,21 +1122,25 @@ impl GossipRegistry {
 
                 // Add the sender as a peer if not already tracked
                 info!(sender = %sender_addr, "Adding sender from full sync response as peer");
-                self.add_peer(sender_addr).await;
-
-                self.merge_full_sync(
-                    local_actors,
-                    known_actors,
-                    sender_addr,
-                    sequence,
-                    wall_clock_time,
-                )
-                .await;
+                if let Ok(addr) = sender_addr.parse::<SocketAddr>() {
+                    self.add_peer(addr).await;
+                    
+                    self.merge_full_sync(
+                        local_actors.into_iter().collect(),
+                        known_actors.into_iter().collect(),
+                        addr,
+                        sequence,
+                        wall_clock_time,
+                    )
+                    .await;
+                }
 
                 let mut gossip_state = self.gossip_state.lock().await;
-                if let Some(peer_info) = gossip_state.peers.get_mut(&addr) {
-                    peer_info.consecutive_deltas = 0;
-                    peer_info.last_sequence = sequence;
+                if let Ok(addr) = sender_addr.parse::<SocketAddr>() {
+                    if let Some(peer_info) = gossip_state.peers.get_mut(&addr) {
+                        peer_info.consecutive_deltas = 0;
+                        peer_info.last_sequence = sequence;
+                    }
                 }
                 gossip_state.full_sync_exchanges += 1;
             }
@@ -1160,64 +1192,76 @@ impl GossipRegistry {
         let mut updated_actors = 0;
         let mut peer_actors = std::collections::HashSet::new();
 
-        // Merge using vector clock-based conflict resolution
-        {
-            let mut actor_state = self.actor_state.write().await;
-
-            // Merge remote local actors - these are owned by the sender
-            for (name, location) in remote_local {
-                peer_actors.insert(name.clone());
-                if !actor_state.local_actors.contains_key(&name) {
-                    match actor_state.known_actors.get(&name) {
-                        Some(existing_location) => {
-                            // Use wall clock time for conflict resolution
-                            if location.wall_clock_time > existing_location.wall_clock_time {
-                                actor_state.known_actors.insert(name.clone(), location);
-                                updated_actors += 1;
-                            } else if location.wall_clock_time == existing_location.wall_clock_time
-                            {
-                                // Use address as tiebreaker for concurrent updates
-                                if location.address > existing_location.address {
-                                    actor_state.known_actors.insert(name.clone(), location);
-                                    updated_actors += 1;
-                                }
-                            }
-                            // Otherwise keep existing
-                        }
-                        None => {
-                            actor_state.known_actors.insert(name.clone(), location);
-                            new_actors += 1;
-                        }
-                    }
-                }
-            }
-
-            // Merge remote known actors
-            for (name, location) in remote_known {
-                if actor_state.local_actors.contains_key(&name) {
-                    continue; // Don't override local actors
-                }
-
-                match actor_state.known_actors.get(&name) {
+        // Pre-compute all updates outside the lock to minimize lock hold time
+        let mut updates_to_apply = Vec::new();
+        
+        // STEP 1: Read current state with read lock (fast, non-blocking)
+        let (local_actors, known_actors) = {
+            let actor_state = self.actor_state.read().await;
+            (actor_state.local_actors.clone(), actor_state.known_actors.clone())
+        };
+        
+        // STEP 2: Compute all updates outside any lock (fast, pure computation)
+        // Process remote local actors
+        for (name, location) in remote_local {
+            peer_actors.insert(name.clone());
+            if !local_actors.contains_key(&name) {
+                match known_actors.get(&name) {
                     Some(existing_location) => {
                         // Use wall clock time for conflict resolution
                         if location.wall_clock_time > existing_location.wall_clock_time {
-                            actor_state.known_actors.insert(name, location);
+                            updates_to_apply.push((name.clone(), location));
                             updated_actors += 1;
                         } else if location.wall_clock_time == existing_location.wall_clock_time {
                             // Use address as tiebreaker for concurrent updates
                             if location.address > existing_location.address {
-                                actor_state.known_actors.insert(name, location);
+                                updates_to_apply.push((name.clone(), location));
                                 updated_actors += 1;
                             }
                         }
                         // Otherwise keep existing
                     }
                     None => {
-                        actor_state.known_actors.insert(name, location);
+                        updates_to_apply.push((name.clone(), location));
                         new_actors += 1;
                     }
                 }
+            }
+        }
+        
+        // Process remote known actors
+        for (name, location) in remote_known {
+            if local_actors.contains_key(&name) {
+                continue; // Don't override local actors
+            }
+
+            match known_actors.get(&name) {
+                Some(existing_location) => {
+                    // Use wall clock time for conflict resolution
+                    if location.wall_clock_time > existing_location.wall_clock_time {
+                        updates_to_apply.push((name, location));
+                        updated_actors += 1;
+                    } else if location.wall_clock_time == existing_location.wall_clock_time {
+                        // Use address as tiebreaker for concurrent updates
+                        if location.address > existing_location.address {
+                            updates_to_apply.push((name, location));
+                            updated_actors += 1;
+                        }
+                    }
+                    // Otherwise keep existing
+                }
+                None => {
+                    updates_to_apply.push((name, location));
+                    new_actors += 1;
+                }
+            }
+        }
+        
+        // STEP 3: Apply all updates with write lock (fast, minimal work under lock)
+        if !updates_to_apply.is_empty() {
+            let mut actor_state = self.actor_state.write().await;
+            for (name, location) in updates_to_apply {
+                actor_state.known_actors.insert(name, location);
             }
         }
 
@@ -1362,6 +1406,11 @@ impl GossipRegistry {
 
         info!("gossip registry shutdown complete");
     }
+    
+    /// Get a connection handle for direct communication (for performance testing)
+    pub async fn get_connection(&self, addr: SocketAddr) -> Result<crate::connection_pool::ConnectionHandle> {
+        self.connection_pool.lock().await.get_connection(addr).await
+    }
 
     pub async fn is_shutdown(&self) -> bool {
         let gossip_state = self.gossip_state.lock().await;
@@ -1475,8 +1524,8 @@ impl GossipRegistry {
     /// Query other peers for their view of a potentially failed peer
     async fn query_peer_health_consensus(&self, target_peer: SocketAddr) -> Result<()> {
         let query_msg = RegistryMessage::PeerHealthQuery {
-            sender: self.bind_addr,
-            target_peer,
+            sender: self.bind_addr.to_string(),
+            target_peer: target_peer.to_string(),
             timestamp: current_timestamp(),
         };
 
@@ -1502,15 +1551,12 @@ impl GossipRegistry {
 
         // Send queries to all healthy peers
         for peer in peers_to_query {
-            if let Ok(data) = bincode::serialize(&query_msg) {
-                let len = data.len() as u32;
-                let mut buffer = Vec::with_capacity(4 + data.len());
-                buffer.extend_from_slice(&len.to_be_bytes());
-                buffer.extend_from_slice(&data);
-
+            if let Ok(data) = rkyv::to_bytes::<rkyv::rancor::Error>(&query_msg) {
                 // Try to send through existing connection
                 let mut pool = self.connection_pool.lock().await;
                 if let Ok(conn) = pool.get_connection(peer).await {
+                    // Create message buffer with length header using buffer pool
+                    let buffer = pool.create_message_buffer(&data);
                     let _ = conn.send_data(buffer).await;
                 }
             }
@@ -1707,9 +1753,8 @@ impl GossipRegistry {
                 return Ok(());
             }
 
-            // Take all urgent changes for immediate propagation
-            let changes = gossip_state.urgent_changes.clone();
-            gossip_state.urgent_changes.clear();
+            // Take all urgent changes for immediate propagation (avoid clone)
+            let changes = std::mem::take(&mut gossip_state.urgent_changes);
 
             // Get healthy peers quickly - just take the first few healthy ones
             let peers: Vec<_> = gossip_state
@@ -1726,13 +1771,6 @@ impl GossipRegistry {
         if urgent_changes.is_empty() || critical_peers.is_empty() {
             return Ok(());
         }
-
-        // Log immediate propagation
-        error!(
-            "🚀 IMMEDIATE GOSSIP: Broadcasting {} urgent changes to {} peers",
-            urgent_changes.len(),
-            critical_peers.len()
-        );
 
         for change in &urgent_changes {
             match change {
@@ -1756,18 +1794,44 @@ impl GossipRegistry {
             }
         }
 
+        // Store count before moving
+        let urgent_changes_count = urgent_changes.len();
+
         // Create delta once and reuse
         let delta = RegistryDelta {
-            sender_addr: self.bind_addr,
+            sender_addr: self.bind_addr.to_string(),
             since_sequence: 0,   // Not used for immediate gossip
             current_sequence: 0, // Not used for immediate gossip
             changes: urgent_changes,
-            wall_clock_time: current_timestamp(),
+            wall_clock_time: current_timestamp(), // For debugging/monitoring only
+            precise_timing_nanos: crate::current_timestamp_nanos(), // High precision timing
         };
 
         // Serialize message once
-        let message = RegistryMessage::DeltaGossip { delta };
-        let serialized_data = bincode::serialize(&message)?;
+        let serialization_start = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let message = RegistryMessage::DeltaGossip {
+            delta: delta.clone(),
+        };
+        let serialized_data = Arc::new(rkyv::to_bytes::<rkyv::rancor::Error>(&message)?);
+
+        let serialization_end = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let serialization_duration_ms =
+            (serialization_end - serialization_start) as f64 / 1_000_000.0;
+
+        // Log immediate propagation with timing
+        error!(
+            "🚀 IMMEDIATE GOSSIP: Broadcasting {} urgent changes to {} peers (serialization: {:.3}ms)",
+            urgent_changes_count,
+            critical_peers.len(),
+            serialization_duration_ms
+        );
 
         if serialized_data.len() > self.config.max_message_size {
             return Err(GossipError::MessageTooLarge {
@@ -1776,27 +1840,46 @@ impl GossipRegistry {
             });
         }
 
-        // Send to all peers concurrently with minimal overhead
+        // Pre-establish all connections and pre-create buffers (single lock acquisition)
+        let peer_connections_buffers: Vec<(
+            SocketAddr,
+            crate::connection_pool::ConnectionHandle,
+            Vec<u8>,
+        )> = {
+            let mut pool_guard = self.connection_pool.lock().await;
+            let mut connections_buffers = Vec::new();
+
+            for peer_addr in &critical_peers {
+                if let Ok(conn) = pool_guard.get_connection(*peer_addr).await {
+                    // Create message buffer with length header using buffer pool
+                    let buffer = pool_guard.create_message_buffer(&serialized_data);
+                    connections_buffers.push((*peer_addr, conn, buffer));
+                }
+            }
+
+            connections_buffers
+        };
+
+        // Send to all peers concurrently with pre-established connections and buffers
         let mut join_handles = Vec::new();
-        let connection_pool = self.connection_pool.clone();
 
-        for peer_addr in critical_peers {
-            let data = serialized_data.clone();
-            let pool = connection_pool.clone();
-
+        for (peer_addr, conn, buffer) in peer_connections_buffers {
             let handle: tokio::task::JoinHandle<Result<()>> = tokio::spawn(async move {
-                // Get persistent connection
-                let conn = {
-                    let mut pool_guard = pool.lock().await;
-                    pool_guard.get_connection(peer_addr).await?
-                };
+                // Measure pure network send time
+                let send_start = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
 
-                // Send the pre-serialized data with length prefix
-                let len = data.len() as u32;
-                let mut buffer = Vec::with_capacity(4 + data.len());
-                buffer.extend_from_slice(&len.to_be_bytes());
-                buffer.extend_from_slice(&data);
                 conn.send_data(buffer).await?;
+
+                let send_end = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
+                let send_time_ms = (send_end - send_start) as f64 / 1_000_000.0;
+
+                debug!(peer = %peer_addr, send_time_ms = send_time_ms, "Network send completed");
 
                 Ok(())
             });
@@ -1913,8 +1996,8 @@ mod tests {
             priority: RegistrationPriority::Immediate,
         };
 
-        let serialized = bincode::serialize(&change).unwrap();
-        let deserialized: RegistryChange = bincode::deserialize(&serialized).unwrap();
+        let serialized = rkyv::to_bytes::<rkyv::rancor::Error>(&change).unwrap();
+        let deserialized: RegistryChange = rkyv::from_bytes::<RegistryChange, rkyv::rancor::Error>(&serialized).unwrap();
 
         match deserialized {
             RegistryChange::ActorAdded { name, .. } => {
@@ -1930,16 +2013,17 @@ mod tests {
             since_sequence: 10,
             current_sequence: 15,
             changes: vec![],
-            sender_addr: test_addr(8080),
+            sender_addr: test_addr(8080).to_string(),
             wall_clock_time: 1000,
+            precise_timing_nanos: 1000_000_000_000, // 1000 seconds in nanoseconds
         };
 
-        let serialized = bincode::serialize(&delta).unwrap();
-        let deserialized: RegistryDelta = bincode::deserialize(&serialized).unwrap();
+        let serialized = rkyv::to_bytes::<rkyv::rancor::Error>(&delta).unwrap();
+        let deserialized: RegistryDelta = rkyv::from_bytes::<RegistryDelta, rkyv::rancor::Error>(&serialized).unwrap();
 
         assert_eq!(deserialized.since_sequence, 10);
         assert_eq!(deserialized.current_sequence, 15);
-        assert_eq!(deserialized.sender_addr, test_addr(8080));
+        assert_eq!(deserialized.sender_addr, test_addr(8080).to_string());
     }
 
     #[test]
@@ -1962,12 +2046,13 @@ mod tests {
             since_sequence: 1,
             current_sequence: 2,
             changes: vec![],
-            sender_addr: test_addr(8080),
+            sender_addr: test_addr(8080).to_string(),
             wall_clock_time: 1000,
+            precise_timing_nanos: 1000_000_000_000, // 1000 seconds in nanoseconds
         };
         let msg = RegistryMessage::DeltaGossip { delta };
-        let serialized = bincode::serialize(&msg).unwrap();
-        let deserialized: RegistryMessage = bincode::deserialize(&serialized).unwrap();
+        let serialized = rkyv::to_bytes::<rkyv::rancor::Error>(&msg).unwrap();
+        let deserialized: RegistryMessage = rkyv::from_bytes::<RegistryMessage, rkyv::rancor::Error>(&serialized).unwrap();
         match deserialized {
             RegistryMessage::DeltaGossip { .. } => (),
             _ => panic!("Wrong message type"),
@@ -1975,12 +2060,12 @@ mod tests {
 
         // Test FullSyncRequest
         let msg = RegistryMessage::FullSyncRequest {
-            sender_addr: test_addr(8080),
+            sender_addr: test_addr(8080).to_string(),
             sequence: 10,
             wall_clock_time: 1000,
         };
-        let serialized = bincode::serialize(&msg).unwrap();
-        let deserialized: RegistryMessage = bincode::deserialize(&serialized).unwrap();
+        let serialized = rkyv::to_bytes::<rkyv::rancor::Error>(&msg).unwrap();
+        let deserialized: RegistryMessage = rkyv::from_bytes::<RegistryMessage, rkyv::rancor::Error>(&serialized).unwrap();
         match deserialized {
             RegistryMessage::FullSyncRequest { sequence, .. } => {
                 assert_eq!(sequence, 10);
@@ -2221,7 +2306,7 @@ mod tests {
 
         let found = registry.lookup_actor("local_actor").await;
         assert!(found.is_some());
-        assert_eq!(found.unwrap().address, test_addr(9001));
+        assert_eq!(found.unwrap().socket_addr().unwrap(), test_addr(9001));
 
         // Test non-existent actor
         let not_found = registry.lookup_actor("missing_actor").await;
@@ -2281,8 +2366,9 @@ mod tests {
                 location,
                 priority: RegistrationPriority::Normal,
             }],
-            sender_addr: test_addr(8081),
+            sender_addr: test_addr(8081).to_string(),
             wall_clock_time: current_timestamp(),
+            precise_timing_nanos: crate::current_timestamp_nanos(),
         };
 
         registry.apply_delta(delta).await.unwrap();
@@ -2313,8 +2399,9 @@ mod tests {
                 location: remote_location,
                 priority: RegistrationPriority::Normal,
             }],
-            sender_addr: test_addr(8081),
+            sender_addr: test_addr(8081).to_string(),
             wall_clock_time: current_timestamp(),
+            precise_timing_nanos: crate::current_timestamp_nanos(),
         };
 
         registry.apply_delta(delta).await.unwrap();
@@ -2322,7 +2409,7 @@ mod tests {
         // Verify local actor wasn't overridden
         let actor_state = registry.actor_state.read().await;
         let actor = actor_state.local_actors.get("local_actor").unwrap();
-        assert_eq!(actor.address, test_addr(9001)); // Still local address
+        assert_eq!(actor.socket_addr().unwrap(), test_addr(9001)); // Still local address
     }
 
     #[tokio::test]
@@ -2578,7 +2665,7 @@ mod tests {
         let task = GossipTask {
             peer_addr: test_addr(8081),
             message: RegistryMessage::FullSyncRequest {
-                sender_addr: test_addr(8080),
+                sender_addr: test_addr(8080).to_string(),
                 sequence: 10,
                 wall_clock_time: 1000,
             },

@@ -1,7 +1,7 @@
-use serde::{Deserialize, Serialize};
+use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 
 /// Priority levels for actor registrations
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Archive, RkyvSerialize, RkyvDeserialize)]
 pub enum RegistrationPriority {
     /// Normal priority - uses standard gossip intervals
     Normal = 0,
@@ -44,7 +44,7 @@ impl RegistrationPriority {
 }
 
 /// Consistency levels for read operations
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, RkyvSerialize, RkyvDeserialize)]
 pub enum ConsistencyLevel {
     /// Eventual consistency - may read stale data
     Eventual,
@@ -66,7 +66,10 @@ mod tests {
 
     #[test]
     fn test_registration_priority_default() {
-        assert_eq!(RegistrationPriority::default(), RegistrationPriority::Normal);
+        assert_eq!(
+            RegistrationPriority::default(),
+            RegistrationPriority::Normal
+        );
     }
 
     #[test]
@@ -102,8 +105,8 @@ mod tests {
     #[test]
     fn test_registration_priority_serialization() {
         let priority = RegistrationPriority::Immediate;
-        let serialized = bincode::serialize(&priority).unwrap();
-        let deserialized: RegistrationPriority = bincode::deserialize(&serialized).unwrap();
+        let serialized = rkyv::to_bytes::<rkyv::rancor::Error>(&priority).unwrap();
+        let deserialized: RegistrationPriority = rkyv::from_bytes::<RegistrationPriority, rkyv::rancor::Error>(&serialized).unwrap();
         assert_eq!(priority, deserialized);
     }
 
@@ -122,8 +125,8 @@ mod tests {
     #[test]
     fn test_consistency_level_serialization() {
         let level = ConsistencyLevel::Strong;
-        let serialized = bincode::serialize(&level).unwrap();
-        let deserialized: ConsistencyLevel = bincode::deserialize(&serialized).unwrap();
+        let serialized = rkyv::to_bytes::<rkyv::rancor::Error>(&level).unwrap();
+        let deserialized: ConsistencyLevel = rkyv::from_bytes::<ConsistencyLevel, rkyv::rancor::Error>(&serialized).unwrap();
         assert_eq!(level, deserialized);
     }
 
