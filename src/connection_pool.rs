@@ -645,7 +645,14 @@ macro_rules! tell_msg {
 /// All connections are persistent - there is no checkout/checkin
 /// Lock-free connection pool using atomic operations and lock-free data structures
 pub struct ConnectionPool {
-    /// Mapping: SocketAddr -> LockFreeConnection
+    /// PRIMARY: Mapping Peer ID -> LockFreeConnection
+    /// This is the main storage - we identify connections by peer ID, not address
+    connections_by_peer: dashmap::DashMap<crate::PeerId, Arc<LockFreeConnection>>,
+    /// SECONDARY: Mapping SocketAddr -> Peer ID (for incoming connection identification)
+    addr_to_peer_id: dashmap::DashMap<SocketAddr, crate::PeerId>,
+    /// Configuration: Peer ID -> Expected SocketAddr (where to connect)
+    pub peer_id_to_addr: dashmap::DashMap<crate::PeerId, SocketAddr>,
+    /// DEPRECATED: Old address-based connections for migration
     connections: dashmap::DashMap<SocketAddr, Arc<LockFreeConnection>>,
     max_connections: usize,
     connection_timeout: Duration,
@@ -1028,19 +1035,98 @@ impl ConnectionPool {
         const POOL_SIZE: usize = 256;
         const BUFFER_SIZE: usize = 8192;
         
-        Self {
-            connections: dashmap::DashMap::new(),
+        let pool = Self {
+            connections_by_peer: dashmap::DashMap::new(),
+            addr_to_peer_id: dashmap::DashMap::new(),
+            peer_id_to_addr: dashmap::DashMap::new(),
+            connections: dashmap::DashMap::new(), // DEPRECATED
             max_connections,
             connection_timeout,
             registry: None,
             message_buffer_pool: Arc::new(MessageBufferPool::new(POOL_SIZE, BUFFER_SIZE)),
             connection_counter: AtomicUsize::new(0),
-        }
+        };
+        
+        // Log the pool's address for debugging
+        info!("CONNECTION POOL: Created new pool at {:p}", &pool as *const _);
+        pool
     }
 
     /// Set the registry reference for handling incoming messages
     pub fn set_registry(&mut self, registry: std::sync::Arc<GossipRegistry>) {
         self.registry = Some(std::sync::Arc::downgrade(&registry));
+    }
+    
+    /// Store or update the address for a node
+    pub fn update_node_address(&self, node_id: &str, addr: SocketAddr) {
+        let peer_id = crate::PeerId::new(node_id);
+        self.peer_id_to_addr.insert(peer_id.clone(), addr);
+        self.addr_to_peer_id.insert(addr, peer_id);
+        info!("CONNECTION POOL: Updated address for node {} to {}", node_id, addr);
+    }
+    
+    /// Get a connection by node ID
+    pub fn get_connection_by_node_id(&self, node_id: &str) -> Option<Arc<LockFreeConnection>> {
+        // PRIMARY: Look up connection directly by node ID
+        let peer_id = crate::PeerId::new(node_id);
+        if let Some(conn_entry) = self.connections_by_peer.get(&peer_id) {
+            let conn = conn_entry.value().clone();
+            if conn.is_connected() {
+                info!("CONNECTION POOL: Found connection for node '{}'", node_id);
+                Some(conn)
+            } else {
+                warn!("CONNECTION POOL: Connection for node '{}' is disconnected", node_id);
+                None
+            }
+        } else {
+            warn!("CONNECTION POOL: No connection found for node '{}'", node_id);
+            // Debug: show what nodes we do have connections for
+            let connected_nodes: Vec<String> = self.connections_by_peer.iter()
+                .map(|entry| entry.key().as_str().to_string())
+                .collect();
+            warn!("CONNECTION POOL: Available node connections: {:?}", connected_nodes);
+            None
+        }
+    }
+    
+    /// Add a connection indexed by node ID
+    pub fn add_connection_by_node_id(&self, node_id: String, addr: SocketAddr, connection: Arc<LockFreeConnection>) -> bool {
+        // Convert to PeerId
+        let peer_id = crate::PeerId::new(&node_id);
+        
+        // Update the address mappings
+        self.addr_to_peer_id.insert(addr, peer_id.clone());
+        
+        // PRIMARY: Store the connection by peer ID
+        self.connections_by_peer.insert(peer_id, connection.clone());
+        
+        // DEPRECATED: Also store by address for backward compatibility
+        self.connections.insert(addr, connection);
+        
+        self.connection_counter.fetch_add(1, Ordering::AcqRel);
+        
+        info!("CONNECTION POOL: Added connection for node '{}' (address: {})", node_id, addr);
+        true
+    }
+    
+    /// Send data to a node by ID
+    pub fn send_to_node_id(&self, node_id: &str, data: &[u8]) -> Result<()> {
+        info!("CONNECTION POOL: send_to_node_id called for node '{}', pool has {} node connections", 
+              node_id, self.connections_by_peer.len());
+        if let Some(connection) = self.get_connection_by_node_id(node_id) {
+            if let Some(ref stream_handle) = connection.stream_handle {
+                info!("CONNECTION POOL: Sending {} bytes to node '{}'", data.len(), node_id);
+                return stream_handle.write_nonblocking(data);
+            } else {
+                warn!(node_id = %node_id, "Connection found but no stream handle");
+            }
+        } else {
+            warn!(node_id = %node_id, "No connection found for node");
+        }
+        Err(crate::GossipError::Network(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("Connection not found for node {}", node_id)
+        )))
     }
     
     /// Get or create a lock-free connection - NO MUTEX NEEDED
@@ -1078,68 +1164,37 @@ impl ConnectionPool {
         let connection_arc = Arc::new(connection);
         
         // Spawn reader task for this connection
+        // This reader needs to process incoming messages on outgoing connections
         let reader_connection = connection_arc.clone();
         let registry_weak = self.registry.clone();
         tokio::spawn(async move {
-            Self::handle_connection_reader(reader, addr, reader_connection, registry_weak).await;
+            info!(peer = %addr, "Starting reader task for outgoing connection");
+            handle_persistent_connection_reader(reader, addr, registry_weak).await;
+            reader_connection.set_state(ConnectionState::Disconnected);
+            info!(peer = %addr, "Reader task for outgoing connection ended");
         });
         
         // Insert into lock-free hash map
         self.connections.insert(addr, connection_arc.clone());
+        info!("CONNECTION POOL: Added lock-free connection to {} - pool now has {} connections", 
+              addr, self.connections.len());
         
         Ok(connection_arc)
     }
     
-    /// Handle incoming messages from a connection - no locks needed
-    async fn handle_connection_reader(
-        mut reader: tokio::net::tcp::OwnedReadHalf,
-        addr: SocketAddr,
-        connection: Arc<LockFreeConnection>,
-        registry: Option<std::sync::Weak<GossipRegistry>>,
-    ) {
-        use tokio::io::AsyncReadExt;
-        
-        let mut buffer = vec![0u8; 8192];
-        
-        loop {
-            match reader.read(&mut buffer).await {
-                Ok(0) => {
-                    // EOF - connection closed
-                    connection.set_state(ConnectionState::Disconnected);
-                    break;
-                }
-                Ok(n) => {
-                    connection.bytes_read.fetch_add(n, Ordering::Relaxed);
-                    connection.update_last_used();
-                    
-                    // Process the message if we have a registry
-                    if let Some(registry_weak) = &registry {
-                        if let Some(_registry) = registry_weak.upgrade() {
-                            // Process the received data
-                            let _data = &buffer[..n];
-                            // TODO: Replace with proper message handling once available
-                            // For now, just log that we received data
-                            debug!("Received {} bytes from {}", n, addr);
-                        }
-                    }
-                }
-                Err(e) => {
-                    // Connection error
-                    connection.set_state(ConnectionState::Failed);
-                    connection.increment_failure_count();
-                    error!("Connection error from {}: {}", addr, e);
-                    break;
-                }
-            }
-        }
-    }
     
     /// Send data through lock-free connection - NO BLOCKING
     pub fn send_lock_free(&self, addr: SocketAddr, data: &[u8]) -> Result<()> {
         if let Some(connection) = self.get_lock_free_connection(addr) {
             if let Some(ref stream_handle) = connection.stream_handle {
                 return stream_handle.write_nonblocking(data);
+            } else {
+                warn!(addr = %addr, "Connection found but no stream handle");
             }
+        } else {
+            warn!(addr = %addr, "No connection found for address");
+            warn!("Available connections: {:?}", 
+                self.connections.iter().map(|e| e.key().clone()).collect::<Vec<_>>());
         }
         Err(crate::GossipError::Network(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -1147,9 +1202,40 @@ impl ConnectionPool {
         )))
     }
     
+    /// Try to send data through any available connection for a node
+    /// This handles cases where we might have multiple connections (incoming/outgoing)
+    pub fn send_to_node(&self, node_addr: SocketAddr, data: &[u8], _registry: &GossipRegistry) -> Result<()> {
+        // First try direct lookup
+        if let Ok(()) = self.send_lock_free(node_addr, data) {
+            return Ok(());
+        }
+        
+        // If that fails, look for any connection that could reach this node
+        // This could be enhanced with a node ID -> connections mapping
+        debug!(node_addr = %node_addr, "Direct send failed, looking for alternative connections");
+        
+        // For now, we'll rely on the caller to handle fallback strategies
+        Err(crate::GossipError::Network(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("No connection found for node {}", node_addr)
+        )))
+    }
+    
     /// Remove a connection from the pool - lock-free operation
     pub fn remove_connection(&self, addr: SocketAddr) -> Option<Arc<LockFreeConnection>> {
+        // First remove from address-based map
         if let Some((_, connection)) = self.connections.remove(&addr) {
+            info!("CONNECTION POOL: Removed connection to {} - pool now has {} connections", 
+                  addr, self.connections.len());
+            
+            // Also remove from node ID mapping
+            if let Some(node_id_entry) = self.addr_to_peer_id.remove(&addr) {
+                let (_, node_id) = node_id_entry;
+                if let Some((_, _)) = self.connections_by_peer.remove(&node_id) {
+                    info!("CONNECTION POOL: Also removed connection by node ID '{}'", node_id);
+                }
+            }
+            
             self.connection_counter.fetch_sub(1, Ordering::AcqRel);
             Some(connection)
         } else {
@@ -1159,7 +1245,18 @@ impl ConnectionPool {
     
     /// Get connection count - lock-free operation
     pub fn connection_count(&self) -> usize {
-        self.connections.len()
+        let count = self.connections_by_peer.len();
+        if count == 0 {
+            // Debug: Show why we might have 0 connections
+            let connected_count = self.connections_by_peer.iter()
+                .filter(|entry| entry.value().is_connected())
+                .count();
+            if connected_count != count {
+                warn!("CONNECTION POOL: {} node connections exist but only {} are connected", 
+                      self.connections_by_peer.len(), connected_count);
+            }
+        }
+        count
     }
     
     /// Get all connected peers - lock-free operation
@@ -1174,6 +1271,11 @@ impl ConnectionPool {
                 }
             })
             .collect()
+    }
+    
+    /// Get all connections (including disconnected) - for debugging
+    pub fn get_all_connections(&self) -> Vec<SocketAddr> {
+        self.connections.iter().map(|entry| *entry.key()).collect()
     }
 
     /// Get a buffer from the pool or create a new one
@@ -1243,8 +1345,69 @@ impl ConnectionPool {
         None
     }
     
+    /// Get or create a connection to a node by its ID
+    pub async fn get_connection_to_node(&mut self, node_id: &str) -> Result<ConnectionHandle> {
+        // Convert string to PeerId for internal use
+        let peer_id = crate::PeerId::new(node_id);
+        info!("CONNECTION POOL: get_connection_to_node called for node '{}'", node_id);
+        
+        // First check if we already have a connection to this node
+        if let Some(conn_entry) = self.connections_by_peer.get(&peer_id) {
+            let conn = conn_entry.value();
+            if conn.is_connected() {
+                conn.update_last_used();
+                info!("CONNECTION POOL: Found existing connection to node '{}'", node_id);
+                
+                if let Some(ref stream_handle) = conn.stream_handle {
+                    // Need to get the address for ConnectionHandle
+                    let addr = conn.addr;
+                    return Ok(ConnectionHandle {
+                        addr,
+                        stream_handle: stream_handle.clone(),
+                    });
+                } else {
+                    return Err(crate::GossipError::Network(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "Connection exists but no stream handle"
+                    )));
+                }
+            } else {
+                // Remove disconnected connection
+                info!("CONNECTION POOL: Removing disconnected connection to node '{}'", node_id);
+                drop(conn_entry);
+                self.connections_by_peer.remove(&peer_id);
+            }
+        }
+        
+        // Look up the address for this node
+        let addr = if let Some(addr_entry) = self.peer_id_to_addr.get(&peer_id) {
+            *addr_entry.value()
+        } else {
+            return Err(crate::GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("No address configured for node '{}'", node_id)
+            )));
+        };
+        
+        info!("CONNECTION POOL: Creating new connection to node '{}' at {}", node_id, addr);
+        
+        // Create the connection and store it by node ID
+        let handle = self.get_connection(addr).await?;
+        
+        // After successful connection, ensure it's indexed by node ID
+        if let Some(conn) = self.connections.get(&addr) {
+            self.connections_by_peer.insert(peer_id.clone(), conn.value().clone());
+            self.addr_to_peer_id.insert(addr, peer_id.clone());
+            info!("CONNECTION POOL: Indexed new connection under node ID '{}'", node_id);
+        }
+        
+        Ok(handle)
+    }
+
     pub async fn get_connection(&mut self, addr: SocketAddr) -> Result<ConnectionHandle> {
         let _current_time = current_timestamp();
+        info!("CONNECTION POOL: get_connection called on pool at {:p} for {}", self as *const _, addr);
+        info!("CONNECTION POOL: This pool instance has {} connections stored", self.connections.len());
 
         // TEMPORARY: For backward compatibility, we'll create a hybrid approach
         // that allows the old ConnectionHandle API to work while we transition
@@ -1277,36 +1440,43 @@ impl ConnectionPool {
             }
         }
 
-        // Create new persistent connection
-        self.create_connection(addr).await
-    }
-
-    async fn create_connection(&mut self, addr: SocketAddr) -> Result<ConnectionHandle> {
-        debug!(peer = %addr, "creating new persistent connection");
-
+        // Extract what we need before any await points to avoid Send issues
+        let max_connections = self.max_connections;
+        let connection_timeout = self.connection_timeout;
+        let connections = self.connections.clone();
+        let registry_weak = self.registry.clone();
+        
         // Make room if necessary
-        if self.connections.len() >= self.max_connections {
-            let oldest_addr = self.connections.iter()
+        if connections.len() >= max_connections {
+            let oldest_addr = connections.iter()
                 .min_by_key(|entry| entry.value().last_used.load(Ordering::Acquire))
                 .map(|entry| *entry.key());
             
             if let Some(oldest) = oldest_addr {
-                self.connections.remove(&oldest);
+                connections.remove(&oldest);
                 warn!(addr = %oldest, "removed oldest connection to make room");
             }
         }
 
         // Connect with timeout
-        let stream = tokio::time::timeout(self.connection_timeout, TcpStream::connect(addr))
+        info!("CONNECTION POOL: Attempting to connect to {}", addr);
+        let stream = tokio::time::timeout(connection_timeout, TcpStream::connect(addr))
             .await
-            .map_err(|_| GossipError::Timeout)?
-            .map_err(GossipError::Network)?;
+            .map_err(|_| {
+                info!("CONNECTION POOL: Connection to {} timed out", addr);
+                GossipError::Timeout
+            })?
+            .map_err(|e| {
+                info!("CONNECTION POOL: Connection to {} failed: {}", addr, e);
+                GossipError::Network(e)
+            })?;
+        info!("CONNECTION POOL: Successfully connected to {}", addr);
 
         // Configure socket
         stream.set_nodelay(true).map_err(GossipError::Network)?;
 
         // Split the stream
-        let (reader, writer) = stream.into_split();
+        let (mut reader, writer) = stream.into_split();
         
         // Create lock-free connection for receiving
         let stream_handle = Arc::new(LockFreeStreamHandle::new(
@@ -1323,15 +1493,173 @@ impl ConnectionPool {
         
         let connection_arc = Arc::new(conn);
         
-        // Spawn reader task
+        // Insert into lock-free map before spawning
+        self.connections.insert(addr, connection_arc.clone());
+        info!("CONNECTION POOL: Added connection via get_connection to {} - pool now has {} connections", 
+              addr, self.connections.len());
+        // Double check it's really there
+        assert!(self.connections.contains_key(&addr), "Connection was not added to pool!");
+        info!("CONNECTION POOL: Verified connection exists for {}", addr);
+        
+        // Send initial FullSync message to identify ourselves
+        if let Some(registry_arc) = registry_weak.as_ref().and_then(|w| w.upgrade()) {
+            let initial_msg = {
+                let actor_state = registry_arc.actor_state.read().await;
+                let gossip_state = registry_arc.gossip_state.lock().await;
+                
+                RegistryMessage::FullSync {
+                    local_actors: actor_state.local_actors.clone().into_iter().map(|(k, v)| (k, v)).collect(),
+                    known_actors: actor_state.known_actors.clone().into_iter().map(|(k, v)| (k, v)).collect(),
+                    sender_peer_id: registry_arc.peer_id.clone(),
+                    sequence: gossip_state.gossip_sequence,
+                    wall_clock_time: crate::current_timestamp(),
+                }
+            };
+            
+            // Serialize and send the initial message
+            match rkyv::to_bytes::<rkyv::rancor::Error>(&initial_msg) {
+                Ok(data) => {
+                    let msg_buffer = self.create_message_buffer(&data);
+                    // Create a connection handle to send the message
+                    let conn_handle = ConnectionHandle {
+                        addr,
+                        stream_handle: stream_handle.clone(),
+                    };
+                    if let Err(e) = conn_handle.send_data(msg_buffer).await {
+                        warn!(peer = %addr, error = %e, "Failed to send initial FullSync message");
+                    } else {
+                        info!(peer = %addr, "Sent initial FullSync message to identify ourselves");
+                    }
+                }
+                Err(e) => {
+                    warn!(peer = %addr, error = %e, "Failed to serialize initial FullSync message");
+                }
+            }
+        }
+        
+        // Spawn reader task for outgoing connection
+        // This MUST process incoming messages to receive responses!
         let reader_connection = connection_arc.clone();
-        let registry_weak = self.registry.clone();
+        let registry_weak_for_reader = registry_weak.clone();
         tokio::spawn(async move {
-            Self::handle_connection_reader(reader, addr, reader_connection, registry_weak).await;
+            use tokio::io::AsyncReadExt;
+            info!(peer = %addr, "Starting outgoing connection reader with message processing");
+            
+            let mut partial_msg_buf = Vec::new();
+            let mut read_buf = vec![0u8; 4096];
+            
+            loop {
+                match reader.read(&mut read_buf).await {
+                    Ok(0) => {
+                        reader_connection.set_state(ConnectionState::Disconnected);
+                        info!(peer = %addr, "Outgoing connection closed by peer (EOF)");
+                        // Check if connection is still in pool
+                        if let Some(ref registry_weak) = registry_weak_for_reader {
+                            if let Some(registry) = registry_weak.upgrade() {
+                                let pool = registry.connection_pool.lock().await;
+                                info!(peer = %addr, "Connection still in pool after EOF? {}", 
+                                      pool.connections.contains_key(&addr));
+                            }
+                        }
+                        break;
+                    }
+                    Ok(n) => {
+                        partial_msg_buf.extend_from_slice(&read_buf[..n]);
+                        
+                        // Process complete messages
+                        while partial_msg_buf.len() >= 4 {
+                            let len = u32::from_be_bytes([partial_msg_buf[0], partial_msg_buf[1], partial_msg_buf[2], partial_msg_buf[3]]) as usize;
+                            
+                            if partial_msg_buf.len() >= 4 + len {
+                                // We have a complete message
+                                let msg_data = partial_msg_buf[4..4+len].to_vec();
+                                partial_msg_buf.drain(..4+len);
+                                
+                                // Process the message if we have a registry
+                                if let Some(ref registry_weak) = registry_weak_for_reader {
+                                    if let Some(registry) = registry_weak.upgrade() {
+                                        match rkyv::from_bytes::<RegistryMessage, rkyv::rancor::Error>(&msg_data) {
+                                            Ok(msg) => {
+                                                warn!(peer = %addr, "Received message on outgoing connection");
+                                                
+                                                // Extract node ID from message if available
+                                                let node_id = match &msg {
+                                                    RegistryMessage::FullSync { sender_peer_id, .. } => Some(sender_peer_id.as_str().to_string()),
+                                                    RegistryMessage::FullSyncResponse { sender_peer_id, .. } => Some(sender_peer_id.as_str().to_string()),
+                                                    _ => None,
+                                                };
+                                                
+                                                // Update node mapping if we got a node ID
+                                                if let Some(node_id) = node_id {
+                                                    let pool = registry.connection_pool.lock().await;
+                                                    pool.update_node_address(&node_id, addr);
+                                                    info!(peer = %addr, node_id = %node_id, "Updated node ID mapping from outgoing connection message");
+                                                }
+                                                
+                                                if let Err(e) = handle_incoming_message(registry, addr, msg).await {
+                                                    warn!(peer = %addr, error = %e, "Failed to handle message on outgoing connection");
+                                                }
+                                            }
+                                            Err(e) => {
+                                                warn!(peer = %addr, error = %e, "Failed to deserialize message on outgoing connection");
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                // Need more data
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        reader_connection.set_state(ConnectionState::Failed);
+                        warn!(peer = %addr, error = %e, "Outgoing connection error");
+                        break;
+                    }
+                }
+            }
+            
+            info!(peer = %addr, "Outgoing connection reader exited");
         });
         
-        // Insert into lock-free map
-        self.connections.insert(addr, connection_arc.clone());
+        // Reset failure state for this peer since we successfully connected
+        if let Some(ref registry_weak) = registry_weak {
+            if let Some(registry) = registry_weak.upgrade() {
+                let registry_clone = registry.clone();
+                let peer_addr = addr;
+                tokio::spawn(async move {
+                    let mut gossip_state = registry_clone.gossip_state.lock().await;
+                    
+                    // Check if we need to reset failures and clear pending
+                    let need_to_clear_pending = if let Some(peer_info) = gossip_state.peers.get_mut(&peer_addr) {
+                        let had_failures = peer_info.failures > 0;
+                        if had_failures {
+                            info!(peer = %peer_addr, 
+                                  prev_failures = peer_info.failures,
+                                  "✅ Successfully established outgoing connection - resetting failure state");
+                            peer_info.failures = 0;
+                            peer_info.last_failure_time = None;
+                        }
+                        peer_info.last_success = crate::current_timestamp();
+                        had_failures
+                    } else {
+                        false
+                    };
+                    
+                    // Clear pending failure record if needed
+                    if need_to_clear_pending {
+                        gossip_state.pending_peer_failures.remove(&peer_addr);
+                    }
+                });
+            }
+        }
+        
+        info!(peer = %addr, "successfully created new persistent connection");
+        
+        // Verify the connection is in the pool
+        info!("CONNECTION POOL: After get_connection, pool has {} connections", self.connections.len());
+        info!("CONNECTION POOL: Pool contains connection to {}? {}", addr, self.connections.contains_key(&addr));
         
         // Return a lock-free ConnectionHandle
         Ok(ConnectionHandle {
@@ -1339,6 +1667,7 @@ impl ConnectionPool {
             stream_handle: stream_handle,
         })
     }
+
 
     /// Mark a connection as disconnected
     pub fn mark_disconnected(&mut self, addr: SocketAddr) {
@@ -1365,49 +1694,6 @@ impl ConnectionPool {
             .count()
     }
 
-    /// Add a sender channel for an existing connection (used for incoming connections)
-    /// Supports bidirectional connections by allowing multiple connections to the same address
-    pub fn add_connection_sender(
-        &mut self,
-        listening_addr: SocketAddr,
-        peer_addr: SocketAddr,
-        writer: tokio::net::tcp::OwnedWriteHalf,
-    ) -> bool {
-        // Check if we already have a connection
-        if let Some(entry) = self.connections.get(&listening_addr) {
-            let conn = entry.value();
-            // If we already have a stream handle, just update state
-            if conn.stream_handle.is_some() {
-                conn.set_state(ConnectionState::Connected);
-                conn.update_last_used();
-                info!(peer = %peer_addr, listening = %listening_addr, 
-                      "updated existing lock-free connection for incoming sender");
-                // Drop the new writer since we already have one
-                drop(writer);
-                return true;
-            }
-        }
-        
-        // Create lock-free stream handle with the writer
-        let stream_handle = Arc::new(LockFreeStreamHandle::new(
-            writer,
-            listening_addr,
-            ChannelId::Global,
-            4096,
-        ));
-        
-        // Create or update the connection
-        let mut conn = LockFreeConnection::new(listening_addr);
-        conn.stream_handle = Some(stream_handle);
-        conn.set_state(ConnectionState::Connected);
-        conn.update_last_used();
-        
-        self.connections.insert(listening_addr, Arc::new(conn));
-        
-        info!(peer = %peer_addr, listening = %listening_addr, 
-              "added new lock-free connection with writer for incoming sender");
-        true
-    }
 
     /// Check if we have a connection to a peer by address
     pub fn has_connection(&self, addr: &SocketAddr) -> bool {
@@ -1472,9 +1758,10 @@ pub(crate) async fn handle_incoming_persistent_connection(
     
     // Add writer to connection pool if needed
     if let Some(registry_weak) = &registry_weak {
-        if let Some(registry) = registry_weak.upgrade() {
-            let mut pool = registry.connection_pool.lock().await;
-            pool.add_connection_sender(listening_addr, _peer_addr, writer);
+        if let Some(_registry) = registry_weak.upgrade() {
+            // Note: We don't add the connection here anymore as we need the node ID first
+            // The connection will be added when we receive the first message with node ID
+            drop(writer);
         }
     } else {
         // No registry, just drop the writer
@@ -1762,7 +2049,7 @@ pub(crate) async fn handle_incoming_message(
     match msg {
         RegistryMessage::DeltaGossip { delta } => {
             debug!(
-                sender = %delta.sender_addr,
+                sender = %delta.sender_peer_id,
                 since_sequence = delta.since_sequence,
                 changes = delta.changes.len(),
                 "received delta gossip message on bidirectional connection"
@@ -1772,17 +2059,12 @@ pub(crate) async fn handle_incoming_message(
             {
                 let mut gossip_state = registry.gossip_state.lock().await;
                 
-                // Parse sender address once for consistent use
-                let sender_socket_addr = if let Ok(addr) = delta.sender_addr.parse::<SocketAddr>() {
-                    addr
-                } else {
-                    warn!("Invalid sender address: {}", delta.sender_addr);
-                    return Ok(());
-                };
+                // Use the actual peer address we received from
+                let sender_socket_addr = _peer_addr;
                 
                 // Add the sender as a peer (inlined to avoid separate lock)
-                if delta.sender_addr != registry.bind_addr.to_string() {
-                        if let std::collections::hash_map::Entry::Vacant(e) = gossip_state.peers.entry(sender_socket_addr) {
+                if delta.sender_peer_id != registry.peer_id {
+                    if let std::collections::hash_map::Entry::Vacant(e) = gossip_state.peers.entry(sender_socket_addr) {
                         let current_time = crate::current_timestamp();
                         e.insert(crate::registry::PeerInfo {
                             address: sender_socket_addr,
@@ -1807,7 +2089,7 @@ pub(crate) async fn handle_incoming_message(
 
                 if was_failed {
                     info!(
-                        peer = %delta.sender_addr,
+                        peer = %delta.sender_peer_id,
                         "✅ Received delta from previously failed peer - connection restored!"
                     );
 
@@ -1817,12 +2099,15 @@ pub(crate) async fn handle_incoming_message(
                         .remove(&sender_socket_addr);
                 }
 
-                // Update peer info
-                if let Some(peer_info) = gossip_state.peers.get_mut(&sender_socket_addr) {
-                    // Only reset failure state if peer was actually failed
-                    // Don't reset if just a buffered message after connection failure
-                    if peer_info.failures >= registry.config.max_peer_failures {
-                        info!(peer = %delta.sender_addr, "peer reconnected - resetting failure state");
+                // Update peer info and check if we need to clear pending failures
+                let need_to_clear_pending = if let Some(peer_info) = gossip_state.peers.get_mut(&sender_socket_addr) {
+                    // Always reset failure state when we receive messages from the peer
+                    // This proves the peer is alive and communicating
+                    let had_failures = peer_info.failures > 0;
+                    if had_failures {
+                        info!(peer = %delta.sender_peer_id, 
+                              prev_failures = peer_info.failures,
+                              "🔄 Resetting failure state after receiving DeltaGossip");
                         peer_info.failures = 0;
                         peer_info.last_failure_time = None;
                     }
@@ -1831,6 +2116,15 @@ pub(crate) async fn handle_incoming_message(
                     peer_info.last_sequence =
                         std::cmp::max(peer_info.last_sequence, delta.current_sequence);
                     peer_info.consecutive_deltas += 1;
+                    
+                    had_failures
+                } else {
+                    false
+                };
+                
+                // Clear pending failure record if needed
+                if need_to_clear_pending {
+                    gossip_state.pending_peer_failures.remove(&sender_socket_addr);
                 }
                 gossip_state.delta_exchanges += 1;
             }
@@ -1839,12 +2133,8 @@ pub(crate) async fn handle_incoming_message(
             // Apply the delta directly here to minimize async scheduling delays
             {
                 let total_changes = delta.changes.len();
-                let sender_addr = if let Ok(addr) = delta.sender_addr.parse::<SocketAddr>() {
-                    addr
-                } else {
-                    warn!("Invalid sender address in delta: {}", delta.sender_addr);
-                    return Ok(());
-                };
+                // Use the actual peer address we received from
+                let sender_addr = _peer_addr;
                 
                 // Pre-compute priority flags to avoid redundant checks
                 let has_immediate = delta.changes.iter().any(|change| match change {
@@ -2060,33 +2350,24 @@ pub(crate) async fn handle_incoming_message(
         RegistryMessage::FullSync {
             local_actors,
             known_actors,
-            sender_addr,
+            sender_peer_id,
             sequence,
             wall_clock_time,
         } => {
-            // Parse sender address once for consistent use
-            let sender_socket_addr = if let Ok(addr) = sender_addr.parse::<SocketAddr>() {
-                addr
-            } else {
-                warn!("Invalid sender address: {}", sender_addr);
-                return Ok(());
-            };
+            // We no longer have sender address - will need to handle differently
+            let sender_socket_addr = _peer_addr; // Use the actual peer address
+            
+            // Note: sender_peer_id is now a PeerId (e.g., "node_a"), not an address
+            debug!("Received FullSync from node '{}' at address {}", sender_peer_id, sender_socket_addr);
             
             // OPTIMIZATION: Do all peer management in one lock acquisition
-            let failed_peers = {
+            {
                 let mut gossip_state = registry.gossip_state.lock().await;
                 
-                // Calculate failed peers count
-                let active_peers = gossip_state
-                    .peers
-                    .values()
-                    .filter(|p| p.failures < registry.config.max_peer_failures)
-                    .count();
-                let failed_peers = gossip_state.peers.len() - active_peers;
-                
                 // Add the sender as a peer (inlined to avoid separate lock)
-                if sender_addr != registry.bind_addr.to_string() {
+                if sender_socket_addr != registry.bind_addr {
                     if let std::collections::hash_map::Entry::Vacant(e) = gossip_state.peers.entry(sender_socket_addr) {
+                        info!(peer = %sender_socket_addr, "Adding new peer from FullSync");
                         let current_time = crate::current_timestamp();
                         e.insert(crate::registry::PeerInfo {
                             address: sender_socket_addr,
@@ -2102,46 +2383,40 @@ pub(crate) async fn handle_incoming_message(
                     }
                 }
 
-                // Check if this is a previously failed peer
-                let was_failed = gossip_state
-                    .peers
-                    .get(&sender_socket_addr)
-                    .map(|info| info.failures >= registry.config.max_peer_failures)
+                // Update peer info and reset failure state
+                let had_failures = gossip_state.peers.get(&sender_socket_addr)
+                    .map(|info| info.failures > 0)
                     .unwrap_or(false);
-
-                if was_failed {
-                    info!(
-                        peer = %sender_addr,
-                        "✅ Received full sync from previously failed peer - connection restored!"
-                    );
-
+                
+                if had_failures {
                     // Clear the pending failure record
                     gossip_state.pending_peer_failures.remove(&sender_socket_addr);
                 }
-
-                // Update peer info
+                
                 if let Some(peer_info) = gossip_state.peers.get_mut(&sender_socket_addr) {
-                    // Only reset failure state if peer was actually failed
-                    // Don't reset if just a buffered message after connection failure
-                    if peer_info.failures >= registry.config.max_peer_failures {
-                        info!(peer = %sender_addr, "peer reconnected - resetting failure state");
+                    let prev_failures = peer_info.failures;
+                    // Always reset failure state when we receive a FullSync from the peer
+                    // This proves the peer is alive and communicating
+                    if peer_info.failures > 0 {
+                        info!(peer = %sender_socket_addr, 
+                              prev_failures = prev_failures,
+                              "🔄 Resetting failure state after receiving FullSync");
                         peer_info.failures = 0;
                         peer_info.last_failure_time = None;
                     }
                     peer_info.last_success = crate::current_timestamp();
                     peer_info.consecutive_deltas = 0;
+                } else {
+                    warn!(peer = %sender_socket_addr, "Peer not found in peer list when trying to reset failure state");
                 }
                 gossip_state.full_sync_exchanges += 1;
-                
-                failed_peers
-            };
+            }
 
             info!(
-                sender = %sender_addr,
+                sender = %sender_peer_id,
                 sequence = sequence,
                 local_actors = local_actors.len(),
                 known_actors = known_actors.len(),
-                failed_peers = failed_peers,
                 "📨 INCOMING: Received full sync message on bidirectional connection"
             );
 
@@ -2150,25 +2425,143 @@ pub(crate) async fn handle_incoming_message(
                 .merge_full_sync(
                     local_actors.into_iter().collect(),
                     known_actors.into_iter().collect(),
-                    sender_addr.parse::<SocketAddr>().unwrap_or_else(|_| {
-                        warn!("Invalid sender address: {}", sender_addr);
-                        "127.0.0.1:0".parse().unwrap()
-                    }),
+                    sender_socket_addr,
                     sequence,
                     wall_clock_time,
                 )
                 .await;
 
-            // Note: Response will be sent during regular gossip rounds
+            // Send back our state as a response so the sender can receive our actors
+            // This is critical for late-joining nodes (like Node C) to get existing state
+            {
+                // Get our current state
+                let (our_local_actors, our_known_actors, our_sequence) = {
+                    let actor_state = registry.actor_state.read().await;
+                    let gossip_state = registry.gossip_state.lock().await;
+                    (
+                        actor_state.local_actors.clone(),
+                        actor_state.known_actors.clone(),
+                        gossip_state.gossip_sequence,
+                    )
+                };
+                
+                // Calculate sizes before moving
+                let local_actors_count = our_local_actors.len();
+                let known_actors_count = our_known_actors.len();
+                
+                // Create a FullSyncResponse message
+                let response = RegistryMessage::FullSyncResponse {
+                    local_actors: our_local_actors.into_iter().map(|(k, v)| (k, v)).collect(),
+                    known_actors: our_known_actors.into_iter().map(|(k, v)| (k, v)).collect(),
+                    sender_peer_id: registry.peer_id.clone(), // Use peer ID
+                    sequence: our_sequence,
+                    wall_clock_time: crate::current_timestamp(),
+                };
+                
+                // Send the response back through existing connection
+                // We'll use send_lock_free which doesn't create new connections
+                let response_data = match rkyv::to_bytes::<rkyv::rancor::Error>(&response) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        warn!(error = %e, "Failed to serialize FullSync response");
+                        return Ok(());
+                    }
+                };
+                
+                // Try to send immediately on existing connection
+                {
+                    info!("FULLSYNC RESPONSE: Node {} is about to acquire connection pool lock", registry.bind_addr);
+                    let pool = registry.connection_pool.lock().await;
+                    info!("FULLSYNC RESPONSE: Node {} got pool lock, pool has {} total entries", 
+                          registry.bind_addr, pool.connection_count());
+                    info!("FULLSYNC RESPONSE: Pool instance address: {:p}", &*pool);
+                    
+                    // Log details about each connection
+                    for entry in pool.connections.iter() {
+                        let addr = entry.key();
+                        let conn = entry.value();
+                        info!("FULLSYNC RESPONSE: Connection to {} - state={:?}", 
+                              addr, conn.get_state());
+                    }
+                    
+                    // Create message with length prefix
+                    let mut buffer = Vec::with_capacity(4 + response_data.len());
+                    buffer.extend_from_slice(&(response_data.len() as u32).to_be_bytes());
+                    buffer.extend_from_slice(&response_data);
+                    
+                    // Debug: Log what connections we have
+                    info!(
+                        "FULLSYNC RESPONSE DEBUG: Available connections by addr: {:?}", 
+                        pool.connections.iter().map(|entry| entry.key().clone()).collect::<Vec<_>>()
+                    );
+                    info!(
+                        "FULLSYNC RESPONSE DEBUG: Available node mappings: {:?}",
+                        pool.peer_id_to_addr.iter().map(|entry| (entry.key().clone(), entry.value().clone())).collect::<Vec<_>>()
+                    );
+                    info!(
+                        "FULLSYNC RESPONSE DEBUG: Looking for connection to sender_peer_id: {}", 
+                        sender_peer_id
+                    );
+                    info!("FULLSYNC RESPONSE DEBUG: sender_socket_addr={}", sender_socket_addr);
+                    
+                    // Try to send using peer ID
+                    let send_result = match pool.send_to_node_id(sender_peer_id.as_str(), &buffer) {
+                        Ok(()) => Ok(()),
+                        Err(e) => {
+                            warn!("Failed to send via peer ID {}: {}", sender_peer_id, e);
+                            // Fall back to socket address
+                            pool.send_lock_free(sender_socket_addr, &buffer)
+                        }
+                    };
+                    
+                    if send_result.is_err() {
+                        warn!(
+                            "Primary send failed for peer {}, no fallback available",
+                            sender_peer_id
+                        );
+                    }
+                    
+                    match send_result {
+                        Ok(()) => {
+                            info!(peer = %sender_socket_addr, 
+                                  peer_id = %sender_peer_id,
+                                  local_actors = local_actors_count,
+                                  known_actors = known_actors_count,
+                                  bind_addr = %registry.bind_addr,
+                                  "📤 RESPONSE: Successfully sent FullSync response with our state");
+                        }
+                        Err(e) => {
+                            // If we can't send immediately, queue it for the next gossip round
+                            warn!(peer = %sender_socket_addr, 
+                                  peer_id = %sender_peer_id,
+                                  error = %e, 
+                                  "Could not send FullSync response immediately - will be sent in next gossip round");
+                            
+                            // Store in gossip state to be sent during next gossip round
+                            drop(pool); // Release the pool lock first
+                            let mut gossip_state = registry.gossip_state.lock().await;
+                            
+                            // Mark that we need to send a full sync to this peer
+                            if let Some(peer_info) = gossip_state.peers.get_mut(&sender_socket_addr) {
+                                // Force a full sync on the next gossip round
+                                peer_info.consecutive_deltas = registry.config.max_delta_history as u64;
+                                info!(peer = %sender_socket_addr, 
+                                      "Marked peer for full sync in next gossip round");
+                            }
+                        }
+                    }
+                }
+            }
+
             Ok(())
         }
         RegistryMessage::FullSyncRequest {
-            sender_addr,
+            sender_peer_id,
             sequence: _,
             wall_clock_time: _,
         } => {
             debug!(
-                sender = %sender_addr,
+                sender = %sender_peer_id,
                 "received full sync request on bidirectional connection"
             );
 
@@ -2183,7 +2576,7 @@ pub(crate) async fn handle_incoming_message(
         // Handle response messages (these can arrive on incoming connections too)
         RegistryMessage::DeltaGossipResponse { delta } => {
             debug!(
-                sender = %delta.sender_addr,
+                sender = %delta.sender_peer_id,
                 changes = delta.changes.len(),
                 "received delta gossip response on bidirectional connection"
             );
@@ -2199,29 +2592,54 @@ pub(crate) async fn handle_incoming_message(
         RegistryMessage::FullSyncResponse {
             local_actors,
             known_actors,
-            sender_addr,
+            sender_peer_id,
             sequence,
             wall_clock_time,
         } => {
-            debug!(
-                sender = %sender_addr,
-                "received full sync response on bidirectional connection"
+            info!(
+                sender = %sender_peer_id,
+                local_actors = local_actors.len(),
+                known_actors = known_actors.len(),
+                "📥 RECEIVED: FullSyncResponse from peer"
             );
+
+            // Use the actual peer address we're connected to
+            let sender_socket_addr = _peer_addr;
 
             registry
                 .merge_full_sync(
                     local_actors.into_iter().collect(),
                     known_actors.into_iter().collect(),
-                    sender_addr.parse::<SocketAddr>().unwrap_or_else(|_| {
-                        warn!("Invalid sender address: {}", sender_addr);
-                        "127.0.0.1:0".parse().unwrap()
-                    }),
+                    sender_socket_addr,
                     sequence,
                     wall_clock_time,
                 )
                 .await;
 
+            // Reset failure state when receiving response
             let mut gossip_state = registry.gossip_state.lock().await;
+            
+            // Reset failure state for responding peer
+            let need_to_clear_pending = if let Some(peer_info) = gossip_state.peers.get_mut(&sender_socket_addr) {
+                let had_failures = peer_info.failures > 0;
+                if had_failures {
+                    info!(peer = %sender_socket_addr, 
+                          prev_failures = peer_info.failures,
+                          "🔄 Resetting failure state after receiving FullSyncResponse");
+                    peer_info.failures = 0;
+                    peer_info.last_failure_time = None;
+                }
+                peer_info.last_success = crate::current_timestamp();
+                had_failures
+            } else {
+                false
+            };
+            
+            // Clear pending failure record if needed
+            if need_to_clear_pending {
+                gossip_state.pending_peer_failures.remove(&sender_socket_addr);
+            }
+            
             gossip_state.full_sync_exchanges += 1;
             Ok(())
         }
@@ -2237,9 +2655,17 @@ pub(crate) async fn handle_incoming_message(
             );
 
             // Check our connection status to the target peer
+            let target_addr = match target_peer.parse::<SocketAddr>() {
+                Ok(addr) => addr,
+                Err(_) => {
+                    warn!("Invalid target peer address in health query: {}", target_peer);
+                    return Ok(());
+                }
+            };
+            
             let is_alive = {
                 let pool = registry.connection_pool.lock().await;
-                pool.has_connection(&target_peer.parse::<SocketAddr>().unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap()))
+                pool.has_connection(&target_addr)
             };
 
             let last_contact = if is_alive {
@@ -2249,7 +2675,7 @@ pub(crate) async fn handle_incoming_message(
                 let gossip_state = registry.gossip_state.lock().await;
                 gossip_state
                     .peers
-                    .get(&target_peer.parse::<SocketAddr>().unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap()))
+                    .get(&target_addr)
                     .map(|info| info.last_success)
                     .unwrap_or(0)
             };
@@ -2262,7 +2688,7 @@ pub(crate) async fn handle_incoming_message(
                 let gossip_state = registry.gossip_state.lock().await;
                 gossip_state
                     .peers
-                    .get(&target_peer.parse::<SocketAddr>().unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap()))
+                    .get(&target_addr)
                     .map(|info| info.failures as u32)
                     .unwrap_or(0)
             };
@@ -2277,18 +2703,25 @@ pub(crate) async fn handle_incoming_message(
             );
 
             let report = RegistryMessage::PeerHealthReport {
-                reporter: registry.bind_addr.to_string(),
+                reporter: registry.peer_id.clone(),
                 peer_statuses: peer_statuses.into_iter().collect(),
                 timestamp: crate::current_timestamp(),
             };
 
             // Send report back to the querying peer
             if let Ok(data) = rkyv::to_bytes::<rkyv::rancor::Error>(&report) {
-                let mut pool = registry.connection_pool.lock().await;
-                if let Ok(conn) = pool.get_connection(sender.parse::<SocketAddr>().unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap())).await {
-                    // Create message buffer with length header using buffer pool
-                    let buffer = pool.create_message_buffer(&data);
-                    let _ = conn.send_data(buffer).await;
+                let pool = registry.connection_pool.lock().await;
+                // Use the actual peer address we received from
+                let sender_addr = _peer_addr;
+                
+                // Create message with length prefix
+                let mut buffer = Vec::with_capacity(4 + data.len());
+                buffer.extend_from_slice(&(data.len() as u32).to_be_bytes());
+                buffer.extend_from_slice(&data);
+                
+                // Use send_lock_free which doesn't create new connections
+                if let Err(e) = pool.send_lock_free(sender_addr, &buffer) {
+                    warn!(peer = %sender_addr, error = %e, "Failed to send peer health report");
                 }
             }
 
@@ -2309,11 +2742,14 @@ pub(crate) async fn handle_incoming_message(
             {
                 let mut gossip_state = registry.gossip_state.lock().await;
                 for (peer, status) in peer_statuses {
-                    gossip_state
-                        .peer_health_reports
-                        .entry(peer.parse::<SocketAddr>().unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap()))
-                        .or_insert_with(HashMap::new)
-                        .insert(reporter.parse::<SocketAddr>().unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap()), status);
+                    if let Ok(peer_addr) = peer.parse::<SocketAddr>() {
+                        // For now, use the reporter's peer address from the connection
+                        gossip_state
+                            .peer_health_reports
+                            .entry(peer_addr)
+                            .or_insert_with(HashMap::new)
+                            .insert(_peer_addr, status);
+                    }
                 }
             }
 
@@ -2477,24 +2913,6 @@ mod tests {
         assert_eq!(pool.connection_count(), 0);
     }
 
-    #[tokio::test]
-    async fn test_add_connection_sender() {
-        let mut pool = ConnectionPool::new(10, Duration::from_secs(5));
-        let listening_addr = "127.0.0.1:8080".parse().unwrap();
-        let peer_addr = "127.0.0.1:9090".parse().unwrap();
-        
-        // Create a mock stream using a TCP server for testing
-        let server_addr = create_test_server().await;
-        sleep(Duration::from_millis(10)).await;
-        let stream = tokio::net::TcpStream::connect(server_addr).await.unwrap();
-        let (_, writer) = stream.into_split();
-        // Writer is now owned directly by LockFreeStreamHandle
-
-        let added = pool.add_connection_sender(listening_addr, peer_addr, writer);
-        assert!(added);
-        assert!(pool.has_connection(&listening_addr));
-        assert_eq!(pool.connection_count(), 1);
-    }
 
     #[tokio::test]
     async fn test_cleanup_stale_connections() {
@@ -2540,10 +2958,17 @@ mod tests {
         let (_, writer) = stream.into_split();
         // Writer is now owned directly by LockFreeStreamHandle
         
+        // Create a LockFreeStreamHandle first
+        let stream_handle = Arc::new(LockFreeStreamHandle::new(
+            writer,
+            "127.0.0.1:8080".parse().unwrap(),
+            ChannelId::Global,
+            1024,
+        ));
+        
         let handle = ConnectionHandle {
             addr: "127.0.0.1:8080".parse().unwrap(),
-            writer,
-            global_ring_buffer: None,
+            stream_handle,
         };
 
         let data = vec![1, 2, 3, 4];
@@ -2562,10 +2987,17 @@ mod tests {
         let _ = writer.shutdown().await; // Close the writer
         // Writer is now owned directly by LockFreeStreamHandle
 
+        // Create a LockFreeStreamHandle first
+        let stream_handle = Arc::new(LockFreeStreamHandle::new(
+            writer,
+            "127.0.0.1:8080".parse().unwrap(),
+            ChannelId::Global,
+            1024,
+        ));
+        
         let handle = ConnectionHandle {
             addr: "127.0.0.1:8080".parse().unwrap(),
-            writer,
-            global_ring_buffer: None,
+            stream_handle,
         };
 
         let result = handle.send_data(vec![1, 2, 3]).await;
@@ -2591,16 +3023,9 @@ mod tests {
         let (_, writer) = stream.into_split();
         // Writer is now owned directly by LockFreeStreamHandle
 
-        let conn = PersistentConnection {
-            writer,
-            peer_addr: addr,
-            last_used,
-            connected: true,
-        };
-
-        assert_eq!(conn.peer_addr, addr);
-        assert_eq!(conn.last_used, last_used);
-        assert!(conn.connected);
+        // Test creating a LockFreeStreamHandle
+        let stream_handle = Arc::new(LockFreeStreamHandle::new(writer, addr, ChannelId::Global, 1024));
+        assert!(stream_handle.channel_id == ChannelId::Global);
     }
 
     #[tokio::test]

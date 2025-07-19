@@ -13,48 +13,48 @@ async fn main() {
         .init();
 
     let config = GossipConfig {
-        key_pair: Some(KeyPair::new_for_testing("node_a")),
+        key_pair: Some(KeyPair::new_for_testing("node_c")),
         gossip_interval: Duration::from_secs(TEST_GOSSIP_INTERVAL_SECS),
         ..Default::default()
     };
 
-    println!("Starting Node A on 127.0.0.1:8001...");
+    println!("Starting Node C on 127.0.0.1:8003...");
     let handle = GossipRegistryHandle::new(
-        "127.0.0.1:8001".parse().unwrap(),
+        "127.0.0.1:8003".parse().unwrap(),
         vec![], // No initial peers
         Some(config),
     )
     .await
-    .expect("Failed to create node A");
+    .expect("Failed to create node C");
 
-    println!("Node A started at {}", handle.registry.bind_addr);
+    println!("Node C started at {}", handle.registry.bind_addr);
     
     // Add peers and attempt connections
+    let peer_a = handle.add_peer(&PeerId::new("node_a")).await;
     let peer_b = handle.add_peer(&PeerId::new("node_b")).await;
-    let peer_c = handle.add_peer(&PeerId::new("node_c")).await;
+    
+    println!("Attempting to connect to node_a...");
+    match peer_a.connect(&"127.0.0.1:8001".parse().unwrap()).await {
+        Ok(_) => println!("Connected to node_a"),
+        Err(e) => println!("Failed to connect to node_a: {}", e),
+    }
     
     println!("Attempting to connect to node_b...");
     match peer_b.connect(&"127.0.0.1:8002".parse().unwrap()).await {
         Ok(_) => println!("Connected to node_b"),
         Err(e) => println!("Failed to connect to node_b: {}", e),
     }
-    
-    println!("Attempting to connect to node_c...");
-    match peer_c.connect(&"127.0.0.1:8003".parse().unwrap()).await {
-        Ok(_) => println!("Connected to node_c"),
-        Err(e) => println!("Failed to connect to node_c: {}", e),
-    }
 
-    // Register a local actor with immediate priority
+    // Register a local actor with immediate priority for fast propagation
     handle
         .register_with_priority(
-            "node_a".to_string(),
-            "127.0.0.1:9001".parse().unwrap(),
+            "node_c".to_string(),
+            "127.0.0.1:9003".parse().unwrap(),
             RegistrationPriority::Immediate,
         )
         .await
         .expect("Failed to register actor");
-    println!("Registered node_a on Node A with immediate priority");
+    println!("Registered node_c on Node C with immediate priority");
 
     // Monitor peer status
     loop {
@@ -128,7 +128,7 @@ async fn main() {
         };
         
         println!(
-            "Node A - Configured peers: {}, Connected: {}, Active: {}, Failed: {}, Known actors: {}, Local actors: {}",
+            "Node C - Configured peers: {}, Connected: {}, Active: {}, Failed: {}, Known actors: {}, Local actors: {}",
             configured_peers, connected_peers, stats.active_peers, stats.failed_peers, stats.known_actors, stats.local_actors
         );
         println!("Peer Status:");

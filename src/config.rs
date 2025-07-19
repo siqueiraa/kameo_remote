@@ -22,6 +22,8 @@ pub const DEFAULT_SMALL_CLUSTER_THRESHOLD: usize = 5;
 /// Configuration for the gossip registry
 #[derive(Debug, Clone)]
 pub struct GossipConfig {
+    /// Node's key pair for identification (must be unique in the cluster)
+    pub key_pair: Option<crate::KeyPair>,
     /// Interval between gossip rounds
     pub gossip_interval: Duration,
     /// Maximum number of peers to gossip to in each round
@@ -79,6 +81,7 @@ pub struct GossipConfig {
 impl Default for GossipConfig {
     fn default() -> Self {
         Self {
+            key_pair: None,
             gossip_interval: Duration::from_secs(DEFAULT_GOSSIP_INTERVAL_SECS),
             max_gossip_peers: 3,
             actor_ttl: Duration::from_secs(300),

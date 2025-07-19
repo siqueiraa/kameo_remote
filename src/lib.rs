@@ -1,4 +1,4 @@
-pub mod actor_location;
+pub mod remote_actor_location;
 pub mod config;
 pub mod connection_pool;
 mod handle;
@@ -11,11 +11,101 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tracing::error;
 
-pub use actor_location::ActorLocation;
+pub use remote_actor_location::RemoteActorLocation;
 pub use config::GossipConfig;
 pub use handle::GossipRegistryHandle;
 pub use priority::{ConsistencyLevel, RegistrationPriority};
 pub use connection_pool::{DelegatedReplySender, LockFreeStreamHandle, StreamFrameType, ChannelId};
+
+/// Key pair for node identity (using strings for now, will be cryptographic keys later)
+#[derive(Debug, Clone)]
+pub struct KeyPair {
+    /// Public key - shared with other nodes
+    pub public_key: String,
+    /// Private key - kept secret by the node
+    pub private_key: String,
+}
+
+impl KeyPair {
+    /// Create a new key pair
+    pub fn new(public_key: impl Into<String>, private_key: impl Into<String>) -> Self {
+        Self {
+            public_key: public_key.into(),
+            private_key: private_key.into(),
+        }
+    }
+    
+    /// For testing - create a key pair where private key = public key
+    pub fn new_for_testing(id: impl Into<String>) -> Self {
+        let id = id.into();
+        Self {
+            public_key: id.clone(),
+            private_key: id,
+        }
+    }
+}
+
+/// Peer identifier - just the public key
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct PeerId(String);
+
+impl PeerId {
+    /// Create a new peer ID from a public key
+    pub fn new(public_key: impl Into<String>) -> Self {
+        Self(public_key.into())
+    }
+    
+    /// Get the public key as a string
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for PeerId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<String> for PeerId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl From<&str> for PeerId {
+    fn from(s: &str) -> Self {
+        Self(s.to_string())
+    }
+}
+
+/// Handle to a configured peer
+#[derive(Clone)]
+pub struct Peer {
+    peer_id: PeerId,
+    registry: std::sync::Arc<registry::GossipRegistry>,
+}
+
+impl Peer {
+    /// Connect to this peer at the specified address
+    pub async fn connect(&self, addr: &SocketAddr) -> Result<()> {
+        // First configure the address for this peer
+        {
+            let pool = self.registry.connection_pool.lock().await;
+            pool.peer_id_to_addr.insert(self.peer_id.clone(), *addr);
+        }
+        
+        // Then attempt to connect
+        self.registry.connect_to_peer(self.peer_id.as_str()).await
+    }
+    
+    /// Get the peer ID
+    pub fn id(&self) -> &PeerId {
+        &self.peer_id
+    }
+}
+
 
 /// Errors that can occur in the gossip registry
 #[derive(Error, Debug)]
