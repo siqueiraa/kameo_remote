@@ -2,13 +2,43 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
-use std::sync::atomic::{AtomicBool, AtomicUsize, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, AtomicU32, AtomicU16, Ordering};
 
 use crate::{
     current_timestamp,
     registry::{GossipRegistry, RegistryMessage},
     GossipError, Result,
 };
+
+/// Process mock requests for testing
+#[cfg(feature = "test-helpers")]
+fn process_mock_request(request: &str) -> Vec<u8> {
+    if request.starts_with("ECHO:") {
+        let content = &request[5..];
+        format!("ECHOED:{}", content).into_bytes()
+    } else if request.starts_with("REVERSE:") {
+        let content = &request[8..];
+        let reversed: String = content.chars().rev().collect();
+        format!("REVERSED:{}", reversed).into_bytes()
+    } else if request.starts_with("COUNT:") {
+        let content = &request[6..];
+        format!("COUNTED:{} chars", content.len()).into_bytes()
+    } else if request.starts_with("HASH:") {
+        let content = &request[5..];
+        let hash = std::collections::hash_map::DefaultHasher::new();
+        use std::hash::{Hash, Hasher};
+        content.hash(&mut hash.clone());
+        format!("HASHED:{:x}", hash.finish()).into_bytes()
+    } else {
+        // Default response
+        format!("RECEIVED:{} bytes, content: '{}'", request.len(), request).into_bytes()
+    }
+}
+
+#[cfg(not(feature = "test-helpers"))]
+fn process_mock_request(_request: &str) -> Vec<u8> {
+    vec![]
+}
 
 /// Stream frame types for high-performance streaming protocol
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +119,7 @@ pub struct LockFreeConnection {
     pub bytes_read: AtomicUsize,
     pub failure_count: AtomicUsize,
     pub stream_handle: Option<Arc<LockFreeStreamHandle>>,
+    pub correlation: Option<Arc<CorrelationTracker>>,
 }
 
 impl LockFreeConnection {
@@ -101,6 +132,7 @@ impl LockFreeConnection {
             bytes_read: AtomicUsize::new(0),
             failure_count: AtomicUsize::new(0),
             stream_handle: None,
+            correlation: Some(CorrelationTracker::new()),
         }
     }
     
@@ -665,12 +697,94 @@ pub struct ConnectionPool {
 }
 
 
+/// Maximum number of pending responses (must be power of 2 for fast modulo)
+const PENDING_RESPONSES_SIZE: usize = 1024;
+
+/// Pending response slot
+type PendingResponse = Option<tokio::sync::oneshot::Sender<Vec<u8>>>;
+
+/// Shared state for correlation tracking
+pub(crate) struct CorrelationTracker {
+    /// Next correlation ID to use
+    next_id: AtomicU16,
+    /// Fixed-size array of pending responses
+    pending: [parking_lot::Mutex<PendingResponse>; PENDING_RESPONSES_SIZE],
+}
+
+impl std::fmt::Debug for CorrelationTracker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CorrelationTracker")
+            .field("next_id", &self.next_id.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
+impl CorrelationTracker {
+    fn new() -> Arc<Self> {
+        // Create array of None values
+        let pending = std::array::from_fn(|_| parking_lot::Mutex::new(None));
+        Arc::new(Self {
+            next_id: AtomicU16::new(1),
+            pending,
+        })
+    }
+    
+    /// Allocate a correlation ID and store the response sender
+    fn allocate(&self, sender: tokio::sync::oneshot::Sender<Vec<u8>>) -> u16 {
+        loop {
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            if id == 0 {
+                continue; // Skip 0 as it's reserved
+            }
+            
+            let slot = (id as usize) % PENDING_RESPONSES_SIZE;
+            let mut pending = self.pending[slot].lock();
+            
+            // If slot is empty, use it
+            if pending.is_none() {
+                *pending = Some(sender);
+                return id;
+            }
+            
+            // Slot is occupied, try next ID
+        }
+    }
+    
+    /// Complete a pending request with a response
+    fn complete(&self, correlation_id: u16, response: Vec<u8>) {
+        let slot = (correlation_id as usize) % PENDING_RESPONSES_SIZE;
+        let mut pending = self.pending[slot].lock();
+        
+        if let Some(sender) = pending.take() {
+            let _ = sender.send(response);
+        }
+    }
+    
+    /// Cancel a pending request
+    fn cancel(&self, correlation_id: u16) {
+        let slot = (correlation_id as usize) % PENDING_RESPONSES_SIZE;
+        let mut pending = self.pending[slot].lock();
+        pending.take();
+    }
+}
+
 /// Handle to send messages through a persistent connection - LOCK-FREE
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ConnectionHandle {
     pub addr: SocketAddr,
     // Direct lock-free stream handle - NO MUTEX!
     stream_handle: Arc<LockFreeStreamHandle>,
+    // Correlation tracker for ask/response
+    correlation: Arc<CorrelationTracker>,
+}
+
+impl std::fmt::Debug for ConnectionHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionHandle")
+            .field("addr", &self.addr)
+            .field("stream_handle", &self.stream_handle)
+            .finish()
+    }
 }
 
 /// Delegated reply sender for asynchronous response handling
@@ -810,6 +924,11 @@ impl ConnectionHandle {
         self.stream_handle.write_nonblocking(&data)
     }
     
+    /// Send raw bytes without any framing - used by ReplyTo
+    pub fn send_raw_bytes(&self, data: &[u8]) -> Result<()> {
+        self.stream_handle.write_nonblocking(data)
+    }
+    
     /// Raw tell() - LOCK-FREE write (used internally)
     pub async fn tell_raw(&self, data: &[u8]) -> Result<()> {
         // Create message with length header
@@ -925,17 +1044,79 @@ impl ConnectionHandle {
     /// Ask method for request-response (Note: This is a simplified implementation)
     /// For full request-response, you would need a proper protocol with correlation IDs
     pub async fn ask(&self, request: &[u8]) -> Result<Vec<u8>> {
-        // This is a placeholder implementation
-        // In a real system, you'd need:
-        // 1. Correlation IDs to match requests with responses
-        // 2. Response handling mechanism
-        // 3. Timeout handling
+        // Create oneshot channel for response
+        let (tx, rx) = tokio::sync::oneshot::channel();
         
-        // For now, we'll just send the request
-        self.tell(request).await?;
+        // Allocate correlation ID
+        let correlation_id = self.correlation.allocate(tx);
         
-        // Return a dummy response
-        Ok(format!("RESPONSE:{}", request.len()).into_bytes())
+        // Create ask message with length prefix + 8-byte header + payload
+        let total_size = 8 + request.len();
+        let mut message = Vec::with_capacity(4 + total_size);
+        
+        // Length prefix (4 bytes)
+        message.extend_from_slice(&(total_size as u32).to_be_bytes());
+        
+        // Header: [type:1][correlation_id:2][reserved:5]
+        message.push(crate::MessageType::Ask as u8);
+        message.extend_from_slice(&correlation_id.to_be_bytes());
+        message.extend_from_slice(&[0u8; 5]); // Reserved bytes
+        message.extend_from_slice(request);
+        
+        // Send the message
+        self.stream_handle.write_nonblocking(&message)?;
+        
+        tracing::debug!(
+            correlation_id = correlation_id,
+            request_size = request.len(),
+            "ask: sent message with correlation ID"
+        );
+        
+        // Wait for response with default timeout (30 seconds)
+        match tokio::time::timeout(Duration::from_secs(30), rx).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(_)) => Err(crate::GossipError::Network(
+                std::io::Error::new(std::io::ErrorKind::Other, "Response channel closed")
+            )),
+            Err(_) => Err(crate::GossipError::Timeout),
+        }
+    }
+    
+    /// Ask method that returns a ReplyTo handle for delegated replies
+    pub async fn ask_with_reply_to(&self, request: &[u8]) -> Result<crate::ReplyTo> {
+        // Create oneshot channel for response (we won't use it for ReplyTo)
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        
+        // Allocate correlation ID 
+        let correlation_id = self.correlation.allocate(tx);
+        
+        // Create ask message with length prefix + 8-byte header + payload
+        let total_size = 8 + request.len();
+        let mut message = Vec::with_capacity(4 + total_size);
+        
+        // Length prefix (4 bytes)
+        message.extend_from_slice(&(total_size as u32).to_be_bytes());
+        
+        // Header: [type:1][correlation_id:2][reserved:5]
+        message.push(crate::MessageType::Ask as u8);
+        message.extend_from_slice(&correlation_id.to_be_bytes());
+        message.extend_from_slice(&[0u8; 5]); // Reserved bytes
+        message.extend_from_slice(request);
+        
+        // Send the message
+        self.stream_handle.write_nonblocking(&message)?;
+        
+        tracing::debug!(
+            correlation_id = correlation_id,
+            request_size = request.len(),
+            "ask_with_reply_to: sent message with correlation ID"
+        );
+        
+        // Return ReplyTo handle
+        Ok(crate::ReplyTo {
+            correlation_id,
+            connection: Arc::new(self.clone()),
+        })
     }
     
     /// Ask method with delegated reply sender for asynchronous response handling
@@ -1364,6 +1545,7 @@ impl ConnectionPool {
                     return Ok(ConnectionHandle {
                         addr,
                         stream_handle: stream_handle.clone(),
+                        correlation: conn.correlation.clone().unwrap_or_else(|| CorrelationTracker::new()),
                     });
                 } else {
                     return Err(crate::GossipError::Network(std::io::Error::new(
@@ -1424,6 +1606,7 @@ impl ConnectionPool {
                     return Ok(ConnectionHandle {
                         addr,
                         stream_handle: stream_handle.clone(),
+                        correlation: conn.correlation.clone().unwrap_or_else(|| CorrelationTracker::new()),
                     });
                 } else {
                     // Connection exists but no stream handle - this shouldn't happen
@@ -1524,6 +1707,7 @@ impl ConnectionPool {
                     let conn_handle = ConnectionHandle {
                         addr,
                         stream_handle: stream_handle.clone(),
+                        correlation: connection_arc.correlation.clone().unwrap_or_else(|| CorrelationTracker::new()),
                     };
                     if let Err(e) = conn_handle.send_data(msg_buffer).await {
                         warn!(peer = %addr, error = %e, "Failed to send initial FullSync message");
@@ -1572,13 +1756,100 @@ impl ConnectionPool {
                             
                             if partial_msg_buf.len() >= 4 + len {
                                 // We have a complete message
-                                let msg_data = partial_msg_buf[4..4+len].to_vec();
+                                let msg_data = &partial_msg_buf[4..4+len];
+                                
+                                // Check if this is an Ask/Response message by looking at first byte
+                                if msg_data.len() >= 1 {
+                                    if let Some(msg_type) = crate::MessageType::from_byte(msg_data[0]) {
+                                        // This is an Ask/Response message
+                                        if msg_data.len() < 8 {
+                                            warn!(peer = %addr, "Ask/Response message too small");
+                                            partial_msg_buf.drain(..4+len);
+                                            continue;
+                                        }
+                                        
+                                        let correlation_id = u16::from_be_bytes([msg_data[1], msg_data[2]]);
+                                        let payload = &msg_data[8..];
+                                        
+                                        match msg_type {
+                                            crate::MessageType::Ask => {
+                                                // Handle incoming Ask requests for testing
+                                                #[cfg(feature = "test-helpers")]
+                                                {
+                                                    if let Some(ref registry_weak) = registry_weak_for_reader {
+                                                        if let Some(registry) = registry_weak.upgrade() {
+                                                            let conn = {
+                                                                let pool = registry.connection_pool.lock().await;
+                                                                pool.connections.get(&addr).map(|conn_ref| conn_ref.value().clone())
+                                                            };
+                                                            
+                                                            if let Some(conn) = conn {
+                                                                // Process the request and generate response
+                                                                let request_str = String::from_utf8_lossy(payload);
+                                                                let response = process_mock_request(&request_str);
+                                                                
+                                                                // Send response back
+                                                                if let Some(ref stream_handle) = conn.stream_handle {
+                                                                    let mut msg = Vec::with_capacity(4 + 8 + response.len());
+                                                                    let total_size = 8 + response.len();
+                                                                    msg.extend_from_slice(&(total_size as u32).to_be_bytes());
+                                                                    msg.push(crate::MessageType::Response as u8);
+                                                                    msg.extend_from_slice(&correlation_id.to_be_bytes());
+                                                                    msg.extend_from_slice(&[0u8; 5]);
+                                                                    msg.extend_from_slice(&response);
+                                                                    
+                                                                    if let Err(e) = stream_handle.write_nonblocking(&msg) {
+                                                                        warn!(peer = %addr, error = %e, "Failed to send Ask response");
+                                                                    } else {
+                                                                        debug!(peer = %addr, correlation_id = correlation_id, "Sent Ask response");
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                #[cfg(not(feature = "test-helpers"))]
+                                                {
+                                                    warn!(peer = %addr, correlation_id = correlation_id, "Received Ask request - not implemented in production");
+                                                }
+                                            }
+                                            crate::MessageType::Response => {
+                                                // Handle incoming response
+                                                if let Some(ref registry_weak) = registry_weak_for_reader {
+                                                    if let Some(registry) = registry_weak.upgrade() {
+                                                        // Find the connection with this peer
+                                                        let conn = {
+                                                            let pool = registry.connection_pool.lock().await;
+                                                            pool.connections.get(&addr).map(|c| c.value().clone())
+                                                        };
+                                                        
+                                                        if let Some(conn) = conn {
+                                                            if let Some(ref correlation) = conn.correlation {
+                                                                correlation.complete(correlation_id, payload.to_vec());
+                                                                debug!(peer = %addr, correlation_id = correlation_id, "Delivered response to correlation tracker");
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            crate::MessageType::Tell => {
+                                                warn!(peer = %addr, "Received Tell message in Ask/Response format - unexpected");
+                                            }
+                                        }
+                                        
+                                        partial_msg_buf.drain(..4+len);
+                                        continue;
+                                    }
+                                }
+                                
+                                // This is a gossip protocol message
+                                let msg_data_vec = msg_data.to_vec();
                                 partial_msg_buf.drain(..4+len);
                                 
                                 // Process the message if we have a registry
                                 if let Some(ref registry_weak) = registry_weak_for_reader {
                                     if let Some(registry) = registry_weak.upgrade() {
-                                        match rkyv::from_bytes::<RegistryMessage, rkyv::rancor::Error>(&msg_data) {
+                                        match rkyv::from_bytes::<RegistryMessage, rkyv::rancor::Error>(&msg_data_vec) {
                                             Ok(msg) => {
                                                 warn!(peer = %addr, "Received message on outgoing connection");
                                                 
@@ -1665,6 +1936,7 @@ impl ConnectionPool {
         Ok(ConnectionHandle {
             addr,
             stream_handle: stream_handle,
+            correlation: connection_arc.correlation.clone().unwrap_or_else(|| CorrelationTracker::new()),
         })
     }
 
@@ -1807,7 +2079,99 @@ pub(crate) async fn handle_persistent_connection_reader(
                     
                     let total_len = 4 + len;
                     if partial_msg_buf.len() >= total_len {
-                        let msg_data = partial_msg_buf[4..total_len].to_vec();
+                        let msg_data = &partial_msg_buf[4..total_len];
+                        
+                        // Check if this is an Ask/Response message by looking at first byte
+                        if msg_data.len() >= 1 {
+                            if let Some(msg_type) = crate::MessageType::from_byte(msg_data[0]) {
+                                // This is an Ask/Response message
+                                if msg_data.len() < 8 {
+                                    warn!(peer = %peer_addr, "Ask/Response message too small");
+                                    partial_msg_buf.drain(..total_len);
+                                    continue;
+                                }
+                                
+                                let correlation_id = u16::from_be_bytes([msg_data[1], msg_data[2]]);
+                                let payload = &msg_data[8..];
+                                
+                                match msg_type {
+                                    crate::MessageType::Ask => {
+                                        // Handle incoming Ask requests for testing
+                                        #[cfg(feature = "test-helpers")]
+                                        {
+                                            if let Some(ref registry_weak) = registry_weak {
+                                                if let Some(registry) = registry_weak.upgrade() {
+                                                    let conn = {
+                                                        let pool = registry.connection_pool.lock().await;
+                                                        pool.connections.get(&peer_addr).map(|conn_ref| conn_ref.value().clone())
+                                                    };
+                                                    
+                                                    if let Some(conn) = conn {
+                                                        // Process the request and generate response
+                                                        let request_str = String::from_utf8_lossy(payload);
+                                                        let response_data = process_mock_request(&request_str);
+                                                        
+                                                        // Build response message
+                                                        let total_size = 8 + response_data.len();
+                                                        let mut msg = Vec::with_capacity(4 + total_size);
+                                                        
+                                                        // Length prefix
+                                                        msg.extend_from_slice(&(total_size as u32).to_be_bytes());
+                                                        
+                                                        // Header: [type:1][corr_id:2][reserved:5]
+                                                        msg.push(crate::MessageType::Response as u8);
+                                                        msg.extend_from_slice(&correlation_id.to_be_bytes());
+                                                        msg.extend_from_slice(&[0u8; 5]);
+                                                        msg.extend_from_slice(&response_data);
+                                                        
+                                                        // Send response back through stream handle
+                                                        if let Some(ref stream_handle) = conn.stream_handle {
+                                                            if let Err(e) = stream_handle.write_nonblocking(&msg) {
+                                                                warn!("Failed to send mock response: {}", e);
+                                                            } else {
+                                                                debug!("Sent mock response for correlation_id {}", correlation_id);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        #[cfg(not(feature = "test-helpers"))]
+                                        {
+                                            warn!(peer = %peer_addr, correlation_id = correlation_id, "Received Ask request - not implemented in production");
+                                        }
+                                    }
+                                    crate::MessageType::Response => {
+                                        // Handle incoming response
+                                        if let Some(ref registry_weak) = registry_weak {
+                                            if let Some(registry) = registry_weak.upgrade() {
+                                                // Find the connection with this peer
+                                                let conn = {
+                                                    let pool = registry.connection_pool.lock().await;
+                                                    pool.connections.get(&peer_addr).map(|c| c.value().clone())
+                                                };
+                                                
+                                                if let Some(conn) = conn {
+                                                    if let Some(ref correlation) = conn.correlation {
+                                                        correlation.complete(correlation_id, payload.to_vec());
+                                                        debug!(peer = %peer_addr, correlation_id = correlation_id, "Delivered response to correlation tracker");
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    crate::MessageType::Tell => {
+                                        warn!(peer = %peer_addr, "Received Tell message in Ask/Response format - unexpected");
+                                    }
+                                }
+                                
+                                partial_msg_buf.drain(..total_len);
+                                continue;
+                            }
+                        }
+                        
+                        // This is a gossip protocol message
+                        let msg_data_vec = msg_data.to_vec();
                         partial_msg_buf.drain(..total_len);
                         
                         // Add timing right after TCP read - BEFORE any deserialization
@@ -1819,7 +2183,7 @@ pub(crate) async fn handle_persistent_connection_reader(
                         // Process message
                         if let Some(ref registry_weak) = registry_weak {
                             if let Some(registry) = registry_weak.upgrade() {
-                                if let Ok(msg) = rkyv::from_bytes::<crate::registry::RegistryMessage, rkyv::rancor::Error>(&msg_data) {
+                                if let Ok(msg) = rkyv::from_bytes::<crate::registry::RegistryMessage, rkyv::rancor::Error>(&msg_data_vec) {
                                     // Debug: Show timing right after TCP read, before any processing
                                     match &msg {
                                         crate::registry::RegistryMessage::DeltaGossip { delta } => {
@@ -1898,6 +2262,7 @@ async fn handle_persistent_connection_impl(
 
                     // Try to process complete messages
                     while partial_msg_buf.len() >= 4 {
+                        // All messages now have 4-byte length prefix
                         let len = u32::from_be_bytes([
                             partial_msg_buf[0],
                             partial_msg_buf[1],
@@ -1915,10 +2280,98 @@ async fn handle_persistent_connection_impl(
 
                         let total_len = 4 + len;
                         if partial_msg_buf.len() >= total_len {
-                            // OPTIMIZATION: Zero-copy deserialization - avoid to_vec() allocation
                             let msg_data = &partial_msg_buf[4..total_len];
-
-                            // Process message immediately without spawning task
+                            
+                            // Check if this is an Ask/Response message by looking at first byte
+                            if msg_data.len() >= 1 {
+                                if let Some(msg_type) = crate::MessageType::from_byte(msg_data[0]) {
+                                    // This is an Ask/Response message
+                                    if msg_data.len() < 8 {
+                                        warn!(peer = %peer_addr, "Ask/Response message too small");
+                                        partial_msg_buf.drain(..total_len);
+                                        continue;
+                                    }
+                                    
+                                    let correlation_id = u16::from_be_bytes([msg_data[1], msg_data[2]]);
+                                    let payload = &msg_data[8..];
+                                    
+                                    match msg_type {
+                                        crate::MessageType::Ask => {
+                                            // Handle incoming Ask requests for testing
+                                            #[cfg(feature = "test-helpers")]
+                                            {
+                                                if let Some(ref registry_weak) = registry_weak_read {
+                                                    if let Some(registry) = registry_weak.upgrade() {
+                                                        let conn = {
+                                                            let pool = registry.connection_pool.lock().await;
+                                                            pool.connections.get(&peer_addr).map(|conn_ref| conn_ref.value().clone())
+                                                        };
+                                                        
+                                                        if let Some(conn) = conn {
+                                                            // Process the request and generate response
+                                                            let request_str = String::from_utf8_lossy(payload);
+                                                            let response_data = process_mock_request(&request_str);
+                                                            
+                                                            // Build response message
+                                                            let total_size = 8 + response_data.len();
+                                                            let mut msg = Vec::with_capacity(4 + total_size);
+                                                            
+                                                            // Length prefix
+                                                            msg.extend_from_slice(&(total_size as u32).to_be_bytes());
+                                                            
+                                                            // Header: [type:1][corr_id:2][reserved:5]
+                                                            msg.push(crate::MessageType::Response as u8);
+                                                            msg.extend_from_slice(&correlation_id.to_be_bytes());
+                                                            msg.extend_from_slice(&[0u8; 5]);
+                                                            msg.extend_from_slice(&response_data);
+                                                            
+                                                            // Send response back through stream handle
+                                                            if let Some(ref stream_handle) = conn.stream_handle {
+                                                                if let Err(e) = stream_handle.write_nonblocking(&msg) {
+                                                                    warn!("Failed to send mock response: {}", e);
+                                                                } else {
+                                                                    debug!("Sent mock response for correlation_id {}", correlation_id);
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            #[cfg(not(feature = "test-helpers"))]
+                                            {
+                                                warn!(peer = %peer_addr, correlation_id = correlation_id, "Received Ask request - not implemented in production");
+                                            }
+                                        }
+                                        crate::MessageType::Response => {
+                                            // Handle incoming response
+                                            if let Some(ref registry_weak) = registry_weak_read {
+                                                if let Some(registry) = registry_weak.upgrade() {
+                                                    // Find the connection with this peer
+                                                    let conn = {
+                                                        let pool = registry.connection_pool.lock().await;
+                                                        pool.connections.get(&peer_addr).map(|c| c.value().clone())
+                                                    };
+                                                    
+                                                    if let Some(conn) = conn {
+                                                        if let Some(ref correlation) = conn.correlation {
+                                                            correlation.complete(correlation_id, payload.to_vec());
+                                                            debug!(peer = %peer_addr, correlation_id = correlation_id, "Delivered response to correlation tracker");
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        crate::MessageType::Tell => {
+                                            warn!(peer = %peer_addr, "Received Tell message in Ask/Response format - unexpected");
+                                        }
+                                    }
+                                    
+                                    partial_msg_buf.drain(..total_len);
+                                    continue;
+                                }
+                            }
+                            
+                            // This is a gossip protocol message
                             match rkyv::from_bytes::<RegistryMessage, rkyv::rancor::Error>(msg_data) {
                                 Ok(msg) => {
                                     if let Some(ref registry_weak) = registry_weak_read {
@@ -2969,6 +3422,7 @@ mod tests {
         let handle = ConnectionHandle {
             addr: "127.0.0.1:8080".parse().unwrap(),
             stream_handle,
+            correlation: CorrelationTracker::new(),
         };
 
         let data = vec![1, 2, 3, 4];
@@ -2998,6 +3452,7 @@ mod tests {
         let handle = ConnectionHandle {
             addr: "127.0.0.1:8080".parse().unwrap(),
             stream_handle,
+            correlation: CorrelationTracker::new(),
         };
 
         let result = handle.send_data(vec![1, 2, 3]).await;
@@ -3014,7 +3469,7 @@ mod tests {
     #[tokio::test]
     async fn test_persistent_connection() {
         let addr = "127.0.0.1:8080".parse().unwrap();
-        let last_used = current_timestamp();
+        let _last_used = current_timestamp();
         
         // Create a mock stream using a TCP server for testing
         let server_addr = create_test_server().await;

@@ -92,7 +92,8 @@ impl GossipRegistryHandle {
         address: SocketAddr,
         priority: RegistrationPriority,
     ) -> Result<()> {
-        let location = RemoteActorLocation::new_with_priority(address, priority);
+        let mut location = RemoteActorLocation::new_with_peer(address, self.registry.peer_id.clone());
+        location.priority = priority;
         self.registry
             .register_actor_with_priority(name, location, priority)
             .await
@@ -105,7 +106,8 @@ impl GossipRegistryHandle {
         address: SocketAddr,
         priority: RegistrationPriority,
     ) -> Result<()> {
-        let location = RemoteActorLocation::new_with_priority(address, priority);
+        let mut location = RemoteActorLocation::new_with_peer(address, self.registry.peer_id.clone());
+        location.priority = priority;
         self.registry
             .register_actor_with_priority(name, location, priority)
             .await

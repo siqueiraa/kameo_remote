@@ -4,6 +4,7 @@ pub mod connection_pool;
 mod handle;
 pub mod priority;
 pub mod registry;
+pub mod reply_to;
 
 use std::io;
 use std::net::SocketAddr;
@@ -16,6 +17,7 @@ pub use config::GossipConfig;
 pub use handle::GossipRegistryHandle;
 pub use priority::{ConsistencyLevel, RegistrationPriority};
 pub use connection_pool::{DelegatedReplySender, LockFreeStreamHandle, StreamFrameType, ChannelId};
+pub use reply_to::{ReplyTo, TimeoutReplyTo};
 
 /// Key pair for node identity (using strings for now, will be cryptographic keys later)
 #[derive(Debug, Clone)]
@@ -90,14 +92,171 @@ pub struct Peer {
 impl Peer {
     /// Connect to this peer at the specified address
     pub async fn connect(&self, addr: &SocketAddr) -> Result<()> {
+        // Validate the address
+        if addr.port() == 0 {
+            return Err(GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Invalid port 0 for peer {}", self.peer_id),
+            )));
+        }
+
         // First configure the address for this peer
         {
             let pool = self.registry.connection_pool.lock().await;
             pool.peer_id_to_addr.insert(self.peer_id.clone(), *addr);
         }
         
-        // Then attempt to connect
-        self.registry.connect_to_peer(self.peer_id.as_str()).await
+        // Then attempt to connect with enhanced error context
+        match self.registry.connect_to_peer(self.peer_id.as_str()).await {
+            Ok(()) => {
+                tracing::info!(
+                    peer_id = %self.peer_id,
+                    addr = %addr,
+                    "Successfully connected to peer"
+                );
+                Ok(())
+            }
+            Err(GossipError::Network(io_err)) => {
+                tracing::error!(
+                    peer_id = %self.peer_id,
+                    addr = %addr,
+                    error = %io_err,
+                    "Network error connecting to peer"
+                );
+                Err(GossipError::Network(std::io::Error::new(
+                    io_err.kind(),
+                    format!("Failed to connect to peer {} at {}: {}", self.peer_id, addr, io_err),
+                )))
+            }
+            Err(GossipError::Timeout) => {
+                tracing::error!(
+                    peer_id = %self.peer_id,
+                    addr = %addr,
+                    "Connection timeout when connecting to peer"
+                );
+                Err(GossipError::Network(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("Connection timeout to peer {} at {}", self.peer_id, addr),
+                )))
+            }
+            Err(GossipError::ConnectionExists) => {
+                tracing::debug!(
+                    peer_id = %self.peer_id,
+                    addr = %addr,
+                    "Connection already exists to peer"
+                );
+                // This is not really an error - connection already exists
+                Ok(())
+            }
+            Err(GossipError::Shutdown) => {
+                tracing::error!(
+                    peer_id = %self.peer_id,
+                    addr = %addr,
+                    "Registry is shutting down, cannot connect to peer"
+                );
+                Err(GossipError::Shutdown)
+            }
+            Err(other_err) => {
+                tracing::error!(
+                    peer_id = %self.peer_id,
+                    addr = %addr,
+                    error = %other_err,
+                    "Unexpected error connecting to peer"
+                );
+                Err(other_err)
+            }
+        }
+    }
+    
+    /// Connect to this peer with retry attempts
+    pub async fn connect_with_retry(
+        &self, 
+        addr: &SocketAddr, 
+        max_retries: u32, 
+        retry_delay: std::time::Duration
+    ) -> Result<()> {
+        let mut last_error = None;
+        
+        for attempt in 0..=max_retries {
+            match self.connect(addr).await {
+                Ok(()) => return Ok(()),
+                Err(GossipError::Shutdown) => {
+                    // Don't retry if registry is shutting down
+                    return Err(GossipError::Shutdown);
+                }
+                Err(err) => {
+                    last_error = Some(err);
+                    if attempt < max_retries {
+                        tracing::warn!(
+                            peer_id = %self.peer_id,
+                            addr = %addr,
+                            attempt = attempt + 1,
+                            max_retries = max_retries,
+                            "Connection attempt failed, retrying in {:?}",
+                            retry_delay
+                        );
+                        tokio::time::sleep(retry_delay).await;
+                    }
+                }
+            }
+        }
+        
+        // All retries failed
+        let final_error = last_error.unwrap_or_else(|| GossipError::Network(
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Unknown error during connection attempts"
+            )
+        ));
+        
+        tracing::error!(
+            peer_id = %self.peer_id,
+            addr = %addr,
+            max_retries = max_retries,
+            "All connection attempts failed"
+        );
+        
+        Err(final_error)
+    }
+    
+    /// Check if this peer is currently connected
+    pub async fn is_connected(&self) -> bool {
+        let pool = self.registry.connection_pool.lock().await;
+        
+        // Check if we have a connection by peer ID
+        if let Some(conn) = pool.get_connection_by_node_id(self.peer_id.as_str()) {
+            conn.is_connected()
+        } else {
+            false
+        }
+    }
+    
+    /// Disconnect from this peer
+    pub async fn disconnect(&self) -> Result<()> {
+        let mut pool = self.registry.connection_pool.lock().await;
+        
+        if let Some(conn) = pool.get_connection_by_node_id(self.peer_id.as_str()) {
+            // Mark connection as disconnected
+            conn.set_state(crate::connection_pool::ConnectionState::Disconnected);
+            
+            // Get the peer address for mark_disconnected
+            let peer_addr = pool.peer_id_to_addr.get(&self.peer_id).map(|addr| *addr.value());
+            if let Some(addr) = peer_addr {
+                pool.mark_disconnected(addr);
+            }
+            
+            tracing::info!(
+                peer_id = %self.peer_id,
+                "Disconnected from peer"
+            );
+            Ok(())
+        } else {
+            tracing::debug!(
+                peer_id = %self.peer_id,
+                "No connection found to disconnect"
+            );
+            Ok(()) // Not an error if no connection exists
+        }
     }
     
     /// Get the peer ID
@@ -106,6 +265,29 @@ impl Peer {
     }
 }
 
+/// Message types for the request-response protocol
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum MessageType {
+    /// Fire-and-forget message (tell)
+    Tell = 0,
+    /// Request expecting a response (ask)
+    Ask = 1,
+    /// Response to an ask request
+    Response = 2,
+}
+
+impl MessageType {
+    /// Parse message type from byte
+    pub fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(MessageType::Tell),
+            1 => Some(MessageType::Ask),
+            2 => Some(MessageType::Response),
+            _ => None,
+        }
+    }
+}
 
 /// Errors that can occur in the gossip registry
 #[derive(Error, Debug)]

@@ -12,7 +12,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     connection_pool::ConnectionPool, current_timestamp, RemoteActorLocation, GossipConfig, GossipError,
-    RegistrationPriority, Result,
+    RegistrationPriority, Result, PeerId,
 };
 
 /// Registry change types for delta tracking
@@ -2272,7 +2272,7 @@ mod tests {
             since_sequence: 10,
             current_sequence: 15,
             changes: vec![],
-            sender_addr: test_addr(8080).to_string(),
+            sender_peer_id: PeerId::new("test_peer"),
             wall_clock_time: 1000,
             precise_timing_nanos: 1000_000_000_000, // 1000 seconds in nanoseconds
         };
@@ -2283,7 +2283,7 @@ mod tests {
 
         assert_eq!(deserialized.since_sequence, 10);
         assert_eq!(deserialized.current_sequence, 15);
-        assert_eq!(deserialized.sender_addr, test_addr(8080).to_string());
+        assert_eq!(deserialized.sender_peer_id, PeerId::new("test_peer"));
     }
 
     #[test]
@@ -2306,7 +2306,7 @@ mod tests {
             since_sequence: 1,
             current_sequence: 2,
             changes: vec![],
-            sender_addr: test_addr(8080).to_string(),
+            sender_peer_id: PeerId::new("test_peer"),
             wall_clock_time: 1000,
             precise_timing_nanos: 1000_000_000_000, // 1000 seconds in nanoseconds
         };
@@ -2321,7 +2321,7 @@ mod tests {
 
         // Test FullSyncRequest
         let msg = RegistryMessage::FullSyncRequest {
-            sender_addr: test_addr(8080).to_string(),
+            sender_peer_id: PeerId::new("test_peer"),
             sequence: 10,
             wall_clock_time: 1000,
         };
@@ -2628,7 +2628,7 @@ mod tests {
                 location,
                 priority: RegistrationPriority::Normal,
             }],
-            sender_addr: test_addr(8081).to_string(),
+            sender_peer_id: PeerId::new("node_b"),
             wall_clock_time: current_timestamp(),
             precise_timing_nanos: crate::current_timestamp_nanos(),
         };
@@ -2661,7 +2661,7 @@ mod tests {
                 location: remote_location,
                 priority: RegistrationPriority::Normal,
             }],
-            sender_addr: test_addr(8081).to_string(),
+            sender_peer_id: PeerId::new("node_b"),
             wall_clock_time: current_timestamp(),
             precise_timing_nanos: crate::current_timestamp_nanos(),
         };
@@ -2927,7 +2927,7 @@ mod tests {
         let task = GossipTask {
             peer_addr: test_addr(8081),
             message: RegistryMessage::FullSyncRequest {
-                sender_addr: test_addr(8080).to_string(),
+                sender_peer_id: PeerId::new("test_peer"),
                 sequence: 10,
                 wall_clock_time: 1000,
             },
