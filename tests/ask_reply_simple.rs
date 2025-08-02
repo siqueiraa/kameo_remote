@@ -51,7 +51,7 @@ async fn test_basic_ask_correlation() {
     peer_a.connect(&addr_a).await.unwrap();
 
     // Wait for initial gossip protocol to establish and settle
-    sleep(Duration::from_secs(5)).await;
+    sleep(Duration::from_millis(100)).await;
 
     info!("Test: Basic ask with correlation tracking");
 

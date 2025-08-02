@@ -2,9 +2,11 @@ pub mod remote_actor_location;
 pub mod config;
 pub mod connection_pool;
 mod handle;
+mod handle_builder;
 pub mod priority;
 pub mod registry;
 pub mod reply_to;
+pub mod stream_writer;
 
 use std::io;
 use std::net::SocketAddr;
@@ -15,6 +17,7 @@ use tracing::error;
 pub use remote_actor_location::RemoteActorLocation;
 pub use config::GossipConfig;
 pub use handle::GossipRegistryHandle;
+pub use handle_builder::GossipRegistryBuilder;
 pub use priority::{ConsistencyLevel, RegistrationPriority};
 pub use connection_pool::{DelegatedReplySender, LockFreeStreamHandle, StreamFrameType, ChannelId};
 pub use reply_to::{ReplyTo, TimeoutReplyTo};
@@ -106,6 +109,36 @@ impl Peer {
             pool.peer_id_to_addr.insert(self.peer_id.clone(), *addr);
         }
         
+        // Add the peer to gossip state so it can be selected for gossip rounds
+        {
+            tracing::debug!("🎯 Peer::connect - About to add peer {} to gossip state", self.peer_id);
+            let mut gossip_state = self.registry.gossip_state.lock().await;
+            let current_time = crate::current_timestamp();
+            let peers_before = gossip_state.peers.len();
+            gossip_state.peers.insert(
+                *addr,
+                crate::registry::PeerInfo {
+                    address: *addr,
+                    peer_address: None,
+                    failures: 0,  // Start with 0 failures
+                    last_attempt: current_time,  // Set last_attempt to now
+                    last_success: 0,
+                    last_sequence: 0,
+                    last_sent_sequence: 0,
+                    consecutive_deltas: 0,
+                    last_failure_time: None,
+                },
+            );
+            let peers_after = gossip_state.peers.len();
+            tracing::debug!(
+                peer_id = %self.peer_id,
+                addr = %addr,
+                peers_before = peers_before,
+                peers_after = peers_after,
+                "🎯 Added peer to gossip state for gossip rounds"
+            );
+        }
+        
         // Then attempt to connect with enhanced error context
         match self.registry.connect_to_peer(self.peer_id.as_str()).await {
             Ok(()) => {
@@ -114,6 +147,8 @@ impl Peer {
                     addr = %addr,
                     "Successfully connected to peer"
                 );
+                // Trigger an immediate gossip round to sync
+                self.registry.trigger_immediate_gossip().await;
                 Ok(())
             }
             Err(GossipError::Network(io_err)) => {
@@ -123,6 +158,22 @@ impl Peer {
                     error = %io_err,
                     "Network error connecting to peer"
                 );
+                
+                // Update peer failure state in gossip state
+                {
+                    let mut gossip_state = self.registry.gossip_state.lock().await;
+                    if let Some(peer_info) = gossip_state.peers.get_mut(addr) {
+                        peer_info.failures = self.registry.config.max_peer_failures;
+                        peer_info.last_failure_time = Some(crate::current_timestamp());
+                        tracing::debug!(
+                            peer_id = %self.peer_id,
+                            addr = %addr,
+                            failures = peer_info.failures,
+                            "Updated peer failure state after connection error"
+                        );
+                    }
+                }
+                
                 Err(GossipError::Network(std::io::Error::new(
                     io_err.kind(),
                     format!("Failed to connect to peer {} at {}: {}", self.peer_id, addr, io_err),
@@ -134,6 +185,16 @@ impl Peer {
                     addr = %addr,
                     "Connection timeout when connecting to peer"
                 );
+                
+                // Update peer failure state in gossip state
+                {
+                    let mut gossip_state = self.registry.gossip_state.lock().await;
+                    if let Some(peer_info) = gossip_state.peers.get_mut(addr) {
+                        peer_info.failures = self.registry.config.max_peer_failures;
+                        peer_info.last_failure_time = Some(crate::current_timestamp());
+                    }
+                }
+                
                 Err(GossipError::Network(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     format!("Connection timeout to peer {} at {}", self.peer_id, addr),
@@ -263,29 +324,155 @@ impl Peer {
     pub fn id(&self) -> &PeerId {
         &self.peer_id
     }
+    
+    /// Wait for the initial sync with this peer to complete
+    /// 
+    /// This waits for:
+    /// 1. The connection to be established
+    /// 2. The initial FullSync to be exchanged
+    /// 3. The actor registry to be updated
+    pub async fn wait_for_sync(&self, timeout: Duration) -> Result<()> {
+        let start = tokio::time::Instant::now();
+        let deadline = start + timeout;
+        
+        // Wait for the connection to be established
+        loop {
+            if tokio::time::Instant::now() > deadline {
+                return Err(GossipError::Timeout);
+            }
+            
+            // Check if we have a connection to this peer
+            {
+                let pool = self.registry.connection_pool.lock().await;
+                if pool.get_connection_by_node_id(self.peer_id.as_str()).is_some() {
+                    break;
+                }
+            }
+            
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        
+        // Wait for gossip sync to complete by checking if we've received actors
+        let mut last_actor_count = 0;
+        let mut stable_iterations = 0;
+        
+        loop {
+            if tokio::time::Instant::now() > deadline {
+                return Err(GossipError::Timeout);
+            }
+            
+            // Get current actor count
+            let current_count = self.registry.get_actor_count().await;
+            
+            // If the count is stable for 3 iterations (30ms), we're synced
+            if current_count == last_actor_count && current_count > 0 {
+                stable_iterations += 1;
+                if stable_iterations >= 3 {
+                    tracing::info!(
+                        peer_id = %self.peer_id,
+                        actor_count = current_count,
+                        elapsed = ?start.elapsed(),
+                        "Initial sync completed"
+                    );
+                    return Ok(());
+                }
+            } else {
+                stable_iterations = 0;
+                last_actor_count = current_count;
+            }
+            
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
 }
 
 /// Message types for the request-response protocol
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum MessageType {
-    /// Fire-and-forget message (tell)
-    Tell = 0,
+    /// Gossip protocol message (registry sync, actor registrations, etc.)
+    Gossip = 0,
     /// Request expecting a response (ask)
     Ask = 1,
     /// Response to an ask request
     Response = 2,
+    /// Direct actor tell message (no wrapping)
+    ActorTell = 3,
+    /// Direct actor ask message (no wrapping)
+    ActorAsk = 4,
+    /// Start of a streaming transfer
+    StreamStart = 0x10,
+    /// Streaming data chunk
+    StreamData = 0x11,
+    /// End of streaming transfer
+    StreamEnd = 0x12,
 }
 
 impl MessageType {
     /// Parse message type from byte
     pub fn from_byte(byte: u8) -> Option<Self> {
         match byte {
-            0 => Some(MessageType::Tell),
+            0 => Some(MessageType::Gossip),
             1 => Some(MessageType::Ask),
             2 => Some(MessageType::Response),
+            3 => Some(MessageType::ActorTell),
+            4 => Some(MessageType::ActorAsk),
+            0x10 => Some(MessageType::StreamStart),
+            0x11 => Some(MessageType::StreamData),
+            0x12 => Some(MessageType::StreamEnd),
             _ => None,
         }
+    }
+}
+
+/// Header for streaming protocol messages
+#[derive(Debug, Clone, Copy)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct StreamHeader {
+    /// Unique stream identifier
+    pub stream_id: u64,
+    /// Total size of the complete message
+    pub total_size: u64,
+    /// Size of this chunk (0 for start/end markers)
+    pub chunk_size: u32,
+    /// Chunk sequence number
+    pub chunk_index: u32,
+    /// Message type hash
+    pub type_hash: u32,
+    /// Target actor ID
+    pub actor_id: u64,
+}
+
+impl StreamHeader {
+    /// Size of the serialized header
+    pub const SERIALIZED_SIZE: usize = 8 + 8 + 4 + 4 + 4 + 8; // 36 bytes
+    
+    /// Serialize header to bytes
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(Self::SERIALIZED_SIZE);
+        bytes.extend_from_slice(&self.stream_id.to_be_bytes());
+        bytes.extend_from_slice(&self.total_size.to_be_bytes());
+        bytes.extend_from_slice(&self.chunk_size.to_be_bytes());
+        bytes.extend_from_slice(&self.chunk_index.to_be_bytes());
+        bytes.extend_from_slice(&self.type_hash.to_be_bytes());
+        bytes.extend_from_slice(&self.actor_id.to_be_bytes());
+        bytes
+    }
+    
+    /// Parse header from bytes
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < Self::SERIALIZED_SIZE {
+            return None;
+        }
+        
+        Some(Self {
+            stream_id: u64::from_be_bytes(bytes[0..8].try_into().ok()?),
+            total_size: u64::from_be_bytes(bytes[8..16].try_into().ok()?),
+            chunk_size: u32::from_be_bytes(bytes[16..20].try_into().ok()?),
+            chunk_index: u32::from_be_bytes(bytes[20..24].try_into().ok()?),
+            type_hash: u32::from_be_bytes(bytes[24..28].try_into().ok()?),
+            actor_id: u64::from_be_bytes(bytes[28..36].try_into().ok()?),
+        })
     }
 }
 

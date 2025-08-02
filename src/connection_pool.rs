@@ -1,14 +1,22 @@
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::fmt::Debug;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use std::sync::atomic::{AtomicBool, AtomicUsize, AtomicU32, AtomicU16, Ordering};
+use bytes::BufMut;
 
 use crate::{
     current_timestamp,
     registry::{GossipRegistry, RegistryMessage},
     GossipError, Result,
 };
+
+// Constants for buffer sizes and streaming
+const RING_BUFFER_SIZE: usize = 1024 * 1024; // 1MB ring buffer (must fit entire message including headers)
+pub const STREAM_CHUNK_SIZE: usize = 1024 * 1024; // 1MB chunks for streaming
+// Note: Threshold must be significantly lower to account for rkyv serialization overhead
+const STREAM_THRESHOLD: usize = 1024 * 1024 - 1024; // 1MB - 1KB to ensure messages don't exceed ring buffer
 
 /// Process mock requests for testing
 #[cfg(feature = "test-helpers")]
@@ -122,6 +130,21 @@ pub struct LockFreeConnection {
     pub correlation: Option<Arc<CorrelationTracker>>,
 }
 
+impl Clone for LockFreeConnection {
+    fn clone(&self) -> Self {
+        Self {
+            addr: self.addr,
+            state: AtomicU32::new(self.state.load(Ordering::Relaxed)),
+            last_used: AtomicUsize::new(self.last_used.load(Ordering::Relaxed)),
+            bytes_written: AtomicUsize::new(self.bytes_written.load(Ordering::Relaxed)),
+            bytes_read: AtomicUsize::new(self.bytes_read.load(Ordering::Relaxed)),
+            failure_count: AtomicUsize::new(self.failure_count.load(Ordering::Relaxed)),
+            stream_handle: self.stream_handle.clone(),
+            correlation: self.correlation.clone(),
+        }
+    }
+}
+
 impl LockFreeConnection {
     pub fn new(addr: SocketAddr) -> Self {
         Self {
@@ -178,7 +201,7 @@ impl LockFreeConnection {
 #[derive(Debug, Clone)]
 pub struct WriteCommand {
     pub channel_id: ChannelId,
-    pub data: Vec<u8>,
+    pub data: bytes::Bytes,
     pub sequence: u64,
 }
 
@@ -352,8 +375,30 @@ impl LockFreeRingBuffer {
     }
 }
 
+/// Vectored write command for zero-copy header + payload operations
+#[derive(Debug)]
+pub struct VectoredWriteCommand {
+    channel_id: ChannelId,
+    header: bytes::Bytes,
+    payload: bytes::Bytes,
+    sequence: u64,
+}
+
+/// Commands for streaming operations
+#[derive(Debug)]
+enum StreamingCommand {
+    /// Direct write bytes for streaming
+    WriteBytes(bytes::Bytes),
+    /// Flush the writer
+    Flush,
+    /// Vectored write for header + payload (zero-copy)
+    VectoredWrite(VectoredWriteCommand),
+    /// Batch of owned chunks for streaming (zero-copy)
+    OwnedChunks(Vec<bytes::Bytes>),
+}
+
 /// Truly lock-free streaming handle with dedicated background writer
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct LockFreeStreamHandle {
     addr: SocketAddr,
     channel_id: ChannelId,
@@ -361,8 +406,10 @@ pub struct LockFreeStreamHandle {
     bytes_written: Arc<AtomicUsize>, // This tracks actual TCP bytes written
     ring_buffer: Arc<LockFreeRingBuffer>,
     shutdown_signal: Arc<AtomicBool>,
-    // Channel for tell operations to go through the same writer
-    tell_sender: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    /// Atomic flag for coordinating streaming mode
+    streaming_active: Arc<AtomicBool>,
+    /// Channel to send streaming commands to background task
+    streaming_tx: mpsc::UnboundedSender<StreamingCommand>,
 }
 
 impl LockFreeStreamHandle {
@@ -370,26 +417,29 @@ impl LockFreeStreamHandle {
     pub fn new(tcp_writer: tokio::net::tcp::OwnedWriteHalf, addr: SocketAddr, channel_id: ChannelId, buffer_size: usize) -> Self {
         let ring_buffer = Arc::new(LockFreeRingBuffer::new(buffer_size));
         let shutdown_signal = Arc::new(AtomicBool::new(false));
-        
-        // Create channel for tell operations
-        let (tell_sender, tell_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let streaming_active = Arc::new(AtomicBool::new(false));
         
         // Create shared counter for actual TCP bytes written
         let bytes_written = Arc::new(AtomicUsize::new(0));
+        
+        // Create channel for streaming commands
+        let (streaming_tx, streaming_rx) = mpsc::unbounded_channel();
         
         // Spawn background writer task with exclusive TCP access - NO MUTEX!
         {
             let ring_buffer = ring_buffer.clone();
             let shutdown_signal = shutdown_signal.clone();
             let bytes_written_for_task = bytes_written.clone();
+            let streaming_active_for_task = streaming_active.clone();
             
             tokio::spawn(async move {
                 Self::background_writer_task(
-                    tcp_writer, // Direct ownership!
+                    tcp_writer, // Writer half
                     ring_buffer, 
                     shutdown_signal, 
-                    tell_receiver, 
-                    bytes_written_for_task
+                    bytes_written_for_task,
+                    streaming_active_for_task,
+                    streaming_rx
                 ).await;
             });
         }
@@ -401,24 +451,34 @@ impl LockFreeStreamHandle {
             bytes_written, // This now tracks actual TCP bytes written
             ring_buffer,
             shutdown_signal,
-            tell_sender,
+            streaming_active,
+            streaming_tx,
         }
     }
     
     /// Background writer task - truly lock-free with exclusive TCP access
     /// OPTIMIZED FOR MAXIMUM THROUGHPUT - NO MUTEX NEEDED!
     async fn background_writer_task(
-        mut tcp_writer: tokio::net::tcp::OwnedWriteHalf, // Direct ownership!
+        tcp_writer: tokio::net::tcp::OwnedWriteHalf,
         ring_buffer: Arc<LockFreeRingBuffer>,
         shutdown_signal: Arc<AtomicBool>,
-        mut tell_receiver: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
         bytes_written_counter: Arc<AtomicUsize>, // Track ALL bytes written to TCP
+        streaming_active: Arc<AtomicBool>,
+        mut streaming_rx: mpsc::UnboundedReceiver<StreamingCommand>,
     ) {
         use tokio::io::AsyncWriteExt;
+        use std::io::IoSlice;
+        
+        // Use direct tokio writer with vectored I/O for now
+        // TODO: Integrate platform-specific writers (io_uring on Linux 5.1+)
+        // This requires either:
+        // 1. Modifying StreamWriter trait to work with OwnedWriteHalf
+        // 2. Or using a different socket splitting approach that allows io_uring
+        // Current implementation still uses efficient vectored I/O with batching
+        let mut writer = tokio::io::BufWriter::with_capacity(64 * 1024, tcp_writer);
         
         // Large batching buffers for maximum throughput
         const RING_BATCH_SIZE: usize = 4096;  // Much larger batches
-        const TELL_BATCH_SIZE: usize = 2048;
         const FLUSH_THRESHOLD: usize = 256 * 1024; // 256KB before flush
         
         let mut bytes_since_flush = 0;
@@ -426,55 +486,100 @@ impl LockFreeStreamHandle {
         while !shutdown_signal.load(Ordering::Relaxed) {
             let mut total_bytes_written = 0;
             
-            // Process ring buffer writes with LARGE vectored I/O batches
-            let mut ring_buffers = Vec::with_capacity(RING_BATCH_SIZE);
-            for _ in 0..RING_BATCH_SIZE {
-                if let Some(command) = ring_buffer.try_pop() {
-                    ring_buffers.push(command);
-                } else {
-                    break;
+            // Check for streaming commands first (priority over ring buffer)
+            tokio::select! {
+                Some(cmd) = streaming_rx.recv() => {
+                    match cmd {
+                        StreamingCommand::WriteBytes(data) => {
+                            match writer.write_all(&data).await {
+                                Ok(_) => {
+                                    bytes_written_counter.fetch_add(data.len(), Ordering::Relaxed);
+                                    total_bytes_written += data.len();
+                                }
+                                Err(e) => {
+                                    error!("Streaming write error: {}", e);
+                                    break;
+                                }
+                            }
+                        }
+                        StreamingCommand::Flush => {
+                            let _ = writer.flush().await;
+                        }
+                        StreamingCommand::VectoredWrite(cmd) => {
+                            // Zero-copy vectored I/O - header + payload in single syscall
+                            use tokio::io::AsyncWriteExt;
+                            let header_slice = std::io::IoSlice::new(&cmd.header);
+                            let payload_slice = std::io::IoSlice::new(&cmd.payload);
+                            let bufs = &[header_slice, payload_slice];
+                            
+                            match writer.write_vectored(bufs).await {
+                                Ok(n) => {
+                                    bytes_written_counter.fetch_add(n, Ordering::Relaxed);
+                                    total_bytes_written += n;
+                                }
+                                Err(e) => {
+                                    error!("Vectored write error: {}", e);
+                                    break;
+                                }
+                            }
+                        }
+                        StreamingCommand::OwnedChunks(chunks) => {
+                            // Batch vectored write for multiple chunks
+                            use tokio::io::AsyncWriteExt;
+                            let slices: Vec<std::io::IoSlice> = chunks.iter()
+                                .map(|chunk| std::io::IoSlice::new(chunk))
+                                .collect();
+                            
+                            match writer.write_vectored(&slices).await {
+                                Ok(n) => {
+                                    bytes_written_counter.fetch_add(n, Ordering::Relaxed);
+                                    total_bytes_written += n;
+                                }
+                                Err(e) => {
+                                    error!("Chunk batch write error: {}", e);
+                                    break;
+                                }
+                            }
+                        }
+                    }
                 }
-            }
-            
-            if !ring_buffers.is_empty() {
-                let vectored: Vec<std::io::IoSlice> = ring_buffers.iter()
-                    .map(|cmd| std::io::IoSlice::new(&cmd.data))
-                    .collect();
-                
-                // Calculate total bytes for this batch
-                let batch_bytes: usize = ring_buffers.iter().map(|cmd| cmd.data.len()).sum();
-                
-                // Single vectored write syscall for all ring buffer data
-                if let Ok(_) = tcp_writer.write_vectored(&vectored).await {
-                    // Count successful writes
-                    bytes_written_counter.fetch_add(batch_bytes, Ordering::Relaxed);
-                    total_bytes_written += batch_bytes;
-                }
-            }
-            
-            // Process tell operations with LARGE vectored I/O batches
-            let mut tell_buffers = Vec::with_capacity(TELL_BATCH_SIZE);
-            for _ in 0..TELL_BATCH_SIZE {
-                if let Ok(tell_data) = tell_receiver.try_recv() {
-                    tell_buffers.push(tell_data);
-                } else {
-                    break;
-                }
-            }
-            
-            if !tell_buffers.is_empty() {
-                let vectored: Vec<std::io::IoSlice> = tell_buffers.iter()
-                    .map(|data| std::io::IoSlice::new(data))
-                    .collect();
-                
-                // Calculate total bytes for this batch
-                let batch_bytes: usize = tell_buffers.iter().map(|data| data.len()).sum();
-                
-                // Single vectored write syscall for all tell data
-                if let Ok(_) = tcp_writer.write_vectored(&vectored).await {
-                    // Count successful writes
-                    bytes_written_counter.fetch_add(batch_bytes, Ordering::Relaxed);
-                    total_bytes_written += batch_bytes;
+                _ = tokio::time::sleep(Duration::from_micros(10)) => {
+                    // Check if streaming is active - if so, skip ring buffer processing
+                    if streaming_active.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    
+                    // Process ring buffer writes with LARGE batches
+                    let mut io_slices = Vec::with_capacity(RING_BATCH_SIZE);
+                    let mut write_data = Vec::with_capacity(RING_BATCH_SIZE);
+                    
+                    for _ in 0..RING_BATCH_SIZE {
+                        if let Some(command) = ring_buffer.try_pop() {
+                            write_data.push(command.data);
+                        } else {
+                            break;
+                        }
+                    }
+                    
+                    if !write_data.is_empty() {
+                        // Create IoSlice array for vectored write
+                        for data in &write_data {
+                            io_slices.push(IoSlice::new(data));
+                        }
+                        
+                        // Use vectored I/O for efficient batch writing
+                        match writer.write_vectored(&io_slices).await {
+                            Ok(bytes_written) => {
+                                bytes_written_counter.fetch_add(bytes_written, Ordering::Relaxed);
+                                total_bytes_written += bytes_written;
+                            }
+                            Err(e) => {
+                                error!("Write error: {}", e);
+                                // Connection probably broken, exit task
+                                break;
+                            }
+                        }
+                    }
                 }
             }
             
@@ -482,7 +587,7 @@ impl LockFreeStreamHandle {
             
             // Only flush when we've written enough data or no more work
             if bytes_since_flush >= FLUSH_THRESHOLD || total_bytes_written == 0 {
-                let _ = tcp_writer.flush().await;
+                let _ = writer.flush().await;
                 bytes_since_flush = 0;
                 
                 // If no work was done, wait briefly before next iteration
@@ -494,12 +599,20 @@ impl LockFreeStreamHandle {
     }
     
     /// Write data to the lock-free ring buffer - NO BLOCKING
-    pub fn write_nonblocking(&self, data: &[u8]) -> Result<()> {
+    /// DEPRECATED: Use send_bytes_zero_copy instead to avoid copying
+    // pub fn write_nonblocking(&self, data: &[u8]) -> Result<()> {
+    //     // TODO: This still copies data - need to migrate all callers to send_bytes_zero_copy
+    //     warn!("DEPRECATED: write_nonblocking called - should use send_bytes_zero_copy");
+    //     self.write_bytes_nonblocking(bytes::Bytes::copy_from_slice(data))
+    // }
+    
+    /// Write Bytes to the lock-free ring buffer - NO BLOCKING, NO COPY
+    pub fn write_bytes_nonblocking(&self, data: bytes::Bytes) -> Result<()> {
         let sequence = self.sequence_counter.fetch_add(1, Ordering::Relaxed);
         
         let command = WriteCommand {
             channel_id: self.channel_id,
-            data: data.to_vec(),
+            data,
             sequence: sequence as u64,
         };
         
@@ -518,15 +631,15 @@ impl LockFreeStreamHandle {
             return Ok(());
         }
         
-        // Combine all chunks into a single buffer for simplicity
+        // Use BytesMut for efficient concatenation
         let total_len: usize = data_chunks.iter().map(|chunk| chunk.len()).sum();
-        let mut combined_buffer = Vec::with_capacity(total_len);
+        let mut combined_buffer = bytes::BytesMut::with_capacity(total_len);
         
         for chunk in data_chunks {
             combined_buffer.extend_from_slice(chunk);
         }
         
-        self.write_nonblocking(&combined_buffer)
+        self.write_bytes_nonblocking(combined_buffer.freeze())
     }
     
     /// Write large data in chunks to avoid blocking
@@ -536,7 +649,7 @@ impl LockFreeStreamHandle {
         }
         
         for chunk in data.chunks(chunk_size) {
-            let _ = self.write_nonblocking(chunk);
+            let _ = self.write_bytes_nonblocking(bytes::Bytes::copy_from_slice(chunk));
         }
         
         Ok(())
@@ -548,12 +661,6 @@ impl LockFreeStreamHandle {
         (pending, self.ring_buffer.capacity - pending)
     }
     
-    /// Send tell operation through the lock-free channel - NO BLOCKING
-    pub fn tell_nonblocking(&self, data: Vec<u8>) -> Result<()> {
-        self.tell_sender.send(data)
-            .map_err(|_| crate::GossipError::Shutdown)?;
-        Ok(())
-    }
     
     /// Check if ring buffer is near capacity
     pub fn is_buffer_full(&self) -> bool {
@@ -583,6 +690,181 @@ impl LockFreeStreamHandle {
     /// Shutdown the background writer task
     pub fn shutdown(&self) {
         self.shutdown_signal.store(true, Ordering::Relaxed);
+    }
+    
+    /// Stream a large message directly to the socket, bypassing the ring buffer
+    /// This provides maximum performance for large messages like PreBacktest
+    pub async fn stream_large_message(&self, msg: &[u8], type_hash: u32, actor_id: u64) -> Result<()> {
+        use crate::{MessageType, StreamHeader, current_timestamp};
+        
+        const CHUNK_SIZE: usize = STREAM_CHUNK_SIZE;
+        
+        // Acquire streaming mode atomically
+        while self.streaming_active.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            tokio::task::yield_now().await;
+        }
+        
+        // Ensure we release streaming mode on exit
+        let _guard = StreamingGuard {
+            flag: self.streaming_active.clone(),
+        };
+        
+        // Generate unique stream ID
+        let stream_id = current_timestamp();
+        
+        // Helper to serialize message with type and header
+        fn serialize_stream_message(msg_type: MessageType, header: &StreamHeader) -> Vec<u8> {
+            // Message format: [length:4][type:1][correlation_id:2][reserved:5][header:36]
+            let inner_size = 8 + StreamHeader::SERIALIZED_SIZE;
+            let mut message = Vec::with_capacity(4 + inner_size);
+            
+            // Length prefix (required by protocol)
+            message.extend_from_slice(&(inner_size as u32).to_be_bytes());
+            
+            // Header
+            message.push(msg_type as u8);
+            message.extend_from_slice(&[0, 0]); // correlation_id (not used for streaming)
+            message.extend_from_slice(&[0, 0, 0, 0, 0]); // reserved
+            message.extend_from_slice(&header.to_bytes());
+            message
+        }
+        
+        // Send StreamStart header
+        let start_header = StreamHeader {
+            stream_id,
+            total_size: msg.len() as u64,
+            chunk_size: 0,
+            chunk_index: 0,
+            type_hash,
+            actor_id,
+        };
+        
+        let start_msg = serialize_stream_message(MessageType::StreamStart, &start_header);
+        info!("📤 STREAMING: Sending StreamStart for {} MB message, stream_id={}", 
+              msg.len() as f64 / 1_048_576.0, stream_id);
+        self.streaming_tx.send(StreamingCommand::WriteBytes(start_msg.into()))
+            .map_err(|_| GossipError::Shutdown)?;
+        
+        // Stream chunks directly
+        for (idx, chunk) in msg.chunks(CHUNK_SIZE).enumerate() {
+            let data_header = StreamHeader {
+                stream_id,
+                total_size: msg.len() as u64,
+                chunk_size: chunk.len() as u32,
+                chunk_index: idx as u32,
+                type_hash,
+                actor_id,
+            };
+            
+            // Create combined message with proper length prefix
+            // Message format: [length:4][type:1][correlation_id:2][reserved:5][header:36][chunk_data:N]
+            let inner_size = 8 + StreamHeader::SERIALIZED_SIZE + chunk.len();
+            let mut chunk_msg = Vec::with_capacity(4 + inner_size);
+            
+            // Length prefix (includes header + chunk data)
+            chunk_msg.extend_from_slice(&(inner_size as u32).to_be_bytes());
+            
+            // Header
+            chunk_msg.push(MessageType::StreamData as u8);
+            chunk_msg.extend_from_slice(&[0, 0]); // correlation_id
+            chunk_msg.extend_from_slice(&[0, 0, 0, 0, 0]); // reserved
+            chunk_msg.extend_from_slice(&data_header.to_bytes());
+            
+            // Chunk data
+            chunk_msg.extend_from_slice(chunk);
+            
+            self.streaming_tx.send(StreamingCommand::WriteBytes(chunk_msg.into()))
+                .map_err(|_| GossipError::Shutdown)?;
+            
+            // Yield periodically to prevent blocking
+            if idx % 10 == 0 {
+                self.streaming_tx.send(StreamingCommand::Flush)
+                    .map_err(|_| GossipError::Shutdown)?;
+                tokio::task::yield_now().await;
+            }
+        }
+        
+        // Send StreamEnd
+        let end_msg = serialize_stream_message(MessageType::StreamEnd, &start_header);
+        info!("📤 STREAMING: Sending StreamEnd for stream_id={}", stream_id);
+        self.streaming_tx.send(StreamingCommand::WriteBytes(end_msg.into()))
+            .map_err(|_| GossipError::Shutdown)?;
+        self.streaming_tx.send(StreamingCommand::Flush)
+            .map_err(|_| GossipError::Shutdown)?;
+        
+        info!("✅ STREAMING: Successfully streamed {} MB in {} chunks", 
+              msg.len() as f64 / 1_048_576.0, (msg.len() + CHUNK_SIZE - 1) / CHUNK_SIZE);
+        
+        Ok(())
+    }
+    
+    /// Zero-copy vectored write for header + payload in single operation
+    /// This eliminates copying payload data into frame buffer - optimal for streaming
+    pub fn write_bytes_vectored(&self, header: bytes::Bytes, payload: bytes::Bytes) -> Result<()> {
+        let sequence = self.sequence_counter.fetch_add(1, Ordering::Relaxed);
+        
+        // Create vectored command that preserves both header and payload as separate Bytes
+        let command = VectoredWriteCommand {
+            channel_id: self.channel_id,
+            header,
+            payload,
+            sequence: sequence as u64,
+        };
+        
+        // Try to send via streaming channel first for vectored operations
+        match self.streaming_tx.send(StreamingCommand::VectoredWrite(command)) {
+            Ok(_) => Ok(()),
+            Err(send_error) => {
+                // Fallback: combine into single write if streaming channel is closed
+                let cmd = send_error.0;
+                if let StreamingCommand::VectoredWrite(vectored_cmd) = cmd {
+                    let total_len = vectored_cmd.header.len() + vectored_cmd.payload.len();
+                    let mut combined = bytes::BytesMut::with_capacity(total_len);
+                    combined.extend_from_slice(&vectored_cmd.header);
+                    combined.extend_from_slice(&vectored_cmd.payload);
+                    self.write_bytes_nonblocking(combined.freeze())
+                } else {
+                    Err(GossipError::Shutdown)
+                }
+            }
+        }
+    }
+    
+    /// Send owned chunks without copying - optimal for streaming large messages
+    pub fn write_owned_chunks(&self, chunks: Vec<bytes::Bytes>) -> Result<()> {
+        if chunks.is_empty() {
+            return Ok(());
+        }
+        
+        // Send chunks as a batch via streaming channel for optimal vectored I/O
+        let command = StreamingCommand::OwnedChunks(chunks);
+        self.streaming_tx.send(command).map_err(|_| {
+            GossipError::Shutdown
+        })?;
+        
+        Ok(())
+    }
+}
+
+/// Guard to ensure streaming_active is released on drop
+struct StreamingGuard {
+    flag: Arc<AtomicBool>,
+}
+
+impl Drop for StreamingGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
+    }
+}
+
+impl Debug for LockFreeStreamHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LockFreeStreamHandle")
+            .field("addr", &self.addr)
+            .field("channel_id", &self.channel_id)
+            .field("bytes_written", &self.bytes_written.load(Ordering::Relaxed))
+            .field("sequence", &self.sequence_counter.load(Ordering::Relaxed))
+            .finish()
     }
 }
 
@@ -686,6 +968,8 @@ pub struct ConnectionPool {
     pub peer_id_to_addr: dashmap::DashMap<crate::PeerId, SocketAddr>,
     /// DEPRECATED: Old address-based connections for migration
     connections: dashmap::DashMap<SocketAddr, Arc<LockFreeConnection>>,
+    /// Shared correlation trackers by peer ID - ensures ask/response works across bidirectional connections
+    correlation_trackers: dashmap::DashMap<crate::PeerId, Arc<CorrelationTracker>>,
     max_connections: usize,
     connection_timeout: Duration,
     /// Registry reference for handling incoming messages
@@ -743,11 +1027,20 @@ impl CorrelationTracker {
             // If slot is empty, use it
             if pending.is_none() {
                 *pending = Some(sender);
+                debug!("CorrelationTracker: Allocated correlation_id {} in slot {}", id, slot);
                 return id;
             }
             
             // Slot is occupied, try next ID
+            debug!("CorrelationTracker: Slot {} occupied, trying next ID", slot);
         }
+    }
+    
+    /// Check if a correlation ID has a pending request
+    fn has_pending(&self, correlation_id: u16) -> bool {
+        let slot = (correlation_id as usize) % PENDING_RESPONSES_SIZE;
+        let pending = self.pending[slot].lock();
+        pending.is_some()
     }
     
     /// Complete a pending request with a response
@@ -756,7 +1049,10 @@ impl CorrelationTracker {
         let mut pending = self.pending[slot].lock();
         
         if let Some(sender) = pending.take() {
-            let _ = sender.send(response);
+            match sender.send(response) {
+                Ok(_) => {}
+                Err(_) => {}
+            }
         }
     }
     
@@ -921,24 +1217,41 @@ impl ConnectionHandle {
     /// Send pre-serialized data through this connection - LOCK-FREE
     pub async fn send_data(&self, data: Vec<u8>) -> Result<()> {
         // Use lock-free ring buffer - NO MUTEX!
-        self.stream_handle.write_nonblocking(&data)
+        // Convert Vec<u8> to Bytes for zero-copy
+        self.stream_handle.write_bytes_nonblocking(bytes::Bytes::from(data))
     }
     
     /// Send raw bytes without any framing - used by ReplyTo
     pub fn send_raw_bytes(&self, data: &[u8]) -> Result<()> {
-        self.stream_handle.write_nonblocking(data)
+        // Must copy here since we don't own the data
+        self.stream_handle.write_bytes_nonblocking(bytes::Bytes::copy_from_slice(data))
+    }
+    
+    /// Send bytes without copying - TRUE ZERO-COPY
+    pub fn send_bytes_zero_copy(&self, data: bytes::Bytes) -> Result<()> {
+        self.stream_handle.write_bytes_nonblocking(data)
+    }
+    
+    /// Stream a large message directly - MAXIMUM PERFORMANCE
+    pub async fn stream_large_message(&self, msg: &[u8], type_hash: u32, actor_id: u64) -> Result<()> {
+        self.stream_handle.stream_large_message(msg, type_hash, actor_id).await
     }
     
     /// Raw tell() - LOCK-FREE write (used internally)
     pub async fn tell_raw(&self, data: &[u8]) -> Result<()> {
-        // Create message with length header
-        let len_bytes = (data.len() as u32).to_be_bytes();
-        let mut message = Vec::with_capacity(4 + data.len());
-        message.extend_from_slice(&len_bytes);
+        // Create message with length header using BytesMut for efficiency
+        let mut message = bytes::BytesMut::with_capacity(4 + data.len());
+        message.extend_from_slice(&(data.len() as u32).to_be_bytes());
         message.extend_from_slice(data);
         
         // Use lock-free ring buffer - NO MUTEX!
-        self.stream_handle.write_nonblocking(&message)
+        self.stream_handle.write_bytes_nonblocking(message.freeze())
+    }
+    
+    /// Send a pre-formatted binary message (already has length prefix)
+    pub async fn send_binary_message(&self, message: &[u8]) -> Result<()> {
+        // Message already has length prefix, send as-is
+        self.stream_handle.write_bytes_nonblocking(bytes::Bytes::copy_from_slice(message))
     }
     
     /// Smart tell() - accepts TellMessage with automatic batch detection
@@ -1008,7 +1321,7 @@ impl ConnectionHandle {
     pub async fn tell_batch(&self, messages: &[&[u8]]) -> Result<()> {
         // OPTIMIZATION: Pre-calculate total size and write in one go
         let total_size: usize = messages.iter().map(|m| 4 + m.len()).sum();
-        let mut batch_buffer = Vec::with_capacity(total_size);
+        let mut batch_buffer = bytes::BytesMut::with_capacity(total_size);
         
         for msg in messages {
             batch_buffer.extend_from_slice(&(msg.len() as u32).to_be_bytes());
@@ -1016,7 +1329,7 @@ impl ConnectionHandle {
         }
         
         // Use lock-free ring buffer - NO MUTEX!
-        self.stream_handle.write_nonblocking(&batch_buffer)
+        self.stream_handle.write_bytes_nonblocking(batch_buffer.freeze())
     }
     
     /// Direct access to try_send for maximum performance testing
@@ -1044,6 +1357,12 @@ impl ConnectionHandle {
     /// Ask method for request-response (Note: This is a simplified implementation)
     /// For full request-response, you would need a proper protocol with correlation IDs
     pub async fn ask(&self, request: &[u8]) -> Result<Vec<u8>> {
+        // Use default timeout of 30 seconds
+        self.ask_with_timeout(request, Duration::from_secs(30)).await
+    }
+    
+    /// Ask method with custom timeout for request-response
+    pub async fn ask_with_timeout(&self, request: &[u8], timeout: Duration) -> Result<Vec<u8>> {
         // Create oneshot channel for response
         let (tx, rx) = tokio::sync::oneshot::channel();
         
@@ -1052,34 +1371,34 @@ impl ConnectionHandle {
         
         // Create ask message with length prefix + 8-byte header + payload
         let total_size = 8 + request.len();
-        let mut message = Vec::with_capacity(4 + total_size);
+        let mut message = bytes::BytesMut::with_capacity(4 + total_size);
         
         // Length prefix (4 bytes)
         message.extend_from_slice(&(total_size as u32).to_be_bytes());
         
         // Header: [type:1][correlation_id:2][reserved:5]
-        message.push(crate::MessageType::Ask as u8);
+        message.put_u8(crate::MessageType::Ask as u8);
         message.extend_from_slice(&correlation_id.to_be_bytes());
         message.extend_from_slice(&[0u8; 5]); // Reserved bytes
         message.extend_from_slice(request);
         
         // Send the message
-        self.stream_handle.write_nonblocking(&message)?;
+        self.stream_handle.write_bytes_nonblocking(message.freeze())?;
         
-        tracing::debug!(
-            correlation_id = correlation_id,
-            request_size = request.len(),
-            "ask: sent message with correlation ID"
-        );
-        
-        // Wait for response with default timeout (30 seconds)
-        match tokio::time::timeout(Duration::from_secs(30), rx).await {
-            Ok(Ok(response)) => Ok(response),
+        // Wait for response with custom timeout
+        let result = match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(response)) => {
+                Ok(response)
+            },
             Ok(Err(_)) => Err(crate::GossipError::Network(
                 std::io::Error::new(std::io::ErrorKind::Other, "Response channel closed")
             )),
-            Err(_) => Err(crate::GossipError::Timeout),
-        }
+            Err(_) => {
+                Err(crate::GossipError::Timeout)
+            },
+        };
+        
+        result
     }
     
     /// Ask method that returns a ReplyTo handle for delegated replies
@@ -1092,25 +1411,19 @@ impl ConnectionHandle {
         
         // Create ask message with length prefix + 8-byte header + payload
         let total_size = 8 + request.len();
-        let mut message = Vec::with_capacity(4 + total_size);
+        let mut message = bytes::BytesMut::with_capacity(4 + total_size);
         
         // Length prefix (4 bytes)
         message.extend_from_slice(&(total_size as u32).to_be_bytes());
         
         // Header: [type:1][correlation_id:2][reserved:5]
-        message.push(crate::MessageType::Ask as u8);
+        message.put_u8(crate::MessageType::Ask as u8);
         message.extend_from_slice(&correlation_id.to_be_bytes());
         message.extend_from_slice(&[0u8; 5]); // Reserved bytes
         message.extend_from_slice(request);
         
         // Send the message
-        self.stream_handle.write_nonblocking(&message)?;
-        
-        tracing::debug!(
-            correlation_id = correlation_id,
-            request_size = request.len(),
-            "ask_with_reply_to: sent message with correlation ID"
-        );
+        self.stream_handle.write_bytes_nonblocking(message.freeze())?;
         
         // Return ReplyTo handle
         Ok(crate::ReplyTo {
@@ -1144,6 +1457,114 @@ impl ConnectionHandle {
         Ok(DelegatedReplySender::new_with_timeout(reply_sender, reply_receiver, request.len(), timeout))
     }
     
+    /// Batch ask method for multiple requests in a single network round-trip
+    /// Returns a vector of response futures that can be awaited independently
+    pub async fn ask_batch(&self, requests: &[&[u8]]) -> Result<Vec<tokio::sync::oneshot::Receiver<Vec<u8>>>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        
+        let mut receivers = Vec::with_capacity(requests.len());
+        let mut batch_message = Vec::new();
+        
+        // Process each request
+        for request in requests {
+            // Create oneshot channel for this response
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            receivers.push(rx);
+            
+            // Allocate correlation ID
+            let correlation_id = self.correlation.allocate(tx);
+            
+            // Build ask message: [type:1][correlation_id:2][reserved:5] + payload
+            let total_size = 8 + request.len();
+            
+            // Length prefix (4 bytes)
+            batch_message.extend_from_slice(&(total_size as u32).to_be_bytes());
+            
+            // Header: [type:1][correlation_id:2][reserved:5]
+            batch_message.push(crate::MessageType::Ask as u8);
+            batch_message.extend_from_slice(&correlation_id.to_be_bytes());
+            batch_message.extend_from_slice(&[0u8; 5]); // Reserved bytes
+            batch_message.extend_from_slice(request);
+        }
+        
+        // Send all messages in one write
+        self.stream_handle.write_bytes_nonblocking(bytes::Bytes::from(batch_message))?;
+        
+        Ok(receivers)
+    }
+    
+    /// Batch ask with timeout - returns Vec<Result<Vec<u8>>> with individual timeout handling
+    pub async fn ask_batch_with_timeout(
+        &self, 
+        requests: &[&[u8]], 
+        timeout: Duration
+    ) -> Result<Vec<Result<Vec<u8>>>> {
+        let receivers = self.ask_batch(requests).await?;
+        
+        // Create futures for all responses with timeout
+        let mut response_futures = Vec::with_capacity(receivers.len());
+        
+        for receiver in receivers {
+            let timeout_future = async move {
+                match tokio::time::timeout(timeout, receiver).await {
+                    Ok(Ok(response)) => Ok(response),
+                    Ok(Err(_)) => Err(crate::GossipError::Network(
+                        std::io::Error::new(std::io::ErrorKind::Other, "Response channel closed")
+                    )),
+                    Err(_) => Err(crate::GossipError::Timeout),
+                }
+            };
+            response_futures.push(timeout_future);
+        }
+        
+        // Wait for all responses concurrently
+        let results = futures::future::join_all(response_futures).await;
+        Ok(results)
+    }
+    
+    /// High-performance batch ask with pre-allocated buffers
+    /// This version minimizes allocations for maximum throughput
+    pub async fn ask_batch_optimized(
+        &self,
+        requests: &[&[u8]],
+        response_buffer: &mut Vec<tokio::sync::oneshot::Receiver<Vec<u8>>>
+    ) -> Result<()> {
+        response_buffer.clear();
+        response_buffer.reserve(requests.len());
+        
+        // Pre-calculate total message size
+        let total_size: usize = requests.iter()
+            .map(|req| 4 + 8 + req.len()) // length prefix + header + payload
+            .sum();
+        
+        let mut batch_message = bytes::BytesMut::with_capacity(total_size);
+        
+        // Build all messages
+        for request in requests {
+            // Create oneshot channel for this response
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            response_buffer.push(rx);
+            
+            // Allocate correlation ID
+            let correlation_id = self.correlation.allocate(tx);
+            
+            // Build ask message
+            let msg_size = 8 + request.len();
+            batch_message.extend_from_slice(&(msg_size as u32).to_be_bytes());
+            batch_message.put_u8(crate::MessageType::Ask as u8);
+            batch_message.extend_from_slice(&correlation_id.to_be_bytes());
+            batch_message.extend_from_slice(&[0u8; 5]);
+            batch_message.extend_from_slice(request);
+        }
+        
+        // Single write for all messages
+        self.stream_handle.write_bytes_nonblocking(batch_message.freeze())?;
+        
+        Ok(())
+    }
+    
     /// High-performance streaming API - send structured data with custom framing - LOCK-FREE
     pub async fn stream_send<T>(&self, data: &T) -> Result<()> 
     where
@@ -1164,12 +1585,12 @@ impl ConnectionHandle {
         let header_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&frame_header).map_err(|e| crate::GossipError::Serialization(e))?;
         
         // Combine header and payload for single write
-        let mut combined = Vec::with_capacity(header_bytes.len() + payload.len());
+        let mut combined = bytes::BytesMut::with_capacity(header_bytes.len() + payload.len());
         combined.extend_from_slice(&header_bytes);
         combined.extend_from_slice(&payload);
         
         // Use lock-free ring buffer - NO MUTEX!
-        self.stream_handle.write_nonblocking(&combined)
+        self.stream_handle.write_bytes_nonblocking(combined.freeze())
     }
     
     /// High-performance streaming API - send batch of structured data - LOCK-FREE
@@ -1201,13 +1622,25 @@ impl ConnectionHandle {
         }
         
         // Use lock-free ring buffer for entire batch - NO MUTEX!
-        self.stream_handle.write_nonblocking(&total_payload)
+        self.stream_handle.write_bytes_nonblocking(bytes::Bytes::from(total_payload))
     }
     
     /// Get truly lock-free streaming handle - direct access to the internal handle
     pub fn get_lock_free_stream(&self) -> &Arc<LockFreeStreamHandle> {
         &self.stream_handle
     }
+    
+    /// Zero-copy vectored write for header + payload in single syscall
+    /// This eliminates the need to copy payload data into frame buffer
+    pub fn write_bytes_vectored(&self, header: bytes::Bytes, payload: bytes::Bytes) -> Result<()> {
+        self.stream_handle.write_bytes_vectored(header, payload)
+    }
+    
+    /// Send owned chunks without copying - optimal for streaming large messages
+    pub fn write_owned_chunks(&self, chunks: Vec<bytes::Bytes>) -> Result<()> {
+        self.stream_handle.write_owned_chunks(chunks)
+    }
+    
     
 }
 
@@ -1221,6 +1654,7 @@ impl ConnectionPool {
             addr_to_peer_id: dashmap::DashMap::new(),
             peer_id_to_addr: dashmap::DashMap::new(),
             connections: dashmap::DashMap::new(), // DEPRECATED
+            correlation_trackers: dashmap::DashMap::new(),
             max_connections,
             connection_timeout,
             registry: None,
@@ -1229,7 +1663,7 @@ impl ConnectionPool {
         };
         
         // Log the pool's address for debugging
-        info!("CONNECTION POOL: Created new pool at {:p}", &pool as *const _);
+        debug!("CONNECTION POOL: Created new pool at {:p}", &pool as *const _);
         pool
     }
 
@@ -1239,11 +1673,22 @@ impl ConnectionPool {
     }
     
     /// Store or update the address for a node
+    /// Only updates if no address is already configured for this node
     pub fn update_node_address(&self, node_id: &str, addr: SocketAddr) {
         let peer_id = crate::PeerId::new(node_id);
+        
+        // Check if we already have a configured address for this node
+        if let Some(existing_addr_entry) = self.peer_id_to_addr.get(&peer_id) {
+            let existing_addr = *existing_addr_entry.value();
+            debug!("CONNECTION POOL: Node {} already has configured address {}, not updating to ephemeral port {}", 
+                   node_id, existing_addr, addr);
+            return;
+        }
+        
+        // Only update if no address is configured
         self.peer_id_to_addr.insert(peer_id.clone(), addr);
         self.addr_to_peer_id.insert(addr, peer_id);
-        info!("CONNECTION POOL: Updated address for node {} to {}", node_id, addr);
+        debug!("CONNECTION POOL: Set initial address for node {} to {}", node_id, addr);
     }
     
     /// Get a connection by node ID
@@ -1253,7 +1698,7 @@ impl ConnectionPool {
         if let Some(conn_entry) = self.connections_by_peer.get(&peer_id) {
             let conn = conn_entry.value().clone();
             if conn.is_connected() {
-                info!("CONNECTION POOL: Found connection for node '{}'", node_id);
+                debug!("CONNECTION POOL: Found connection for node '{}'", node_id);
                 Some(conn)
             } else {
                 warn!("CONNECTION POOL: Connection for node '{}' is disconnected", node_id);
@@ -1270,10 +1715,44 @@ impl ConnectionPool {
         }
     }
     
+    /// Get or create a correlation tracker for a peer
+    pub fn get_or_create_correlation_tracker(&self, peer_id: &crate::PeerId) -> Arc<CorrelationTracker> {
+        let tracker = self.correlation_trackers
+            .entry(peer_id.clone())
+            .or_insert_with(|| {
+                debug!("CONNECTION POOL: Creating new correlation tracker for peer {}", peer_id);
+                CorrelationTracker::new()
+            })
+            .clone();
+        debug!("CONNECTION POOL: Got correlation tracker for peer {} (total trackers: {})", 
+              peer_id, self.correlation_trackers.len());
+        tracker
+    }
+    
     /// Add a connection indexed by node ID
-    pub fn add_connection_by_node_id(&self, node_id: String, addr: SocketAddr, connection: Arc<LockFreeConnection>) -> bool {
+    pub fn add_connection_by_node_id(&self, node_id: String, addr: SocketAddr, mut connection: Arc<LockFreeConnection>) -> bool {
         // Convert to PeerId
         let peer_id = crate::PeerId::new(&node_id);
+        
+        // Only set correlation tracker if the connection doesn't already have one
+        if connection.correlation.is_none() {
+            // Get or create shared correlation tracker for this peer
+            let correlation_tracker = self.get_or_create_correlation_tracker(&peer_id);
+            
+            // Set the correlation tracker on the connection
+            // We need to make the connection mutable
+            if let Some(conn_mut) = Arc::get_mut(&mut connection) {
+                conn_mut.correlation = Some(correlation_tracker);
+            } else {
+                warn!("CONNECTION POOL: Cannot set correlation tracker - Arc has multiple references");
+            }
+        } else {
+            // Connection already has a correlation tracker - ensure it's registered
+            if let Some(ref correlation) = connection.correlation {
+                self.correlation_trackers.insert(peer_id.clone(), correlation.clone());
+                debug!("CONNECTION POOL: Registered existing correlation tracker for node '{}'", node_id);
+            }
+        }
         
         // Update the address mappings
         self.addr_to_peer_id.insert(addr, peer_id.clone());
@@ -1286,18 +1765,38 @@ impl ConnectionPool {
         
         self.connection_counter.fetch_add(1, Ordering::AcqRel);
         
-        info!("CONNECTION POOL: Added connection for node '{}' (address: {})", node_id, addr);
+        debug!("CONNECTION POOL: Added connection for node '{}' (address: {})", node_id, addr);
         true
     }
     
     /// Send data to a node by ID
     pub fn send_to_node_id(&self, node_id: &str, data: &[u8]) -> Result<()> {
-        info!("CONNECTION POOL: send_to_node_id called for node '{}', pool has {} node connections", 
+        debug!("CONNECTION POOL: send_to_node_id called for node '{}', pool has {} node connections", 
               node_id, self.connections_by_peer.len());
         if let Some(connection) = self.get_connection_by_node_id(node_id) {
             if let Some(ref stream_handle) = connection.stream_handle {
-                info!("CONNECTION POOL: Sending {} bytes to node '{}'", data.len(), node_id);
-                return stream_handle.write_nonblocking(data);
+                debug!("CONNECTION POOL: Sending {} bytes to node '{}'", data.len(), node_id);
+                return stream_handle.write_bytes_nonblocking(bytes::Bytes::copy_from_slice(data));
+            } else {
+                warn!(node_id = %node_id, "Connection found but no stream handle");
+            }
+        } else {
+            warn!(node_id = %node_id, "No connection found for node");
+        }
+        Err(crate::GossipError::Network(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("Connection not found for node {}", node_id)
+        )))
+    }
+    
+    /// Send bytes to a node by its ID (zero-copy version)
+    pub fn send_bytes_to_node_id(&self, node_id: &str, data: bytes::Bytes) -> Result<()> {
+        debug!("CONNECTION POOL: send_bytes_to_node_id called for node '{}', pool has {} node connections", 
+              node_id, self.connections_by_peer.len());
+        if let Some(connection) = self.get_connection_by_node_id(node_id) {
+            if let Some(ref stream_handle) = connection.stream_handle {
+                debug!("CONNECTION POOL: Sending {} bytes to node '{}'", data.len(), node_id);
+                return stream_handle.write_bytes_nonblocking(data);
             } else {
                 warn!(node_id = %node_id, "Connection found but no stream handle");
             }
@@ -1327,14 +1826,15 @@ impl ConnectionPool {
             )));
         }
         
+        // Split the stream for reading and writing
         let (reader, writer) = tcp_stream.into_split();
         
         // Create lock-free streaming handle with exclusive socket ownership
         let stream_handle = Arc::new(LockFreeStreamHandle::new(
-            writer,
+            writer, // Pass writer half
             addr,
             ChannelId::Global,
-            4096, // Ring buffer size
+            RING_BUFFER_SIZE,
         ));
         
         let mut connection = LockFreeConnection::new(addr);
@@ -1350,14 +1850,14 @@ impl ConnectionPool {
         let registry_weak = self.registry.clone();
         tokio::spawn(async move {
             info!(peer = %addr, "Starting reader task for outgoing connection");
-            handle_persistent_connection_reader(reader, addr, registry_weak).await;
+            handle_persistent_connection_reader(reader, None, addr, registry_weak).await;
             reader_connection.set_state(ConnectionState::Disconnected);
             info!(peer = %addr, "Reader task for outgoing connection ended");
         });
         
         // Insert into lock-free hash map
         self.connections.insert(addr, connection_arc.clone());
-        info!("CONNECTION POOL: Added lock-free connection to {} - pool now has {} connections", 
+        debug!("CONNECTION POOL: Added lock-free connection to {} - pool now has {} connections", 
               addr, self.connections.len());
         
         Ok(connection_arc)
@@ -1368,7 +1868,7 @@ impl ConnectionPool {
     pub fn send_lock_free(&self, addr: SocketAddr, data: &[u8]) -> Result<()> {
         if let Some(connection) = self.get_lock_free_connection(addr) {
             if let Some(ref stream_handle) = connection.stream_handle {
-                return stream_handle.write_nonblocking(data);
+                return stream_handle.write_bytes_nonblocking(bytes::Bytes::copy_from_slice(data));
             } else {
                 warn!(addr = %addr, "Connection found but no stream handle");
             }
@@ -1406,14 +1906,14 @@ impl ConnectionPool {
     pub fn remove_connection(&self, addr: SocketAddr) -> Option<Arc<LockFreeConnection>> {
         // First remove from address-based map
         if let Some((_, connection)) = self.connections.remove(&addr) {
-            info!("CONNECTION POOL: Removed connection to {} - pool now has {} connections", 
+            debug!("CONNECTION POOL: Removed connection to {} - pool now has {} connections", 
                   addr, self.connections.len());
             
             // Also remove from node ID mapping
             if let Some(node_id_entry) = self.addr_to_peer_id.remove(&addr) {
                 let (_, node_id) = node_id_entry;
                 if let Some((_, _)) = self.connections_by_peer.remove(&node_id) {
-                    info!("CONNECTION POOL: Also removed connection by node ID '{}'", node_id);
+                    debug!("CONNECTION POOL: Also removed connection by node ID '{}'", node_id);
                 }
             }
             
@@ -1530,14 +2030,14 @@ impl ConnectionPool {
     pub async fn get_connection_to_node(&mut self, node_id: &str) -> Result<ConnectionHandle> {
         // Convert string to PeerId for internal use
         let peer_id = crate::PeerId::new(node_id);
-        info!("CONNECTION POOL: get_connection_to_node called for node '{}'", node_id);
+        debug!("CONNECTION POOL: get_connection_to_node called for node '{}'", node_id);
         
         // First check if we already have a connection to this node
         if let Some(conn_entry) = self.connections_by_peer.get(&peer_id) {
             let conn = conn_entry.value();
             if conn.is_connected() {
                 conn.update_last_used();
-                info!("CONNECTION POOL: Found existing connection to node '{}'", node_id);
+                debug!("CONNECTION POOL: Found existing connection to node '{}'", node_id);
                 
                 if let Some(ref stream_handle) = conn.stream_handle {
                     // Need to get the address for ConnectionHandle
@@ -1555,7 +2055,7 @@ impl ConnectionPool {
                 }
             } else {
                 // Remove disconnected connection
-                info!("CONNECTION POOL: Removing disconnected connection to node '{}'", node_id);
+                debug!("CONNECTION POOL: Removing disconnected connection to node '{}'", node_id);
                 drop(conn_entry);
                 self.connections_by_peer.remove(&peer_id);
             }
@@ -1571,7 +2071,7 @@ impl ConnectionPool {
             )));
         };
         
-        info!("CONNECTION POOL: Creating new connection to node '{}' at {}", node_id, addr);
+        debug!("CONNECTION POOL: Creating new connection to node '{}' at {}", node_id, addr);
         
         // Create the connection and store it by node ID
         let handle = self.get_connection(addr).await?;
@@ -1580,7 +2080,7 @@ impl ConnectionPool {
         if let Some(conn) = self.connections.get(&addr) {
             self.connections_by_peer.insert(peer_id.clone(), conn.value().clone());
             self.addr_to_peer_id.insert(addr, peer_id.clone());
-            info!("CONNECTION POOL: Indexed new connection under node ID '{}'", node_id);
+            debug!("CONNECTION POOL: Indexed new connection under node ID '{}'", node_id);
         }
         
         Ok(handle)
@@ -1588,8 +2088,9 @@ impl ConnectionPool {
 
     pub async fn get_connection(&mut self, addr: SocketAddr) -> Result<ConnectionHandle> {
         let _current_time = current_timestamp();
-        info!("CONNECTION POOL: get_connection called on pool at {:p} for {}", self as *const _, addr);
-        info!("CONNECTION POOL: This pool instance has {} connections stored", self.connections.len());
+        // Debug logging removed for performance - these logs were too verbose
+        // debug!("CONNECTION POOL: get_connection called on pool at {:p} for {}", self as *const _, addr);
+        // debug!("CONNECTION POOL: This pool instance has {} connections stored", self.connections.len());
 
         // TEMPORARY: For backward compatibility, we'll create a hybrid approach
         // that allows the old ConnectionHandle API to work while we transition
@@ -1642,18 +2143,19 @@ impl ConnectionPool {
         }
 
         // Connect with timeout
-        info!("CONNECTION POOL: Attempting to connect to {}", addr);
+        debug!("CONNECTION POOL: Attempting to connect to {}", addr);
         let stream = tokio::time::timeout(connection_timeout, TcpStream::connect(addr))
             .await
             .map_err(|_| {
-                info!("CONNECTION POOL: Connection to {} timed out", addr);
+                debug!("CONNECTION POOL: Connection to {} timed out after {:?}", addr, connection_timeout);
                 GossipError::Timeout
             })?
             .map_err(|e| {
-                info!("CONNECTION POOL: Connection to {} failed: {}", addr, e);
+                debug!("CONNECTION POOL: Connection to {} failed: {} (will retry in {}s if this is a gossip peer)", 
+                      addr, e, 5); // 5s is the default retry interval
                 GossipError::Network(e)
             })?;
-        info!("CONNECTION POOL: Successfully connected to {}", addr);
+        debug!("CONNECTION POOL: Successfully connected to {}", addr);
 
         // Configure socket
         stream.set_nodelay(true).map_err(GossipError::Network)?;
@@ -1666,7 +2168,7 @@ impl ConnectionPool {
             writer,
             addr,
             ChannelId::Global,
-            4096,
+            RING_BUFFER_SIZE,
         ));
         
         let mut conn = LockFreeConnection::new(addr);
@@ -1674,15 +2176,35 @@ impl ConnectionPool {
         conn.set_state(ConnectionState::Connected);
         conn.update_last_used();
         
+        // For outgoing connections, we might know the peer ID from configuration
+        let peer_id_opt = self.addr_to_peer_id.get(&addr).map(|entry| entry.clone())
+            .or_else(|| {
+                // Try reverse lookup: find peer ID that maps to this address
+                self.peer_id_to_addr.iter()
+                    .find(|entry| entry.value() == &addr)
+                    .map(|entry| entry.key().clone())
+            });
+            
+        if let Some(peer_id) = peer_id_opt {
+            // Use shared correlation tracker for this peer
+            conn.correlation = Some(self.get_or_create_correlation_tracker(&peer_id));
+            debug!("CONNECTION POOL: Using shared correlation tracker for peer {:?} at {}", peer_id, addr);
+        } else {
+            // No peer ID yet, create a new correlation tracker
+            // This will be replaced when we learn the peer ID from their FullSync message
+            conn.correlation = Some(CorrelationTracker::new());
+            debug!("CONNECTION POOL: Created new correlation tracker for unknown peer at {}", addr);
+        }
+        
         let connection_arc = Arc::new(conn);
         
         // Insert into lock-free map before spawning
         self.connections.insert(addr, connection_arc.clone());
-        info!("CONNECTION POOL: Added connection via get_connection to {} - pool now has {} connections", 
+        debug!("CONNECTION POOL: Added connection via get_connection to {} - pool now has {} connections", 
               addr, self.connections.len());
         // Double check it's really there
         assert!(self.connections.contains_key(&addr), "Connection was not added to pool!");
-        info!("CONNECTION POOL: Verified connection exists for {}", addr);
+        debug!("CONNECTION POOL: Verified connection exists for {}", addr);
         
         // Send initial FullSync message to identify ourselves
         if let Some(registry_arc) = registry_weak.as_ref().and_then(|w| w.upgrade()) {
@@ -1721,6 +2243,9 @@ impl ConnectionPool {
             }
         }
         
+        // Note: actor_message_handler is fetched from registry on each message to handle
+        // cases where the handler is registered after connection establishment
+        
         // Spawn reader task for outgoing connection
         // This MUST process incoming messages to receive responses!
         let reader_connection = connection_arc.clone();
@@ -1730,7 +2255,9 @@ impl ConnectionPool {
             info!(peer = %addr, "Starting outgoing connection reader with message processing");
             
             let mut partial_msg_buf = Vec::new();
-            let mut read_buf = vec![0u8; 4096];
+            // Increase buffer size to handle large messages more efficiently
+            // 1MB buffer can read 35MB message in ~35 chunks instead of ~8500
+            let mut read_buf = vec![0u8; 1024 * 1024]; // 1MB read buffer
             
             loop {
                 match reader.read(&mut read_buf).await {
@@ -1758,9 +2285,16 @@ impl ConnectionPool {
                                 // We have a complete message
                                 let msg_data = &partial_msg_buf[4..4+len];
                                 
+                                // Log message for debugging large messages
+                                if len > 1024 * 1024 { // > 1MB
+                                    info!(peer = %addr, msg_size = len, "✅ COMPLETE: Large message fully received, processing...");
+                                }
+                                
                                 // Check if this is an Ask/Response message by looking at first byte
                                 if msg_data.len() >= 1 {
+                                    debug!(peer = %addr, first_byte = msg_data[0], msg_len = msg_data.len(), "Checking message type - first byte: {} (0=Gossip, 3=ActorTell)", msg_data[0]);
                                     if let Some(msg_type) = crate::MessageType::from_byte(msg_data[0]) {
+                                        debug!(peer = %addr, msg_type = ?msg_type, "Identified message type: {:?}", msg_type);
                                         // This is an Ask/Response message
                                         if msg_data.len() < 8 {
                                             warn!(peer = %addr, "Ask/Response message too small");
@@ -1790,15 +2324,15 @@ impl ConnectionPool {
                                                                 
                                                                 // Send response back
                                                                 if let Some(ref stream_handle) = conn.stream_handle {
-                                                                    let mut msg = Vec::with_capacity(4 + 8 + response.len());
+                                                                    let mut msg = bytes::BytesMut::with_capacity(4 + 8 + response.len());
                                                                     let total_size = 8 + response.len();
                                                                     msg.extend_from_slice(&(total_size as u32).to_be_bytes());
-                                                                    msg.push(crate::MessageType::Response as u8);
+                                                                    msg.put_u8(crate::MessageType::Response as u8);
                                                                     msg.extend_from_slice(&correlation_id.to_be_bytes());
                                                                     msg.extend_from_slice(&[0u8; 5]);
                                                                     msg.extend_from_slice(&response);
                                                                     
-                                                                    if let Err(e) = stream_handle.write_nonblocking(&msg) {
+                                                                    if let Err(e) = stream_handle.write_bytes_nonblocking(msg.freeze()) {
                                                                         warn!(peer = %addr, error = %e, "Failed to send Ask response");
                                                                     } else {
                                                                         debug!(peer = %addr, correlation_id = correlation_id, "Sent Ask response");
@@ -1814,26 +2348,149 @@ impl ConnectionPool {
                                                 }
                                             }
                                             crate::MessageType::Response => {
-                                                // Handle incoming response
-                                                if let Some(ref registry_weak) = registry_weak_for_reader {
-                                                    if let Some(registry) = registry_weak.upgrade() {
-                                                        // Find the connection with this peer
-                                                        let conn = {
-                                                            let pool = registry.connection_pool.lock().await;
-                                                            pool.connections.get(&addr).map(|c| c.value().clone())
-                                                        };
+                                                // Handle incoming response - DIRECT DELIVERY, NO LOCKS OR SEARCHES
+                                                debug!(peer = %addr, correlation_id = correlation_id, "Received response message");
+                                                
+                                                // Use the correlation tracker directly from the connection
+                                                if let Some(ref correlation) = reader_connection.correlation {
+                                                    if correlation.has_pending(correlation_id) {
+                                                        correlation.complete(correlation_id, payload.to_vec());
+                                                        debug!(peer = %addr, correlation_id = correlation_id, 
+                                                               "Delivered response via correlation tracker");
+                                                    } else {
+                                                        debug!(peer = %addr, correlation_id = correlation_id, 
+                                                               "No pending request for this correlation_id - may have timed out");
+                                                    }
+                                                } else {
+                                                    warn!(peer = %addr, correlation_id = correlation_id, 
+                                                           "Connection has no correlation tracker!");
+                                                }
+                                            }
+                                            crate::MessageType::Gossip => {
+                                                // Gossip messages can arrive here, just ignore them
+                                            }
+                                            crate::MessageType::ActorTell => {
+                                                // Direct actor tell message format:
+                                                // Already parsed: [type:1][correlation_id:2][reserved:5]
+                                                // Payload: [actor_id:8][type_hash:4][payload_len:4][payload:N]
+                                                info!(peer = %addr, total_payload_len = payload.len(), "🔍 Received ActorTell message (optimized binary path)");
+                                                if payload.len() >= 16 {
+                                                    let actor_id = u64::from_be_bytes(payload[0..8].try_into().unwrap());
+                                                    let type_hash = u32::from_be_bytes(payload[8..12].try_into().unwrap());
+                                                    let payload_len = u32::from_be_bytes(payload[12..16].try_into().unwrap()) as usize;
+                                                    
+                                                    info!(peer = %addr, actor_id = actor_id, type_hash = %format!("{:08x}", type_hash), 
+                                                          payload_len = payload_len, "📨 ActorTell message details");
+                                                    
+                                                    if payload.len() >= 16 + payload_len {
+                                                        let actor_payload = &payload[16..16+payload_len];
+                                                        info!(peer = %addr, actual_payload_size = actor_payload.len(), "✅ ActorTell payload size check passed");
                                                         
-                                                        if let Some(conn) = conn {
-                                                            if let Some(ref correlation) = conn.correlation {
-                                                                correlation.complete(correlation_id, payload.to_vec());
-                                                                debug!(peer = %addr, correlation_id = correlation_id, "Delivered response to correlation tracker");
+                                                        // Fetch actor message handler from registry each time (in case it's set after connection)
+                                                        if let Some(ref registry_weak) = registry_weak_for_reader {
+                                                            if let Some(registry) = registry_weak.upgrade() {
+                                                                if let Some(ref handler) = &*registry.actor_message_handler.lock().await {
+                                                                    info!(peer = %addr, "🚀 Calling actor message handler for ActorTell");
+                                                                    match handler.handle_actor_message(
+                                                                        &actor_id.to_string(),
+                                                                        type_hash,
+                                                                        actor_payload,
+                                                                        None, // No correlation for tell
+                                                                    ).await {
+                                                                        Ok(_) => info!(peer = %addr, actor_id = actor_id, type_hash = %format!("{:08x}", type_hash), 
+                                                                                       "✅ ActorTell handled successfully"),
+                                                                        Err(e) => error!(peer = %addr, actor_id = actor_id, type_hash = %format!("{:08x}", type_hash), 
+                                                                                         error = %e, "❌ Failed to handle ActorTell"),
+                                                                    }
+                                                                } else {
+                                                                    error!(peer = %addr, "❌ No actor message handler registered in registry");
+                                                                }
+                                                            } else {
+                                                                error!(peer = %addr, "❌ Registry weak reference could not be upgraded");
+                                                            }
+                                                        } else {
+                                                            error!(peer = %addr, "❌ No registry weak reference available");
+                                                        }
+                                                    } else {
+                                                        error!(peer = %addr, expected = 16 + payload_len, actual = payload.len(), 
+                                                              "❌ ActorTell payload too short");
+                                                    }
+                                                } else {
+                                                    error!(peer = %addr, payload_len = payload.len(), "❌ ActorTell header too short");
+                                                }
+                                            }
+                                            crate::MessageType::ActorAsk => {
+                                                // TODO: Implement ActorAsk handling
+                                                warn!(peer = %addr, "ActorAsk not yet implemented");
+                                            }
+                                            crate::MessageType::StreamStart => {
+                                                // Parse stream header from payload
+                                                if payload.len() >= crate::StreamHeader::SERIALIZED_SIZE {
+                                                    if let Some(header) = crate::StreamHeader::from_bytes(&payload) {
+                                                        info!(peer = %addr, stream_id = header.stream_id, total_size = header.total_size,
+                                                              type_hash = %format!("{:08x}", header.type_hash), actor_id = header.actor_id,
+                                                              "📥 StreamStart: Beginning streaming transfer");
+                                                        
+                                                        // Initialize stream assembly
+                                                        if let Some(ref registry_weak) = registry_weak_for_reader {
+                                                            if let Some(registry) = registry_weak.upgrade() {
+                                                                registry.start_stream_assembly(header).await;
                                                             }
                                                         }
                                                     }
                                                 }
                                             }
-                                            crate::MessageType::Tell => {
-                                                warn!(peer = %addr, "Received Tell message in Ask/Response format - unexpected");
+                                            crate::MessageType::StreamData => {
+                                                // Parse stream header and data
+                                                if payload.len() >= crate::StreamHeader::SERIALIZED_SIZE {
+                                                    if let Some(header) = crate::StreamHeader::from_bytes(&payload) {
+                                                        let data_start = crate::StreamHeader::SERIALIZED_SIZE;
+                                                        if payload.len() >= data_start + header.chunk_size as usize {
+                                                            let chunk_data = &payload[data_start..data_start + header.chunk_size as usize];
+                                                            
+                                                            debug!(peer = %addr, stream_id = header.stream_id, chunk_index = header.chunk_index,
+                                                                   chunk_size = header.chunk_size, "📦 StreamData: Received chunk");
+                                                            
+                                                            // Add chunk to stream assembly
+                                                            if let Some(ref registry_weak) = registry_weak_for_reader {
+                                                                if let Some(registry) = registry_weak.upgrade() {
+                                                                    registry.add_stream_chunk(header, chunk_data.to_vec()).await;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            crate::MessageType::StreamEnd => {
+                                                // Parse stream header and complete assembly
+                                                if payload.len() >= crate::StreamHeader::SERIALIZED_SIZE {
+                                                    if let Some(header) = crate::StreamHeader::from_bytes(&payload) {
+                                                        info!(peer = %addr, stream_id = header.stream_id,
+                                                              "📤 StreamEnd: Completing streaming transfer");
+                                                        
+                                                        // Complete stream assembly and deliver to actor
+                                                        if let Some(ref registry_weak) = registry_weak_for_reader {
+                                                            if let Some(registry) = registry_weak.upgrade() {
+                                                                if let Some(complete_msg) = registry.complete_stream_assembly(header.stream_id).await {
+                                                                    // Deliver to actor
+                                                                    if let Some(ref handler) = &*registry.actor_message_handler.lock().await {
+                                                                        match handler.handle_actor_message(
+                                                                            &header.actor_id.to_string(),
+                                                                            header.type_hash,
+                                                                            &complete_msg,
+                                                                            None,
+                                                                        ).await {
+                                                                            Ok(_) => info!(peer = %addr, stream_id = header.stream_id,
+                                                                                          "✅ Successfully delivered streamed message to actor"),
+                                                                            Err(e) => error!(peer = %addr, stream_id = header.stream_id,
+                                                                                            error = %e, "❌ Failed to deliver streamed message"),
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
                                         
@@ -1851,7 +2508,7 @@ impl ConnectionPool {
                                     if let Some(registry) = registry_weak.upgrade() {
                                         match rkyv::from_bytes::<RegistryMessage, rkyv::rancor::Error>(&msg_data_vec) {
                                             Ok(msg) => {
-                                                warn!(peer = %addr, "Received message on outgoing connection");
+                                                debug!(peer = %addr, "Received message on outgoing connection");
                                                 
                                                 // Extract node ID from message if available
                                                 let node_id = match &msg {
@@ -1860,11 +2517,11 @@ impl ConnectionPool {
                                                     _ => None,
                                                 };
                                                 
-                                                // Update node mapping if we got a node ID
+                                                // NOTE: We do NOT update node address mapping here because 'addr' is the
+                                                // address we connected TO, which is the correct bind address. We don't want
+                                                // to accidentally overwrite it with ephemeral ports from other connections.
                                                 if let Some(node_id) = node_id {
-                                                    let pool = registry.connection_pool.lock().await;
-                                                    pool.update_node_address(&node_id, addr);
-                                                    info!(peer = %addr, node_id = %node_id, "Updated node ID mapping from outgoing connection message");
+                                                    debug!(peer = %addr, node_id = %node_id, "Received message from node on outgoing connection");
                                                 }
                                                 
                                                 if let Err(e) = handle_incoming_message(registry, addr, msg).await {
@@ -1929,8 +2586,8 @@ impl ConnectionPool {
         info!(peer = %addr, "successfully created new persistent connection");
         
         // Verify the connection is in the pool
-        info!("CONNECTION POOL: After get_connection, pool has {} connections", self.connections.len());
-        info!("CONNECTION POOL: Pool contains connection to {}? {}", addr, self.connections.contains_key(&addr));
+        debug!("CONNECTION POOL: After get_connection, pool has {} connections", self.connections.len());
+        debug!("CONNECTION POOL: Pool contains connection to {}? {}", addr, self.connections.contains_key(&addr));
         
         // Return a lock-free ConnectionHandle
         Ok(ConnectionHandle {
@@ -2010,11 +2667,12 @@ impl ConnectionPool {
 /// Start a persistent connection handler in the background
 fn start_persistent_connection_reader(
     reader: tokio::net::tcp::OwnedReadHalf,
+    writer: Option<tokio::net::tcp::OwnedWriteHalf>,
     peer_addr: SocketAddr,
     registry_weak: Option<std::sync::Weak<GossipRegistry>>,
 ) {
     tokio::spawn(async move {
-        handle_persistent_connection_reader(reader, peer_addr, registry_weak).await;
+        handle_persistent_connection_reader(reader, writer, peer_addr, registry_weak).await;
     });
 }
 
@@ -2028,31 +2686,35 @@ pub(crate) async fn handle_incoming_persistent_connection(
 ) {
     let (reader, writer) = stream.into_split();
     
-    // Add writer to connection pool if needed
-    if let Some(registry_weak) = &registry_weak {
-        if let Some(_registry) = registry_weak.upgrade() {
-            // Note: We don't add the connection here anymore as we need the node ID first
-            // The connection will be added when we receive the first message with node ID
-            drop(writer);
-        }
-    } else {
-        // No registry, just drop the writer
-        drop(writer);
-    }
-    
-    handle_persistent_connection_reader(reader, listening_addr, registry_weak).await;
+    // Pass the writer along to be stored when we know the node ID
+    handle_persistent_connection_reader(reader, Some(writer), listening_addr, registry_weak).await;
 }
 
 /// Handle persistent connection reader - only reads messages, no channels
 pub(crate) async fn handle_persistent_connection_reader(
     mut reader: tokio::net::tcp::OwnedReadHalf,
+    writer: Option<tokio::net::tcp::OwnedWriteHalf>,
     peer_addr: SocketAddr,
     registry_weak: Option<std::sync::Weak<GossipRegistry>>,
 ) {
     use tokio::io::AsyncReadExt;
     
     let mut partial_msg_buf = Vec::new();
-    let mut read_buf = vec![0u8; 4096];
+    // Increase buffer size to handle large messages more efficiently
+    let mut read_buf = vec![0u8; 1024 * 1024]; // 1MB read buffer
+    
+    // For incoming connections with a writer, create a stream handle
+    // For outgoing connections, we'll use the existing handle from the pool
+    let response_handle = if let Some(writer) = writer {
+        Some(Arc::new(LockFreeStreamHandle::new(
+            writer,
+            peer_addr,
+            ChannelId::Global,
+            RING_BUFFER_SIZE,
+        )))
+    } else {
+        None
+    };
     
     loop {
         match reader.read(&mut read_buf).await {
@@ -2072,17 +2734,52 @@ pub(crate) async fn handle_persistent_connection_reader(
                         partial_msg_buf[3],
                     ]) as usize;
                     
-                    if len > 1024 * 1024 {
-                        warn!(peer = %peer_addr, len = len, "Message too large");
+                    if len > 100 * 1024 * 1024 {
+                        warn!(peer = %peer_addr, len = len, "Message too large - possible buffer corruption");
+                        // This usually indicates we're reading from the wrong position in the buffer
+                        // Clear the buffer completely and restart message processing
+                        partial_msg_buf.clear();
                         break;
                     }
                     
+                    // Debug log for large messages (>1MB)
+                    if len > 1024 * 1024 {
+                        // eprintln!("📦 SERVER: LARGE MESSAGE detected! len={}, from peer={}", len, peer_addr);
+                        // info!(peer = %peer_addr, len = len, buf_len = partial_msg_buf.len(), needed = 4 + len,
+                        //       "📦 LARGE MESSAGE: Receiving large message (have {} of {} bytes)", 
+                        //       partial_msg_buf.len(), 4 + len);
+                        
+                        // Pre-allocate buffer capacity for large messages to avoid repeated allocations
+                        let total_needed = 4 + len;
+                        if partial_msg_buf.capacity() < total_needed {
+                            partial_msg_buf.reserve(total_needed - partial_msg_buf.len());
+                            info!(peer = %peer_addr, "📦 LARGE MESSAGE: Reserved {} bytes for message", total_needed);
+                        }
+                    }
+                    
                     let total_len = 4 + len;
+                    if partial_msg_buf.len() < total_len {
+                        // if len > 1024 * 1024 {
+                        //     eprintln!("📦 SERVER: Accumulating large message... have {}/{} bytes", partial_msg_buf.len(), total_len);
+                        // }
+                        // Not enough data yet, break inner loop to read more
+                        break;
+                    }
                     if partial_msg_buf.len() >= total_len {
                         let msg_data = &partial_msg_buf[4..total_len];
                         
+                        // Log when we have the complete large message
+                        // if len > 1024 * 1024 {
+                        //     eprintln!("📦 SERVER: LARGE MESSAGE COMPLETE! len={}, processing...", len);
+                        //     // info!(peer = %peer_addr, len = len, "📦 LARGE MESSAGE: Complete message received, processing...");
+                        // }
+                        
                         // Check if this is an Ask/Response message by looking at first byte
                         if msg_data.len() >= 1 {
+                            // Debug log for large messages
+                            // if len > 1024 * 1024 {
+                            //     info!(peer = %peer_addr, first_byte = msg_data[0], "📦 LARGE MESSAGE first byte: {} (0=Gossip, 3=ActorTell)", msg_data[0]);
+                            // }
                             if let Some(msg_type) = crate::MessageType::from_byte(msg_data[0]) {
                                 // This is an Ask/Response message
                                 if msg_data.len() < 8 {
@@ -2096,75 +2793,418 @@ pub(crate) async fn handle_persistent_connection_reader(
                                 
                                 match msg_type {
                                     crate::MessageType::Ask => {
-                                        // Handle incoming Ask requests for testing
-                                        #[cfg(feature = "test-helpers")]
-                                        {
+                                        
+                                        // Try to deserialize the payload as a RegistryMessage
+                                        // Note: payload might not be aligned, so we need to copy it to an aligned buffer
+                                        let aligned_payload = payload.to_vec();
+                                        match rkyv::from_bytes::<crate::registry::RegistryMessage, rkyv::rancor::Error>(&aligned_payload) {
+                                            Ok(mut registry_msg) => {
+                                                debug!(peer = %peer_addr, correlation_id = correlation_id, "Received Ask with RegistryMessage payload");
+                                            
+                                            // If it's an ActorMessage, ensure it has the correlation_id from the Ask envelope
+                                            if let crate::registry::RegistryMessage::ActorMessage { 
+                                                ref actor_id, 
+                                                ref type_hash, 
+                                                ref payload,
+                                                correlation_id: ref mut inner_correlation_id,
+                                            } = registry_msg {
+                                                if inner_correlation_id.is_none() {
+                                                    // Use the Ask envelope's correlation_id
+                                                    *inner_correlation_id = Some(correlation_id);
+                                                    debug!(
+                                                        peer = %peer_addr, 
+                                                        correlation_id = correlation_id,
+                                                        actor_id = %actor_id,
+                                                        type_hash = %format!("{:08x}", type_hash),
+                                                        "Set ActorMessage correlation_id from Ask envelope"
+                                                    );
+                                                }
+                                            }
+                                            
+                                            // Handle the registry message and get the response
+                                            // For Ask messages, we need to handle the reply ourselves
                                             if let Some(ref registry_weak) = registry_weak {
                                                 if let Some(registry) = registry_weak.upgrade() {
-                                                    let conn = {
-                                                        let pool = registry.connection_pool.lock().await;
-                                                        pool.connections.get(&peer_addr).map(|conn_ref| conn_ref.value().clone())
-                                                    };
-                                                    
-                                                    if let Some(conn) = conn {
-                                                        // Process the request and generate response
-                                                        let request_str = String::from_utf8_lossy(payload);
-                                                        let response_data = process_mock_request(&request_str);
+                                                    // Special handling for ActorMessage with correlation_id
+                                                    if let crate::registry::RegistryMessage::ActorMessage { 
+                                                        ref actor_id, 
+                                                        ref type_hash, 
+                                                        ref payload,
+                                                        correlation_id: Some(corr_id),
+                                                    } = registry_msg {
+                                                        // Handle the actor message directly
+                                                        match registry.handle_actor_message(actor_id, *type_hash, payload, Some(corr_id)).await {
+                                                            Ok(Some(reply_payload)) => {
+                                                                debug!(peer = %peer_addr, correlation_id = corr_id, reply_len = reply_payload.len(),
+                                                                       "Got reply from actor, sending response back");
+                                                                
+                                                                // Create response message
+                                                                let mut response = bytes::BytesMut::with_capacity(4 + 8 + reply_payload.len());
+                                                                
+                                                                // Length prefix (4 bytes)
+                                                                let total_len = 8 + reply_payload.len() as u32;
+                                                                response.extend_from_slice(&total_len.to_be_bytes());
+                                                                
+                                                                // 8-byte header: msg_type(1) + correlation_id(2) + reserved(5)
+                                                                response.put_u8(crate::MessageType::Response as u8);
+                                                                response.extend_from_slice(&corr_id.to_be_bytes());
+                                                                response.extend_from_slice(&[0u8; 5]);
+                                                                
+                                                                // Payload
+                                                                response.extend_from_slice(&reply_payload);
+                                                                
+                                                                // For both incoming and outgoing connections, find the stream handle from the pool
+                                                                let pool = registry.connection_pool.lock().await;
+                                                                if let Some(conn) = pool.connections.get(&peer_addr).map(|c| c.value().clone()) {
+                                                                    if let Some(ref stream_handle) = conn.stream_handle {
+                                                                        if let Err(e) = stream_handle.write_bytes_nonblocking(response.freeze()) {
+                                                                            warn!(peer = %peer_addr, error = %e, "Failed to send ask reply");
+                                                                        } else {
+                                                                            debug!(peer = %peer_addr, correlation_id = corr_id, "Sent ask reply through connection pool");
+                                                                        }
+                                                                    } else {
+                                                                        warn!(peer = %peer_addr, "Connection has no stream handle");
+                                                                    }
+                                                                } else {
+                                                                    warn!(peer = %peer_addr, "No connection found in pool to send ask reply");
+                                                                }
+                                                            }
+                                                            Ok(None) => {
+                                                                debug!(peer = %peer_addr, correlation_id = corr_id, "No reply from actor");
+                                                            }
+                                                            Err(e) => {
+                                                                warn!(peer = %peer_addr, error = %e, correlation_id = corr_id, "Failed to handle actor message");
+                                                            }
+                                                        }
+                                                    } else {
+                                                        // For other messages, use the normal handler
+                                                        match handle_incoming_message(registry.clone(), peer_addr, registry_msg).await {
+                                                        Ok(()) => {
+                                                            debug!(peer = %peer_addr, correlation_id = correlation_id, "Ask message processed");
+                                                        }
+                                                        Err(e) => {
+                                                            warn!(peer = %peer_addr, error = %e, correlation_id = correlation_id, "Failed to handle Ask message");
+                                                        }
+                                                    }
+                                                    }
+                                                }
+                                            }
+                                            }
+                                            Err(e) => {
+                                                warn!(peer = %peer_addr, correlation_id = correlation_id, error = %e,
+                                                       payload_len = payload.len(),
+                                                       "HANDLE ASK: Failed to deserialize as RegistryMessage, trying MessageWrapper");
+                                                
+                                                // Not a RegistryMessage, handle as before for test helpers
+                                            #[cfg(feature = "test-helpers")]
+                                            {
+                                                if let Some(ref registry_weak) = registry_weak {
+                                                    if let Some(registry) = registry_weak.upgrade() {
+                                                        let conn = {
+                                                            let pool = registry.connection_pool.lock().await;
+                                                            pool.connections.get(&peer_addr).map(|conn_ref| conn_ref.value().clone())
+                                                        };
                                                         
-                                                        // Build response message
-                                                        let total_size = 8 + response_data.len();
-                                                        let mut msg = Vec::with_capacity(4 + total_size);
-                                                        
-                                                        // Length prefix
-                                                        msg.extend_from_slice(&(total_size as u32).to_be_bytes());
-                                                        
-                                                        // Header: [type:1][corr_id:2][reserved:5]
-                                                        msg.push(crate::MessageType::Response as u8);
-                                                        msg.extend_from_slice(&correlation_id.to_be_bytes());
-                                                        msg.extend_from_slice(&[0u8; 5]);
-                                                        msg.extend_from_slice(&response_data);
-                                                        
-                                                        // Send response back through stream handle
-                                                        if let Some(ref stream_handle) = conn.stream_handle {
-                                                            if let Err(e) = stream_handle.write_nonblocking(&msg) {
-                                                                warn!("Failed to send mock response: {}", e);
-                                                            } else {
-                                                                debug!("Sent mock response for correlation_id {}", correlation_id);
+                                                        if let Some(conn) = conn {
+                                                            // Process the request and generate response
+                                                            let request_str = String::from_utf8_lossy(payload);
+                                                            let response_data = process_mock_request(&request_str);
+                                                            
+                                                            // Build response message
+                                                            let total_size = 8 + response_data.len();
+                                                            let mut msg = bytes::BytesMut::with_capacity(4 + total_size);
+                                                            
+                                                            // Length prefix
+                                                            msg.extend_from_slice(&(total_size as u32).to_be_bytes());
+                                                            
+                                                            // Header: [type:1][corr_id:2][reserved:5]
+                                                            msg.put_u8(crate::MessageType::Response as u8);
+                                                            msg.extend_from_slice(&correlation_id.to_be_bytes());
+                                                            msg.extend_from_slice(&[0u8; 5]);
+                                                            msg.extend_from_slice(&response_data);
+                                                            
+                                                            // Send response back through stream handle
+                                                            if let Some(ref stream_handle) = conn.stream_handle {
+                                                                if let Err(e) = stream_handle.write_bytes_nonblocking(msg.freeze()) {
+                                                                    warn!("Failed to send mock response: {}", e);
+                                                                } else {
+                                                                    debug!("Sent mock response for correlation_id {}", correlation_id);
+                                                                }
                                                             }
                                                         }
                                                     }
                                                 }
                                             }
-                                        }
-                                        #[cfg(not(feature = "test-helpers"))]
-                                        {
-                                            warn!(peer = %peer_addr, correlation_id = correlation_id, "Received Ask request - not implemented in production");
+                                            #[cfg(not(feature = "test-helpers"))]
+                                            {
+                                                // This might be a kameo AskWrapper - try to handle it
+                                                debug!(peer = %peer_addr, correlation_id = correlation_id, payload_len = payload.len(), 
+                                                      "Received non-RegistryMessage Ask request, checking if it's from kameo");
+                                                
+                                                // Try to parse binary format from kameo: [actor_id:8][type_hash:4][payload_len:4][payload:N]
+                                                if payload.len() >= 16 {
+                                                    let actor_id = u64::from_be_bytes([
+                                                        payload[0], payload[1], payload[2], payload[3],
+                                                        payload[4], payload[5], payload[6], payload[7]
+                                                    ]);
+                                                    let type_hash = u32::from_be_bytes([
+                                                        payload[8], payload[9], payload[10], payload[11]
+                                                    ]);
+                                                    let payload_len = u32::from_be_bytes([
+                                                        payload[12], payload[13], payload[14], payload[15]
+                                                    ]) as usize;
+                                                    
+                                                    if payload.len() >= 16 + payload_len {
+                                                        let inner_payload = &payload[16..16 + payload_len];
+                                                        
+                                                        debug!(peer = %peer_addr, correlation_id = correlation_id, 
+                                                               actor_id = actor_id, type_hash = type_hash,
+                                                               "Successfully decoded kameo binary message format");
+                                                        
+                                                        if let Some(ref registry_weak) = registry_weak {
+                                                            if let Some(registry) = registry_weak.upgrade() {
+                                                                // Handle the actor message
+                                                                let actor_id_str = actor_id.to_string();
+                                                            match registry.handle_actor_message(&actor_id_str, type_hash, inner_payload, Some(correlation_id)).await {
+                                                                Ok(Some(reply_payload)) => {
+                                                                    debug!(peer = %peer_addr, correlation_id = correlation_id, reply_len = reply_payload.len(),
+                                                                           "Got reply from kameo actor, sending response back");
+                                                                    
+                                                                    // Create response message
+                                                                    let mut response = bytes::BytesMut::with_capacity(4 + 8 + reply_payload.len());
+                                                                    
+                                                                    // Length prefix (4 bytes)
+                                                                    let total_len = 8 + reply_payload.len() as u32;
+                                                                    response.extend_from_slice(&total_len.to_be_bytes());
+                                                                    
+                                                                    // 8-byte header: msg_type(1) + correlation_id(2) + reserved(5)
+                                                                    response.put_u8(crate::MessageType::Response as u8);
+                                                                    response.extend_from_slice(&correlation_id.to_be_bytes());
+                                                                    response.extend_from_slice(&[0u8; 5]);
+                                                                    
+                                                                    // Payload
+                                                                    response.extend_from_slice(&reply_payload);
+                                                                    
+                                                                    // Send response back through the response handle we saved
+                                                                    if let Some(ref handle) = response_handle {
+                                                                        // We have the handle directly! Use it
+                                                                        if let Err(e) = handle.write_bytes_nonblocking(response.freeze()) {
+                                                                            warn!(peer = %peer_addr, error = %e, "Failed to send ask reply");
+                                                                        } else {
+                                                                            debug!(peer = %peer_addr, correlation_id = correlation_id, "Sent ask reply directly through writer");
+                                                                        }
+                                                                    } else {
+                                                                        // Fall back to finding in pool
+                                                                        warn!(peer = %peer_addr, "No response_handle, falling back to pool lookup");
+                                                                        let pool = registry.connection_pool.lock().await;
+                                                                        if let Some(conn) = pool.connections.get(&peer_addr).map(|c| c.value().clone()) {
+                                                                            if let Some(ref stream_handle) = conn.stream_handle {
+                                                                                if let Err(e) = stream_handle.write_bytes_nonblocking(response.freeze()) {
+                                                                                    warn!(peer = %peer_addr, error = %e, "Failed to send ask reply");
+                                                                                } else {
+                                                                                    debug!(peer = %peer_addr, correlation_id = correlation_id, "Sent ask reply through connection pool");
+                                                                                }
+                                                                            } else {
+                                                                                warn!(peer = %peer_addr, "Connection has no stream handle");
+                                                                            }
+                                                                        } else {
+                                                                            warn!(peer = %peer_addr, "No connection found in pool for reply");
+                                                                        }
+                                                                    }
+                                                                }
+                                                                Ok(None) => {
+                                                                    debug!(peer = %peer_addr, correlation_id = correlation_id, "No reply from kameo actor");
+                                                                }
+                                                                Err(e) => {
+                                                                    warn!(peer = %peer_addr, error = %e, correlation_id = correlation_id, "Failed to handle kameo actor message");
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    } else {
+                                                        debug!(peer = %peer_addr, correlation_id = correlation_id, 
+                                                               "Binary message payload too short: expected {} bytes but got {}", 
+                                                               16 + payload_len, payload.len());
+                                                    }
+                                                } else {
+                                                    debug!(peer = %peer_addr, correlation_id = correlation_id, 
+                                                           "Ask payload too short for binary format: {} bytes (need at least 16)", 
+                                                           payload.len());
+                                                }
+                                            }
+                                            }
                                         }
                                     }
                                     crate::MessageType::Response => {
                                         // Handle incoming response
                                         if let Some(ref registry_weak) = registry_weak {
                                             if let Some(registry) = registry_weak.upgrade() {
-                                                // Find the connection with this peer
-                                                let conn = {
-                                                    let pool = registry.connection_pool.lock().await;
-                                                    pool.connections.get(&peer_addr).map(|c| c.value().clone())
-                                                };
+                                                let pool = registry.connection_pool.lock().await;
+                                                let mut delivered = false;
                                                 
-                                                if let Some(conn) = conn {
-                                                    if let Some(ref correlation) = conn.correlation {
-                                                        correlation.complete(correlation_id, payload.to_vec());
-                                                        debug!(peer = %peer_addr, correlation_id = correlation_id, "Delivered response to correlation tracker");
+                                                // Look up peer ID for this address
+                                                if let Some(peer_id) = pool.addr_to_peer_id.get(&peer_addr).map(|e| e.clone()) {
+                                                    // Use shared correlation tracker
+                                                    if let Some(correlation) = pool.correlation_trackers.get(&peer_id) {
+                                                        if correlation.has_pending(correlation_id) {
+                                                            correlation.complete(correlation_id, payload.to_vec());
+                                                            debug!(peer = %peer_addr, correlation_id = correlation_id, "Delivered response to shared correlation tracker");
+                                                            delivered = true;
+                                                        }
+                                                    }
+                                                }
+                                                
+                                                if !delivered {
+                                                    debug!(peer = %peer_addr, correlation_id = correlation_id, "Could not find pending request for correlation_id");
+                                                }
+                                            }
+                                        }
+                                    }
+                                    crate::MessageType::Gossip => {
+                                        // Gossip messages can arrive here, just ignore them
+                                    }
+                                    crate::MessageType::ActorTell => {
+                                        // Direct actor tell message format:
+                                        // Already parsed: [type:1][correlation_id:2][reserved:5]
+                                        // Payload: [actor_id:8][type_hash:4][payload_len:4][payload:N]
+                                        if payload.len() >= 16 {
+                                            let actor_id = u64::from_be_bytes(payload[0..8].try_into().unwrap());
+                                            let type_hash = u32::from_be_bytes(payload[8..12].try_into().unwrap());
+                                            let payload_len = u32::from_be_bytes(payload[12..16].try_into().unwrap()) as usize;
+                                            
+                                            
+                                            if payload.len() >= 16 + payload_len {
+                                                let actor_payload = &payload[16..16+payload_len];
+                                                
+                                                // Log large ActorTell messages
+                                                if payload_len > 1024 * 1024 {
+                                                    info!(peer = %peer_addr, actor_id = actor_id, type_hash = %format!("{:08x}", type_hash), 
+                                                          payload_len = payload_len, "📨 LARGE ActorTell message - will call handler");
+                                                }
+                                                
+                                                // Call actor message handler if available
+                                                if let Some(ref registry_weak) = registry_weak {
+                                                    if let Some(registry) = registry_weak.upgrade() {
+                                                        if let Some(ref handler) = &*registry.actor_message_handler.lock().await {
+                                                            if payload_len > 1024 * 1024 {
+                                                                info!(peer = %peer_addr, actor_id = actor_id, type_hash = %format!("{:08x}", type_hash),
+                                                                       "🚀 Calling actor message handler for LARGE ActorTell");
+                                                            } else {
+                                                                debug!(peer = %peer_addr, actor_id = actor_id, type_hash = %format!("{:08x}", type_hash),
+                                                                       "Calling actor message handler for ActorTell");
+                                                            }
+                                                            match handler.handle_actor_message(
+                                                                &actor_id.to_string(),
+                                                                type_hash,
+                                                                actor_payload,
+                                                                None, // No correlation for tell
+                                                            ).await {
+                                                                Ok(_) => {
+                                                                    if payload_len > 1024 * 1024 {
+                                                                        info!(peer = %peer_addr, actor_id = actor_id, type_hash = %format!("{:08x}", type_hash),
+                                                                               "✅ Successfully handled LARGE ActorTell");
+                                                                    } else {
+                                                                        debug!(peer = %peer_addr, actor_id = actor_id, type_hash = %format!("{:08x}", type_hash),
+                                                                               "Successfully handled ActorTell");
+                                                                    }
+                                                                },
+                                                                Err(e) => error!(peer = %peer_addr, error = %e, "Failed to handle ActorTell on incoming connection"),
+                                                            }
+                                                        } else {
+                                                            warn!(peer = %peer_addr, "No actor message handler registered in registry");
+                                                        }
+                                                    } else {
+                                                        warn!(peer = %peer_addr, "Registry weak reference could not be upgraded");
+                                                    }
+                                                } else {
+                                                    warn!(peer = %peer_addr, "No registry weak reference available");
+                                                }
+                                            } else {
+                                                warn!(peer = %peer_addr, expected = 16 + payload_len, actual = payload.len(), 
+                                                      "ActorTell payload too short");
+                                            }
+                                        } else {
+                                            warn!(peer = %peer_addr, payload_len = payload.len(), "ActorTell header too short");
+                                        }
+                                    }
+                                    crate::MessageType::ActorAsk => {
+                                        // TODO: Implement ActorAsk handling
+                                        warn!(peer = %peer_addr, "ActorAsk not yet implemented");
+                                    }
+                                    crate::MessageType::StreamStart => {
+                                        // Parse stream header from payload
+                                        if payload.len() >= crate::StreamHeader::SERIALIZED_SIZE {
+                                            if let Some(header) = crate::StreamHeader::from_bytes(&payload) {
+                                                info!(peer = %peer_addr, stream_id = header.stream_id, total_size = header.total_size,
+                                                      type_hash = %format!("{:08x}", header.type_hash), actor_id = header.actor_id,
+                                                      "📥 StreamStart: Beginning streaming transfer");
+                                                
+                                                // Initialize stream assembly
+                                                if let Some(ref registry_weak) = registry_weak {
+                                                    if let Some(registry) = registry_weak.upgrade() {
+                                                        registry.start_stream_assembly(header).await;
                                                     }
                                                 }
                                             }
                                         }
                                     }
-                                    crate::MessageType::Tell => {
-                                        warn!(peer = %peer_addr, "Received Tell message in Ask/Response format - unexpected");
+                                    crate::MessageType::StreamData => {
+                                        // Parse stream header and data
+                                        if payload.len() >= crate::StreamHeader::SERIALIZED_SIZE {
+                                            if let Some(header) = crate::StreamHeader::from_bytes(&payload) {
+                                                let data_start = crate::StreamHeader::SERIALIZED_SIZE;
+                                                if payload.len() >= data_start + header.chunk_size as usize {
+                                                    let chunk_data = &payload[data_start..data_start + header.chunk_size as usize];
+                                                    
+                                                    // debug!(peer = %peer_addr, stream_id = header.stream_id, chunk_index = header.chunk_index,
+                                                    //        chunk_size = header.chunk_size, "📦 StreamData: Received chunk");
+                                                    
+                                                    // Add chunk to stream assembly
+                                                    if let Some(ref registry_weak) = registry_weak {
+                                                        if let Some(registry) = registry_weak.upgrade() {
+                                                            registry.add_stream_chunk(header, chunk_data.to_vec()).await;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    crate::MessageType::StreamEnd => {
+                                        // Parse stream header and complete assembly
+                                        if payload.len() >= crate::StreamHeader::SERIALIZED_SIZE {
+                                            if let Some(header) = crate::StreamHeader::from_bytes(&payload) {
+                                                info!(peer = %peer_addr, stream_id = header.stream_id,
+                                                      "📤 StreamEnd: Completing streaming transfer");
+                                                
+                                                // Complete stream assembly and deliver to actor
+                                                if let Some(ref registry_weak) = registry_weak {
+                                                    if let Some(registry) = registry_weak.upgrade() {
+                                                        if let Some(complete_msg) = registry.complete_stream_assembly(header.stream_id).await {
+                                                            // Deliver to actor
+                                                            if let Some(ref handler) = &*registry.actor_message_handler.lock().await {
+                                                                match handler.handle_actor_message(
+                                                                    &header.actor_id.to_string(),
+                                                                    header.type_hash,
+                                                                    &complete_msg,
+                                                                    None,
+                                                                ).await {
+                                                                    Ok(_) => info!(peer = %peer_addr, stream_id = header.stream_id,
+                                                                                  "✅ Successfully delivered streamed message to actor"),
+                                                                    Err(e) => error!(peer = %peer_addr, stream_id = header.stream_id,
+                                                                                    error = %e, "❌ Failed to deliver streamed message"),
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                                 
+                                // if len > 1024 * 1024 {
+                                //     eprintln!("📦 SERVER: Drained {} bytes from buffer after processing large message", total_len);
+                                // }
                                 partial_msg_buf.drain(..total_len);
                                 continue;
                             }
@@ -2251,7 +3291,7 @@ async fn handle_persistent_connection_impl(
         loop {
             match reader.read(&mut read_buf).await {
                 Ok(0) => {
-                    info!(peer = %peer_addr, "🔴 CONNECTION POOL: Peer closed write (EOF) - half-closed");
+                    debug!(peer = %peer_addr, "🔴 CONNECTION POOL: Peer closed write (EOF) - half-closed");
                     // Signal EOF to write task
                     let _ = eof_tx.send(()).await;
                     return io::Result::Ok(());
@@ -2270,7 +3310,7 @@ async fn handle_persistent_connection_impl(
                             partial_msg_buf[3],
                         ]) as usize;
 
-                        if len > 10 * 1024 * 1024 {
+                        if len > 100 * 1024 * 1024 {
                             warn!(peer = %peer_addr, "message too large: {}", len);
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
@@ -2314,20 +3354,20 @@ async fn handle_persistent_connection_impl(
                                                             
                                                             // Build response message
                                                             let total_size = 8 + response_data.len();
-                                                            let mut msg = Vec::with_capacity(4 + total_size);
+                                                            let mut msg = bytes::BytesMut::with_capacity(4 + total_size);
                                                             
                                                             // Length prefix
                                                             msg.extend_from_slice(&(total_size as u32).to_be_bytes());
                                                             
                                                             // Header: [type:1][corr_id:2][reserved:5]
-                                                            msg.push(crate::MessageType::Response as u8);
+                                                            msg.put_u8(crate::MessageType::Response as u8);
                                                             msg.extend_from_slice(&correlation_id.to_be_bytes());
                                                             msg.extend_from_slice(&[0u8; 5]);
                                                             msg.extend_from_slice(&response_data);
                                                             
                                                             // Send response back through stream handle
                                                             if let Some(ref stream_handle) = conn.stream_handle {
-                                                                if let Err(e) = stream_handle.write_nonblocking(&msg) {
+                                                                if let Err(e) = stream_handle.write_bytes_nonblocking(msg.freeze()) {
                                                                     warn!("Failed to send mock response: {}", e);
                                                                 } else {
                                                                     debug!("Sent mock response for correlation_id {}", correlation_id);
@@ -2346,23 +3386,35 @@ async fn handle_persistent_connection_impl(
                                             // Handle incoming response
                                             if let Some(ref registry_weak) = registry_weak_read {
                                                 if let Some(registry) = registry_weak.upgrade() {
-                                                    // Find the connection with this peer
-                                                    let conn = {
-                                                        let pool = registry.connection_pool.lock().await;
-                                                        pool.connections.get(&peer_addr).map(|c| c.value().clone())
-                                                    };
+                                                    let pool = registry.connection_pool.lock().await;
+                                                    let mut delivered = false;
                                                     
-                                                    if let Some(conn) = conn {
-                                                        if let Some(ref correlation) = conn.correlation {
-                                                            correlation.complete(correlation_id, payload.to_vec());
-                                                            debug!(peer = %peer_addr, correlation_id = correlation_id, "Delivered response to correlation tracker");
+                                                    // Look up peer ID for this address
+                                                    if let Some(peer_id) = pool.addr_to_peer_id.get(&peer_addr).map(|e| e.clone()) {
+                                                        // Use shared correlation tracker
+                                                        if let Some(correlation) = pool.correlation_trackers.get(&peer_id) {
+                                                            if correlation.has_pending(correlation_id) {
+                                                                correlation.complete(correlation_id, payload.to_vec());
+                                                                debug!(peer = %peer_addr, correlation_id = correlation_id, "Delivered response to shared correlation tracker");
+                                                                delivered = true;
+                                                            }
                                                         }
+                                                    }
+                                                    
+                                                    if !delivered {
+                                                        debug!(peer = %peer_addr, correlation_id = correlation_id, "Could not find pending request for correlation_id");
                                                     }
                                                 }
                                             }
                                         }
-                                        crate::MessageType::Tell => {
-                                            warn!(peer = %peer_addr, "Received Tell message in Ask/Response format - unexpected");
+                                        crate::MessageType::Gossip => {
+                                            // Gossip messages can arrive here, just ignore them
+                                        }
+                                        crate::MessageType::ActorTell | crate::MessageType::ActorAsk => {
+                                            // These can arrive here too, just process them normally
+                                        }
+                                        crate::MessageType::StreamStart | crate::MessageType::StreamData | crate::MessageType::StreamEnd => {
+                                            // Streaming messages processed above
                                         }
                                     }
                                     
@@ -2417,7 +3469,7 @@ async fn handle_persistent_connection_impl(
             tokio::select! {
                 // Check for EOF signal
                 _ = eof_rx.recv() => {
-                    info!(peer = %peer_addr, "🔴 CONNECTION POOL: EOF signal received, shutting down write task");
+                    debug!(peer = %peer_addr, "🔴 CONNECTION POOL: EOF signal received, shutting down write task");
                     return io::Result::Ok(());
                 }
                 // Check for messages to send
@@ -2435,7 +3487,7 @@ async fn handle_persistent_connection_impl(
                                 }
                                 Err(ref e) if e.kind() == io::ErrorKind::BrokenPipe
                                           || e.kind() == io::ErrorKind::ConnectionReset => {
-                                    info!(peer = %peer_addr, "🔴 CONNECTION POOL: Peer closed read - write failed");
+                                    debug!(peer = %peer_addr, "🔴 CONNECTION POOL: Peer closed read - write failed");
                                     return io::Result::Ok(());
                                 }
                                 Err(e) => {
@@ -2445,7 +3497,7 @@ async fn handle_persistent_connection_impl(
                             }
                         }
                         None => {
-                            info!(peer = %peer_addr, "🔴 CONNECTION POOL: channel closed, shutting down write task");
+                            debug!(peer = %peer_addr, "🔴 CONNECTION POOL: channel closed, shutting down write task");
                             return io::Result::Ok(());
                         }
                     }
@@ -2923,47 +3975,48 @@ pub(crate) async fn handle_incoming_message(
                 
                 // Try to send immediately on existing connection
                 {
-                    info!("FULLSYNC RESPONSE: Node {} is about to acquire connection pool lock", registry.bind_addr);
+                    debug!("FULLSYNC RESPONSE: Node {} is about to acquire connection pool lock", registry.bind_addr);
                     let pool = registry.connection_pool.lock().await;
-                    info!("FULLSYNC RESPONSE: Node {} got pool lock, pool has {} total entries", 
+                    debug!("FULLSYNC RESPONSE: Node {} got pool lock, pool has {} total entries", 
                           registry.bind_addr, pool.connection_count());
-                    info!("FULLSYNC RESPONSE: Pool instance address: {:p}", &*pool);
+                    debug!("FULLSYNC RESPONSE: Pool instance address: {:p}", &*pool);
                     
                     // Log details about each connection
                     for entry in pool.connections.iter() {
                         let addr = entry.key();
                         let conn = entry.value();
-                        info!("FULLSYNC RESPONSE: Connection to {} - state={:?}", 
+                        debug!("FULLSYNC RESPONSE: Connection to {} - state={:?}", 
                               addr, conn.get_state());
                     }
                     
                     // Create message with length prefix
-                    let mut buffer = Vec::with_capacity(4 + response_data.len());
+                    let mut buffer = bytes::BytesMut::with_capacity(4 + response_data.len());
                     buffer.extend_from_slice(&(response_data.len() as u32).to_be_bytes());
                     buffer.extend_from_slice(&response_data);
                     
                     // Debug: Log what connections we have
-                    info!(
+                    debug!(
                         "FULLSYNC RESPONSE DEBUG: Available connections by addr: {:?}", 
                         pool.connections.iter().map(|entry| entry.key().clone()).collect::<Vec<_>>()
                     );
-                    info!(
+                    debug!(
                         "FULLSYNC RESPONSE DEBUG: Available node mappings: {:?}",
                         pool.peer_id_to_addr.iter().map(|entry| (entry.key().clone(), entry.value().clone())).collect::<Vec<_>>()
                     );
-                    info!(
+                    debug!(
                         "FULLSYNC RESPONSE DEBUG: Looking for connection to sender_peer_id: {}", 
                         sender_peer_id
                     );
-                    info!("FULLSYNC RESPONSE DEBUG: sender_socket_addr={}", sender_socket_addr);
+                    debug!("FULLSYNC RESPONSE DEBUG: sender_socket_addr={}", sender_socket_addr);
                     
                     // Try to send using peer ID
-                    let send_result = match pool.send_to_node_id(sender_peer_id.as_str(), &buffer) {
+                    let frozen_buffer = buffer.freeze();
+                    let send_result = match pool.send_bytes_to_node_id(sender_peer_id.as_str(), frozen_buffer.clone()) {
                         Ok(()) => Ok(()),
                         Err(e) => {
                             warn!("Failed to send via peer ID {}: {}", sender_peer_id, e);
                             // Fall back to socket address
-                            pool.send_lock_free(sender_socket_addr, &buffer)
+                            pool.send_lock_free(sender_socket_addr, &frozen_buffer)
                         }
                     };
                     
@@ -3049,11 +4102,11 @@ pub(crate) async fn handle_incoming_message(
             sequence,
             wall_clock_time,
         } => {
-            info!(
+            debug!(
                 sender = %sender_peer_id,
                 local_actors = local_actors.len(),
                 known_actors = known_actors.len(),
-                "📥 RECEIVED: FullSyncResponse from peer"
+                "RECEIVED: FullSyncResponse from peer"
             );
 
             // Use the actual peer address we're connected to
@@ -3168,12 +4221,12 @@ pub(crate) async fn handle_incoming_message(
                 let sender_addr = _peer_addr;
                 
                 // Create message with length prefix
-                let mut buffer = Vec::with_capacity(4 + data.len());
+                let mut buffer = bytes::BytesMut::with_capacity(4 + data.len());
                 buffer.extend_from_slice(&(data.len() as u32).to_be_bytes());
                 buffer.extend_from_slice(&data);
                 
                 // Use send_lock_free which doesn't create new connections
-                if let Err(e) = pool.send_lock_free(sender_addr, &buffer) {
+                if let Err(e) = pool.send_lock_free(sender_addr, &buffer.freeze()) {
                     warn!(peer = %sender_addr, error = %e, "Failed to send peer health report");
                 }
             }
@@ -3208,6 +4261,80 @@ pub(crate) async fn handle_incoming_message(
 
             // Check if we have enough reports to make a decision
             registry.check_peer_consensus().await;
+
+            Ok(())
+        }
+        RegistryMessage::ActorMessage {
+            actor_id,
+            type_hash,
+            payload,
+            correlation_id,
+        } => {
+            debug!(
+                actor_id = %actor_id,
+                type_hash = %format!("{:08x}", type_hash),
+                payload_len = payload.len(),
+                correlation_id = ?correlation_id,
+                "received actor message"
+            );
+
+            // Forward to the registry's actor message handler
+            match registry.handle_actor_message(&actor_id, type_hash, &payload, correlation_id).await {
+                Ok(Some(reply_payload)) => {
+                    // If there's a correlation_id, this is an ask message and we need to send the reply back
+                    if let Some(corr_id) = correlation_id {
+                        debug!(
+                            actor_id = %actor_id,
+                            type_hash = %format!("{:08x}", type_hash),
+                            correlation_id = corr_id,
+                            reply_len = reply_payload.len(),
+                            "sending ask reply back to sender"
+                        );
+                        
+                        // Create response message with the correlation_id
+                        let mut response = bytes::BytesMut::with_capacity(4 + 8 + reply_payload.len());
+                        
+                        // Length prefix (4 bytes)
+                        let total_len = 8 + reply_payload.len() as u32;
+                        response.extend_from_slice(&total_len.to_be_bytes());
+                        
+                        // 8-byte header: msg_type(1) + correlation_id(2) + reserved(5)
+                        response.put_u8(crate::MessageType::Response as u8);  // 0x02 for Response
+                        response.extend_from_slice(&corr_id.to_be_bytes());
+                        response.extend_from_slice(&[0u8; 5]); // reserved bytes
+                        
+                        // Payload
+                        response.extend_from_slice(&reply_payload);
+                        
+                        // Send response back through the same connection
+                        let pool = registry.connection_pool.lock().await;
+                        if let Err(e) = pool.send_lock_free(_peer_addr, &response.freeze()) {
+                            warn!(peer = %_peer_addr, error = %e, "Failed to send ask reply");
+                        }
+                    }
+                    
+                    debug!(
+                        actor_id = %actor_id,
+                        type_hash = %format!("{:08x}", type_hash),
+                        "actor message processed successfully with reply"
+                    );
+                }
+                Ok(None) => {
+                    debug!(
+                        actor_id = %actor_id,
+                        type_hash = %format!("{:08x}", type_hash),
+                        "actor message processed successfully"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        actor_id = %actor_id,
+                        type_hash = %format!("{:08x}", type_hash),
+                        error = %e,
+                        "failed to process actor message"
+                    );
+                }
+            }
 
             Ok(())
         }
@@ -3409,9 +4536,8 @@ mod tests {
         sleep(Duration::from_millis(10)).await;
         let stream = tokio::net::TcpStream::connect(server_addr).await.unwrap();
         let (_, writer) = stream.into_split();
-        // Writer is now owned directly by LockFreeStreamHandle
         
-        // Create a LockFreeStreamHandle first
+        // Create a LockFreeStreamHandle
         let stream_handle = Arc::new(LockFreeStreamHandle::new(
             writer,
             "127.0.0.1:8080".parse().unwrap(),
@@ -3439,9 +4565,8 @@ mod tests {
         let (_, mut writer) = stream.into_split();
         use tokio::io::AsyncWriteExt;
         let _ = writer.shutdown().await; // Close the writer
-        // Writer is now owned directly by LockFreeStreamHandle
 
-        // Create a LockFreeStreamHandle first
+        // Create a LockFreeStreamHandle
         let stream_handle = Arc::new(LockFreeStreamHandle::new(
             writer,
             "127.0.0.1:8080".parse().unwrap(),
@@ -3476,7 +4601,6 @@ mod tests {
         sleep(Duration::from_millis(10)).await;
         let stream = tokio::net::TcpStream::connect(server_addr).await.unwrap();
         let (_, writer) = stream.into_split();
-        // Writer is now owned directly by LockFreeStreamHandle
 
         // Test creating a LockFreeStreamHandle
         let stream_handle = Arc::new(LockFreeStreamHandle::new(writer, addr, ChannelId::Global, 1024));

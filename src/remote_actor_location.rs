@@ -11,6 +11,7 @@ pub struct RemoteActorLocation {
     pub wall_clock_time: u64,           // Still needed for TTL calculations
     pub priority: RegistrationPriority, // Registration priority for propagation
     pub local_registration_time: u128,  // Precise registration time for timing measurements
+    pub metadata: Vec<u8>,              // Optional metadata (e.g., serialized ActorId)
 }
 
 impl RemoteActorLocation {
@@ -25,6 +26,22 @@ impl RemoteActorLocation {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos(),
+            metadata: Vec::new(),
+        }
+    }
+    
+    /// Create a new RemoteActorLocation with peer_id and metadata
+    pub fn new_with_metadata(address: SocketAddr, peer_id: crate::PeerId, metadata: Vec<u8>) -> Self {
+        Self {
+            address: address.to_string(),
+            peer_id,
+            wall_clock_time: current_timestamp(),
+            priority: RegistrationPriority::Normal,
+            local_registration_time: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            metadata,
         }
     }
     
@@ -46,6 +63,7 @@ impl RemoteActorLocation {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos(),
+            metadata: Vec::new(),
         }
     }
 
@@ -60,6 +78,7 @@ impl RemoteActorLocation {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos(),
+            metadata: Vec::new(),
         }
     }
 
@@ -78,6 +97,7 @@ impl RemoteActorLocation {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos(),
+            metadata: Vec::new(),
         }
     }
     
@@ -167,6 +187,7 @@ mod tests {
             wall_clock_time: 1000,
             priority: RegistrationPriority::Normal,
             local_registration_time: 1000,
+            metadata: vec![1, 2, 3],
         };
         let location2 = RemoteActorLocation {
             address: addr.to_string(),
@@ -174,6 +195,7 @@ mod tests {
             wall_clock_time: 1000,
             priority: RegistrationPriority::Normal,
             local_registration_time: 1000,
+            metadata: vec![1, 2, 3],
         };
         assert_eq!(location1, location2);
 
@@ -184,6 +206,7 @@ mod tests {
             wall_clock_time: 1001,
             priority: RegistrationPriority::Normal,
             local_registration_time: 1000,
+            metadata: vec![1, 2, 3],
         };
         assert_ne!(location1, location3);
 
@@ -195,6 +218,7 @@ mod tests {
             wall_clock_time: 1000,
             priority: RegistrationPriority::Normal,
             local_registration_time: 1000,
+            metadata: vec![1, 2, 3],
         };
         assert_ne!(location1, location4);
     }
@@ -225,5 +249,28 @@ mod tests {
             location.local_registration_time,
             deserialized.local_registration_time
         );
+        assert_eq!(location.metadata, deserialized.metadata);
+    }
+    
+    #[test]
+    fn test_actor_location_with_metadata() {
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let metadata = vec![0x12, 0x34, 0x56, 0x78];
+        let location = RemoteActorLocation::new_with_metadata(
+            addr, 
+            crate::PeerId::new("test_peer"),
+            metadata.clone()
+        );
+
+        assert_eq!(location.address, addr.to_string());
+        assert_eq!(location.metadata, metadata);
+        assert_eq!(location.priority, RegistrationPriority::Normal);
+        assert!(location.wall_clock_time > 0);
+        
+        // Test serialization with metadata
+        let serialized = rkyv::to_bytes::<rkyv::rancor::Error>(&location).unwrap();
+        let deserialized: RemoteActorLocation = rkyv::from_bytes::<RemoteActorLocation, rkyv::rancor::Error>(&serialized).unwrap();
+        
+        assert_eq!(location.metadata, deserialized.metadata);
     }
 }

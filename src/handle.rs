@@ -23,7 +23,10 @@ pub struct GossipRegistryHandle {
 
 impl GossipRegistryHandle {
 
-    /// Create and start a new gossip registry (backward compatible)
+    /// Create and start a new gossip registry
+    /// 
+    /// Note: The peers parameter is deprecated. Always pass an empty Vec and use
+    /// add_peer() after creation to ensure proper peer ID assignment.
     #[instrument(skip(peers, config))]
     pub async fn new(
         bind_addr: SocketAddr,
@@ -38,10 +41,20 @@ impl GossipRegistryHandle {
 
         let registry = GossipRegistry::new(actual_bind_addr, config.clone());
         
-        // Configure peers as node addresses (for backward compatibility)
-        for (i, peer_addr) in peers.into_iter().enumerate() {
-            let node_name = format!("peer_{}", i);
-            registry.configure_peer(node_name, peer_addr).await;
+        // Note: Peers should be added manually with add_peer() after creation
+        // to ensure proper peer ID assignment. The peers parameter is kept
+        // for backward compatibility but is now deprecated.
+        if !peers.is_empty() {
+            warn!(
+                "Passing peer addresses to GossipRegistryHandle::new() is deprecated. \
+                 Use handle.add_peer() after creation to set proper peer IDs."
+            );
+            // For backward compatibility, we still configure them but with a warning
+            for (i, peer_addr) in peers.into_iter().enumerate() {
+                let node_name = format!("peer_{}", i);
+                warn!("Auto-generating peer name '{}' for {} - this is deprecated", node_name, peer_addr);
+                registry.configure_peer(node_name, peer_addr).await;
+            }
         }
 
         let registry = Arc::new(registry);
@@ -61,10 +74,14 @@ impl GossipRegistryHandle {
         });
 
         // Start the gossip timer
+        debug!("🚀 About to spawn gossip timer task");
         let timer_registry = registry.clone();
         let timer_handle = tokio::spawn(async move {
+            debug!("🚀 Gossip timer task spawned, calling start_gossip_timer");
             start_gossip_timer(timer_registry).await;
+            warn!("⚠️ Gossip timer exited unexpectedly!");
         });
+        debug!("🚀 Gossip timer spawn complete");
 
         // Connection monitoring is now done in the gossip timer
         let monitor_handle = None;
@@ -82,6 +99,12 @@ impl GossipRegistryHandle {
     /// Register a local actor
     pub async fn register(&self, name: String, address: SocketAddr) -> Result<()> {
         let location = RemoteActorLocation::new_with_peer(address, self.registry.peer_id.clone());
+        self.registry.register_actor(name, location).await
+    }
+    
+    /// Register a local actor with metadata
+    pub async fn register_with_metadata(&self, name: String, address: SocketAddr, metadata: Vec<u8>) -> Result<()> {
+        let location = RemoteActorLocation::new_with_metadata(address, self.registry.peer_id.clone(), metadata);
         self.registry.register_actor(name, location).await
     }
 
@@ -194,6 +217,8 @@ async fn start_gossip_server_with_listener(
 /// Start the gossip timer with vector clock support
 #[instrument(skip(registry))]
 async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
+    debug!("start_gossip_timer function called");
+    
     let gossip_interval = registry.config.gossip_interval;
     let cleanup_interval = registry.config.cleanup_interval;
 
@@ -201,7 +226,7 @@ async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
     let mut next_gossip_tick = Instant::now() + gossip_interval + jitter;
     let mut cleanup_timer = interval(cleanup_interval);
 
-    info!(
+    debug!(
         gossip_interval_ms = gossip_interval.as_millis(),
         cleanup_interval_secs = cleanup_interval.as_secs(),
         "gossip timer started with non-blocking I/O"
@@ -285,7 +310,7 @@ async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
         }
     }
 
-    info!("gossip timer stopped");
+    debug!("gossip timer stopped");
 }
 
 /// Handle incoming TCP connections - immediately set up bidirectional communication
@@ -295,7 +320,7 @@ async fn handle_connection(
     peer_addr: SocketAddr,
     registry: Arc<GossipRegistry>,
 ) {
-    info!("🔌 HANDLE_CONNECTION: Starting to handle new incoming connection");
+    debug!("🔌 HANDLE_CONNECTION: Starting to handle new incoming connection");
 
     // Split stream for direct TCP access
     let (reader, writer) = stream.into_split();
@@ -306,7 +331,7 @@ async fn handle_connection(
     // Start the incoming persistent connection handler immediately
     // It will handle ALL messages including the first one
     tokio::spawn(async move {
-        info!(peer = %peer_addr, "HANDLE.RS: Starting incoming direct TCP connection handler");
+        debug!(peer = %peer_addr, "HANDLE.RS: Starting incoming direct TCP connection handler");
         let sender_node_id = handle_incoming_connection_direct_tcp(
             reader,
             writer,
@@ -315,11 +340,11 @@ async fn handle_connection(
             registry_weak,
         )
         .await;
-        info!(peer = %peer_addr, "HANDLE.RS: Incoming direct TCP connection handler exited");
+        debug!(peer = %peer_addr, "HANDLE.RS: Incoming direct TCP connection handler exited");
         
         // Handle peer failure when connection is lost
         if let Some(failed_node_id) = sender_node_id {
-            info!(node_id = %failed_node_id, "HANDLE.RS: Triggering peer failure handling for node");
+            debug!(node_id = %failed_node_id, "HANDLE.RS: Triggering peer failure handling for node");
             if let Err(e) = registry.handle_peer_connection_failure_by_node_id(&failed_node_id).await {
                 warn!(error = %e, node_id = %failed_node_id, "HANDLE.RS: Failed to handle peer connection failure");
             }
@@ -351,6 +376,11 @@ async fn handle_incoming_connection_direct_tcp(
             RegistryMessage::DeltaGossipResponse { delta } => delta.sender_peer_id.as_str().to_string(),
             RegistryMessage::PeerHealthQuery { sender, .. } => sender.as_str().to_string(),
             RegistryMessage::PeerHealthReport { reporter, .. } => reporter.as_str().to_string(),
+            RegistryMessage::ActorMessage { actor_id, .. } => {
+                // For actor messages, we can't determine the sender node from the message itself
+                // Use a default identifier or extract from actor_id if it contains node info
+                format!("actor_message_sender_{}", actor_id)
+            },
         },
         Err(err) => {
             warn!(error = %err, "failed to read initial message from incoming connection");
@@ -358,20 +388,20 @@ async fn handle_incoming_connection_direct_tcp(
         }
     };
 
-    info!(peer_addr = %peer_addr, node_id = %sender_node_id, "Identified incoming connection from node");
+    debug!(peer_addr = %peer_addr, node_id = %sender_node_id, "Identified incoming connection from node");
 
     // Add this connection to the pool FIRST - LOCK-FREE
     // This must happen BEFORE processing messages so responses can be sent
     {
         let pool = registry.connection_pool.lock().await;
         
-        info!("INCOMING CONNECTION: About to add connection to pool - node_id={}, peer_addr={}", 
+        debug!("INCOMING CONNECTION: About to add connection to pool - node_id={}, peer_addr={}", 
               sender_node_id, peer_addr);
         
         // Check if this node is in our configured peers by checking node mappings
         let sender_peer_id = crate::PeerId::new(&sender_node_id);
         let is_configured_peer = pool.peer_id_to_addr.contains_key(&sender_peer_id);
-        info!("INCOMING CONNECTION: Is {} a configured peer? {}", sender_node_id, is_configured_peer);
+        debug!("INCOMING CONNECTION: Is {} a configured peer? {}", sender_node_id, is_configured_peer);
         
         // Validate peer ID - reject unknown peers
         if !is_configured_peer {
@@ -391,11 +421,18 @@ async fn handle_incoming_connection_direct_tcp(
             4096,
         ));
         
+        // Get the shared correlation tracker for this peer
+        let sender_peer_id = crate::PeerId::new(&sender_node_id);
+        let correlation_tracker = pool.get_or_create_correlation_tracker(&sender_peer_id);
+        
         // Create connection - we'll just use peer_addr for now
         let mut conn = LockFreeConnection::new(peer_addr);
         conn.stream_handle = Some(stream_handle);
         conn.set_state(ConnectionState::Connected);
         conn.update_last_used();
+        conn.correlation = Some(correlation_tracker);
+        
+        debug!("INCOMING CONNECTION: Using shared correlation tracker for node '{}'", sender_node_id);
         
         let connection_arc = Arc::new(conn);
         
@@ -404,12 +441,16 @@ async fn handle_incoming_connection_direct_tcp(
             info!(node_id = %sender_node_id, peer_addr = %peer_addr,
                   "Added incoming connection to pool for bidirectional use");
             
+            // NOTE: We do NOT update the node address mapping here because peer_addr is the ephemeral
+            // source port of the incoming connection, not the bind address where the peer listens.
+            // The proper bind address should already be configured through gossip or initial peer setup.
+            
             // Debug: verify it was actually added
-            info!("INCOMING CONNECTION: Pool now has {} connections", pool.connection_count());
+            debug!("INCOMING CONNECTION: Pool now has {} connections", pool.connection_count());
             
             // Verify we can retrieve it by node ID
             if let Some(_conn) = pool.get_connection_by_node_id(&sender_node_id) {
-                info!("INCOMING CONNECTION: Verified connection is retrievable by node ID '{}'", sender_node_id);
+                debug!("INCOMING CONNECTION: Verified connection is retrievable by node ID '{}'", sender_node_id);
             } else {
                 error!("INCOMING CONNECTION: Connection was added but cannot be retrieved by node ID '{}'!", sender_node_id);
             }
@@ -435,7 +476,7 @@ async fn handle_incoming_connection_direct_tcp(
         drop(pool); // Release lock before connecting
         
         if should_connect_back {
-            info!("INCOMING CONNECTION: {} is a configured peer, establishing outbound connection", sender_node_id);
+            debug!("INCOMING CONNECTION: {} is a configured peer, establishing outbound connection", sender_node_id);
             let registry_for_connect = registry.clone();
             let node_id_clone = sender_node_id.clone();
             
@@ -447,7 +488,7 @@ async fn handle_incoming_connection_direct_tcp(
                 let mut pool = registry_for_connect.connection_pool.lock().await;
                 match pool.get_connection_to_node(&node_id_clone).await {
                     Ok(_) => {
-                        info!("Successfully established outbound connection to node '{}'", node_id_clone);
+                        debug!("Successfully established outbound connection to node '{}'", node_id_clone);
                     }
                     Err(e) => {
                         warn!("Failed to establish outbound connection to node '{}': {}", node_id_clone, e);
@@ -503,7 +544,7 @@ async fn handle_incoming_connection_direct_tcp(
 
                         // Apply the results
                         registry_clone.apply_gossip_results(results).await;
-                        info!(node = %sender_node_id_clone, "Completed immediate gossip round after incoming connection");
+                        debug!(node = %sender_node_id_clone, "Completed immediate gossip round after incoming connection");
                     }
                 }
                 Err(err) => {
@@ -517,8 +558,10 @@ async fn handle_incoming_connection_direct_tcp(
     // For now, we'll skip the failure reset logic since we're transitioning to node-based tracking
 
     // Now continue with the persistent connection reader for the rest of the connection
+    // Note: writer was already used to create the connection, so we pass None
     crate::connection_pool::handle_persistent_connection_reader(
         reader,
+        None,
         peer_addr, // Use the actual peer address for the reader
         registry_weak,
     )
@@ -556,12 +599,10 @@ async fn read_message_from_reader(reader: &mut tokio::net::tcp::OwnedReadHalf, m
     reader.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
 
-    // Check message size
+    // TEMPORARY: Skip message size check to allow large messages
+    // TODO: Implement streaming or chunking for very large messages
     if len > max_size {
-        return Err(GossipError::MessageTooLarge {
-            size: len,
-            max: max_size,
-        });
+        warn!("Message size {} exceeds max size {}, but allowing it temporarily", len, max_size);
     }
 
     // Read message data
@@ -718,7 +759,7 @@ async fn bootstrap_peers(_registry: Arc<GossipRegistry>) -> Result<()> {
 
                     // Apply the results
                     registry.apply_gossip_results(results).await;
-                    info!("Completed immediate gossip round after bootstrap");
+                    debug!("Completed immediate gossip round after bootstrap");
                 }
             }
             Err(err) => {
@@ -755,23 +796,47 @@ async fn send_gossip_message_zero_copy(
     mut task: GossipTask,
     registry: Arc<GossipRegistry>,
 ) -> Result<()> {
+    // Check if this is a retry attempt
+    let is_retry = {
+        let gossip_state = registry.gossip_state.lock().await;
+        gossip_state.peers.get(&task.peer_addr)
+            .map(|p| p.failures > 0)
+            .unwrap_or(false)
+    };
+    
+    if is_retry {
+        info!(
+            peer = %task.peer_addr,
+            "🔄 GOSSIP RETRY: Attempting to reconnect to previously failed peer"
+        );
+    }
+    
     // Get connection with minimal lock contention
     let conn = {
         let mut pool = registry.connection_pool.lock().await;
-        info!("GOSSIP: Pool has {} connections before get_connection", pool.connection_count());
-        let conn = pool.get_connection(task.peer_addr).await?;
-        info!("GOSSIP: Pool has {} connections after get_connection", pool.connection_count());
-        conn
+        debug!("GOSSIP: Pool has {} connections before get_connection", pool.connection_count());
+        match pool.get_connection(task.peer_addr).await {
+            Ok(conn) => {
+                if is_retry {
+                    info!(
+                        peer = %task.peer_addr,
+                        "✅ GOSSIP RETRY: Successfully reconnected to peer"
+                    );
+                }
+                conn
+            }
+            Err(e) => {
+                if is_retry {
+                    info!(
+                        peer = %task.peer_addr,
+                        error = %e,
+                        "❌ GOSSIP RETRY: Failed to reconnect to peer"
+                    );
+                }
+                return Err(e);
+            }
+        }
     };
-    // Check pool after releasing mutex
-    {
-        let pool = registry.connection_pool.lock().await;
-        info!("GOSSIP: Pool has {} connections after releasing mutex", pool.connection_count());
-        info!("GOSSIP DEBUG: Pool at {:p} really has {} connections", 
-              &*pool as *const _, pool.connection_count());
-        info!("GOSSIP DEBUG: Pool connection count check: {}", 
-              pool.connection_count());
-    }
 
     // CRITICAL: Set precise timing RIGHT BEFORE TCP write to exclude all scheduling delays
     // Update wall_clock_time in delta changes to current time for accurate propagation measurement
