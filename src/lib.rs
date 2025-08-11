@@ -3,16 +3,22 @@ pub mod config;
 pub mod connection_pool;
 mod handle;
 mod handle_builder;
+pub mod migration;
 pub mod priority;
 pub mod registry;
 pub mod reply_to;
 pub mod stream_writer;
+pub mod tls;
 
 use std::io;
 use std::net::SocketAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tracing::error;
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, ZeroizeOnDrop};
+use std::hash::{Hash, Hasher};
 
 pub use remote_actor_location::RemoteActorLocation;
 pub use config::GossipConfig;
@@ -22,66 +28,351 @@ pub use priority::{ConsistencyLevel, RegistrationPriority};
 pub use connection_pool::{DelegatedReplySender, LockFreeStreamHandle, StreamFrameType, ChannelId};
 pub use reply_to::{ReplyTo, TimeoutReplyTo};
 
-/// Key pair for node identity (using strings for now, will be cryptographic keys later)
-#[derive(Debug, Clone)]
+// =================== New Iroh-style types ===================
+
+/// Public key for node identity - Ed25519 public key
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct PublicKey {
+    inner: [u8; 32],
+}
+
+impl PublicKey {
+    /// Create from raw bytes, validating they form a valid Ed25519 public key
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != 32 {
+            return Err(GossipError::InvalidKeyPair(
+                format!("Invalid public key length: expected 32, got {}", bytes.len())
+            ));
+        }
+        let mut key_bytes = [0u8; 32];
+        key_bytes.copy_from_slice(bytes);
+        
+        // Validate it's a valid Ed25519 public key
+        let _ = VerifyingKey::from_bytes(&key_bytes)
+            .map_err(|e| GossipError::InvalidKeyPair(format!("Invalid public key: {}", e)))?;
+        
+        Ok(Self { inner: key_bytes })
+    }
+    
+    /// Get the raw bytes
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.inner
+    }
+    
+    /// Convert to ed25519_dalek::VerifyingKey for crypto operations
+    pub fn to_verifying_key(&self) -> Result<VerifyingKey> {
+        VerifyingKey::from_bytes(&self.inner)
+            .map_err(|e| GossipError::InvalidKeyPair(format!("Invalid public key: {}", e)))
+    }
+    
+    /// Verify a signature
+    pub fn verify(&self, message: &[u8], signature: &Signature) -> Result<()> {
+        let verifying_key = self.to_verifying_key()?;
+        verifying_key.verify(message, signature)
+            .map_err(|e| GossipError::InvalidSignature(format!("Signature verification failed: {}", e)))
+    }
+    
+    /// Format first 5 bytes as hex for logging (like Iroh)
+    pub fn fmt_short(&self) -> String {
+        hex::encode(&self.inner[..5])
+    }
+    
+    /// Convert to PeerId for backward compatibility with existing code
+    pub fn to_peer_id(&self) -> PeerId {
+        PeerId::from_bytes(self.as_bytes()).expect("NodeId should always convert to valid PeerId")
+    }
+}
+
+impl Hash for PublicKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.inner.hash(state);
+    }
+}
+
+impl std::fmt::Debug for PublicKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PublicKey({}…)", self.fmt_short())
+    }
+}
+
+impl std::fmt::Display for PublicKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.fmt_short())
+    }
+}
+
+impl Serialize for PublicKey {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if serializer.is_human_readable() {
+            // Use base32 for human-readable formats
+            let encoded = data_encoding::BASE32_NOPAD.encode(&self.inner);
+            serializer.serialize_str(&encoded)
+        } else {
+            // Use raw bytes for binary formats
+            serializer.serialize_bytes(&self.inner)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PublicKey {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        if deserializer.is_human_readable() {
+            let s = String::deserialize(deserializer)?;
+            let bytes = data_encoding::BASE32_NOPAD.decode(s.as_bytes())
+                .map_err(serde::de::Error::custom)?;
+            Self::from_bytes(&bytes).map_err(serde::de::Error::custom)
+        } else {
+            let bytes = <[u8; 32]>::deserialize(deserializer)?;
+            Self::from_bytes(&bytes).map_err(serde::de::Error::custom)
+        }
+    }
+}
+
+/// Node identifier - alias for PublicKey (like Iroh)
+pub type NodeId = PublicKey;
+
+/// Secret key for node identity - Ed25519 signing key with secure cleanup
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct SecretKey {
+    #[zeroize(skip)]
+    secret: SigningKey,
+}
+
+impl SecretKey {
+    /// Generate a new random secret key
+    pub fn generate() -> Self {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let mut bytes = [0u8; 32];
+        rng.fill(&mut bytes);
+        let secret = SigningKey::from_bytes(&bytes);
+        bytes.zeroize(); // Clear the temporary bytes
+        Self { secret }
+    }
+    
+    /// Create from raw bytes
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != 32 {
+            return Err(GossipError::InvalidKeyPair(
+                format!("Invalid secret key length: expected 32, got {}", bytes.len())
+            ));
+        }
+        let mut key_bytes = [0u8; 32];
+        key_bytes.copy_from_slice(bytes);
+        let secret = SigningKey::from_bytes(&key_bytes);
+        key_bytes.zeroize(); // Clear the temporary bytes
+        Ok(Self { secret })
+    }
+    
+    /// Get the corresponding public key
+    pub fn public(&self) -> PublicKey {
+        let verifying_key = self.secret.verifying_key();
+        PublicKey { inner: verifying_key.to_bytes() }
+    }
+    
+    /// Sign a message
+    pub fn sign(&self, message: &[u8]) -> Signature {
+        self.secret.sign(message)
+    }
+    
+    /// Get raw bytes (use with caution - these should be zeroized after use)
+    pub fn to_bytes(&self) -> [u8; 32] {
+        self.secret.to_bytes()
+    }
+}
+
+impl std::fmt::Debug for SecretKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SecretKey(***)")
+    }
+}
+
+// =================== End new types ===================
+
+/// Key pair for node identity using Ed25519 cryptography
+#[derive(Clone)]
 pub struct KeyPair {
-    /// Public key - shared with other nodes
-    pub public_key: String,
-    /// Private key - kept secret by the node
-    pub private_key: String,
+    signing_key: SigningKey,
+    verifying_key: VerifyingKey,
 }
 
 impl KeyPair {
-    /// Create a new key pair
-    pub fn new(public_key: impl Into<String>, private_key: impl Into<String>) -> Self {
+    /// Generate a new random keypair
+    pub fn generate() -> Self {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let mut bytes = [0u8; 32];
+        rng.fill(&mut bytes);
+        let signing_key = SigningKey::from_bytes(&bytes);
+        let verifying_key = signing_key.verifying_key();
         Self {
-            public_key: public_key.into(),
-            private_key: private_key.into(),
+            signing_key,
+            verifying_key,
         }
     }
     
-    /// For testing - create a key pair where private key = public key
+    /// Create a keypair from private key bytes
+    pub fn from_private_key_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != 32 {
+            return Err(GossipError::InvalidKeyPair(
+                format!("Invalid private key length: expected 32, got {}", bytes.len())
+            ));
+        }
+        let mut key_bytes = [0u8; 32];
+        key_bytes.copy_from_slice(bytes);
+        let signing_key = SigningKey::from_bytes(&key_bytes);
+        let verifying_key = signing_key.verifying_key();
+        Ok(Self {
+            signing_key,
+            verifying_key,
+        })
+    }
+    
+    /// Get the PeerId (public key) for this keypair
+    pub fn peer_id(&self) -> PeerId {
+        PeerId::from_verifying_key(self.verifying_key)
+    }
+    
+    /// Get the private key bytes
+    pub fn private_key_bytes(&self) -> [u8; 32] {
+        self.signing_key.to_bytes()
+    }
+    
+    /// Get the public key bytes
+    pub fn public_key_bytes(&self) -> [u8; 32] {
+        self.verifying_key.to_bytes()
+    }
+    
+    /// Sign a message
+    pub fn sign(&self, message: &[u8]) -> Signature {
+        self.signing_key.sign(message)
+    }
+    
+    /// For testing - create a deterministic key pair from a seed string
     pub fn new_for_testing(id: impl Into<String>) -> Self {
         let id = id.into();
+        let mut seed = [0u8; 32];
+        let id_bytes = id.as_bytes();
+        let len = id_bytes.len().min(32);
+        seed[..len].copy_from_slice(&id_bytes[..len]);
+        
+        let signing_key = SigningKey::from_bytes(&seed);
+        let verifying_key = signing_key.verifying_key();
         Self {
-            public_key: id.clone(),
-            private_key: id,
+            signing_key,
+            verifying_key,
         }
     }
 }
 
-/// Peer identifier - just the public key
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+impl std::fmt::Debug for KeyPair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyPair")
+            .field("public_key", &hex::encode(self.verifying_key.as_bytes()))
+            .finish()
+    }
+}
+
+/// Peer identifier - contains the Ed25519 public key
+#[derive(Clone, PartialEq, Eq, Hash)]
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub struct PeerId(String);
+pub struct PeerId([u8; 32]);
 
 impl PeerId {
-    /// Create a new peer ID from a public key
-    pub fn new(public_key: impl Into<String>) -> Self {
-        Self(public_key.into())
+    /// Create a new PeerId from a string (for backward compatibility)
+    pub fn new(s: impl Into<String>) -> Self {
+        Self::from(s.into())
     }
     
-    /// Get the public key as a string
-    pub fn as_str(&self) -> &str {
-        &self.0
+    /// Create a PeerId from a verifying key
+    pub fn from_verifying_key(key: VerifyingKey) -> Self {
+        Self(key.to_bytes())
+    }
+    
+    /// Create a PeerId from public key bytes
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != 32 {
+            return Err(GossipError::InvalidKeyPair(
+                format!("Invalid public key length: expected 32, got {}", bytes.len())
+            ));
+        }
+        let mut key_bytes = [0u8; 32];
+        key_bytes.copy_from_slice(bytes);
+        // Verify it's a valid public key
+        let _ = VerifyingKey::from_bytes(&key_bytes)
+            .map_err(|e| GossipError::InvalidKeyPair(format!("Invalid public key: {}", e)))?;
+        Ok(Self(key_bytes))
+    }
+    
+    /// Create a PeerId from hex string
+    pub fn from_hex(hex: &str) -> Result<Self> {
+        let bytes = hex::decode(hex)
+            .map_err(|e| GossipError::InvalidKeyPair(format!("Invalid hex: {}", e)))?;
+        Self::from_bytes(&bytes)
+    }
+    
+    /// Get the public key bytes
+    pub fn to_bytes(&self) -> [u8; 32] {
+        self.0
+    }
+    
+    /// Get the verifying key
+    pub fn to_verifying_key(&self) -> Result<VerifyingKey> {
+        VerifyingKey::from_bytes(&self.0)
+            .map_err(|e| GossipError::InvalidKeyPair(format!("Invalid public key: {}", e)))
+    }
+    
+    /// Get hex representation
+    pub fn to_hex(&self) -> String {
+        hex::encode(&self.0)
+    }
+    
+    /// Get as a string (for backward compatibility)
+    pub fn as_str(&self) -> String {
+        self.to_hex()
+    }
+    
+    /// Verify a signature
+    pub fn verify_signature(&self, message: &[u8], signature: &Signature) -> Result<()> {
+        let verifying_key = self.to_verifying_key()?;
+        verifying_key.verify(message, signature)
+            .map_err(|e| GossipError::InvalidSignature(format!("Signature verification failed: {}", e)))
     }
 }
 
 impl std::fmt::Display for PeerId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+        write!(f, "{}", &self.to_hex()[..8]) // Show first 8 chars for brevity
     }
 }
 
+impl std::fmt::Debug for PeerId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("PeerId")
+            .field(&self.to_hex())
+            .finish()
+    }
+}
+
+// For backward compatibility and testing
 impl From<String> for PeerId {
     fn from(s: String) -> Self {
-        Self(s)
+        // Try to parse as hex, if it fails create a test keypair
+        Self::from_hex(&s).unwrap_or_else(|_| {
+            KeyPair::new_for_testing(&s).peer_id()
+        })
     }
 }
 
 impl From<&str> for PeerId {
     fn from(s: &str) -> Self {
-        Self(s.to_string())
+        Self::from(s.to_string())
     }
 }
 
@@ -120,6 +411,7 @@ impl Peer {
                 crate::registry::PeerInfo {
                     address: *addr,
                     peer_address: None,
+                    node_id: None,
                     failures: 0,  // Start with 0 failures
                     last_attempt: current_time,  // Set last_attempt to now
                     last_success: 0,
@@ -140,7 +432,7 @@ impl Peer {
         }
         
         // Then attempt to connect with enhanced error context
-        match self.registry.connect_to_peer(self.peer_id.as_str()).await {
+        match self.registry.connect_to_peer(&self.peer_id.as_str()).await {
             Ok(()) => {
                 tracing::info!(
                     peer_id = %self.peer_id,
@@ -285,7 +577,7 @@ impl Peer {
         let pool = self.registry.connection_pool.lock().await;
         
         // Check if we have a connection by peer ID
-        if let Some(conn) = pool.get_connection_by_node_id(self.peer_id.as_str()) {
+        if let Some(conn) = pool.get_connection_by_node_id(&self.peer_id.as_str()) {
             conn.is_connected()
         } else {
             false
@@ -296,7 +588,7 @@ impl Peer {
     pub async fn disconnect(&self) -> Result<()> {
         let mut pool = self.registry.connection_pool.lock().await;
         
-        if let Some(conn) = pool.get_connection_by_node_id(self.peer_id.as_str()) {
+        if let Some(conn) = pool.get_connection_by_node_id(&self.peer_id.as_str()) {
             // Mark connection as disconnected
             conn.set_state(crate::connection_pool::ConnectionState::Disconnected);
             
@@ -344,7 +636,7 @@ impl Peer {
             // Check if we have a connection to this peer
             {
                 let pool = self.registry.connection_pool.lock().await;
-                if pool.get_connection_by_node_id(self.peer_id.as_str()).is_some() {
+                if pool.get_connection_by_node_id(&self.peer_id.as_str()).is_some() {
                     break;
                 }
             }
@@ -493,12 +785,30 @@ pub enum GossipError {
 
     #[error("peer not found: {0}")]
     PeerNotFound(SocketAddr),
+    
+    #[error("TLS error: {0}")]
+    TlsError(String),
+    
+    #[error("TLS configuration error: {0}")]
+    TlsConfigError(String),
 
     #[error("actor not found: {0}")]
     ActorNotFound(String),
 
     #[error("registry shutdown")]
     Shutdown,
+    
+    #[error("invalid keypair: {0}")]
+    InvalidKeyPair(String),
+    
+    #[error("invalid signature: {0}")]
+    InvalidSignature(String),
+    
+    #[error("authentication failed: {0}")]
+    AuthenticationFailed(String),
+    
+    #[error("TLS handshake failed: {0}")]
+    TlsHandshakeFailed(String),
 
     #[error("delta too old: requested {requested}, oldest available {oldest}")]
     DeltaTooOld { requested: u64, oldest: u64 },

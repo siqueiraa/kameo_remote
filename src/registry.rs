@@ -155,6 +155,7 @@ pub struct RegistryStats {
 pub struct PeerInfo {
     pub address: SocketAddr,              // Listening address
     pub peer_address: Option<SocketAddr>, // Actual connection address (may be NATed)
+    pub node_id: Option<crate::NodeId>,   // NodeId for TLS verification (optional for backward compat)
     pub failures: usize,
     pub last_attempt: u64,
     pub last_success: u64,
@@ -225,6 +226,9 @@ pub struct GossipRegistry {
     pub peer_id: crate::PeerId,  // Unique peer identifier (public key)
     pub config: GossipConfig,
     pub start_time: u64,
+    
+    // Optional TLS configuration for encrypted connections
+    pub tls_config: Option<Arc<crate::tls::TlsConfig>>,
 
     // Separated lockable state
     pub actor_state: Arc<RwLock<ActorState>>,
@@ -254,7 +258,7 @@ impl GossipRegistry {
     pub fn new(bind_addr: SocketAddr, config: GossipConfig) -> Self {
         // Use public key from config, or generate one based on bind address
         let peer_id = config.key_pair.as_ref()
-            .map(|kp| crate::PeerId::new(&kp.public_key))
+            .map(|kp| kp.peer_id())
             .unwrap_or_else(|| crate::PeerId::new(format!("node_{}", bind_addr.port())));
         
         info!(
@@ -271,6 +275,7 @@ impl GossipRegistry {
             peer_id,
             config: config.clone(),
             start_time: current_timestamp(),
+            tls_config: None, // TLS disabled by default for backward compatibility
             actor_state: Arc::new(RwLock::new(ActorState {
                 local_actors: HashMap::new(),
                 known_actors: HashMap::new(),
@@ -295,6 +300,16 @@ impl GossipRegistry {
         };
 
         registry
+    }
+
+    /// Enable TLS for secure connections
+    /// This must be called before starting the registry to enable TLS
+    pub fn enable_tls(&mut self, secret_key: crate::SecretKey) -> Result<()> {
+        let tls_config = crate::tls::TlsConfig::new(secret_key)
+            .map_err(|e| GossipError::TlsConfigError(format!("Failed to create TLS config: {}", e)))?;
+        self.tls_config = Some(Arc::new(tls_config));
+        info!("TLS enabled for gossip registry");
+        Ok(())
     }
 
     /// Register an actor message handler callback
@@ -409,13 +424,24 @@ impl GossipRegistry {
 
     /// Add a new peer (called when receiving connections)
     pub async fn add_peer(&self, peer_addr: SocketAddr) {
-        debug!(peer = %peer_addr, self_addr = %self.bind_addr, "add_peer called");
+        self.add_peer_with_node_id(peer_addr, None).await;
+    }
+    
+    /// Add a new peer with NodeId for TLS verification
+    pub async fn add_peer_with_node_id(&self, peer_addr: SocketAddr, node_id: Option<crate::NodeId>) {
+        debug!(peer = %peer_addr, self_addr = %self.bind_addr, has_node_id = node_id.is_some(), "add_peer_with_node_id called");
         if peer_addr != self.bind_addr {
             let mut gossip_state = self.gossip_state.lock().await;
 
             // Check if we already have this peer
-            if gossip_state.peers.contains_key(&peer_addr) {
-                debug!(peer = %peer_addr, "peer already tracked");
+            if let Some(existing_peer) = gossip_state.peers.get_mut(&peer_addr) {
+                // Update NodeId if provided and not already set
+                if node_id.is_some() && existing_peer.node_id.is_none() {
+                    existing_peer.node_id = node_id;
+                    debug!(peer = %peer_addr, "updated existing peer with NodeId");
+                } else {
+                    debug!(peer = %peer_addr, "peer already tracked");
+                }
                 return;
             }
 
@@ -424,6 +450,7 @@ impl GossipRegistry {
                 e.insert(PeerInfo {
                     address: peer_addr,
                     peer_address: None,
+                    node_id,
                     failures: 0,
                     last_attempt: current_time,
                     last_success: current_time,
@@ -432,7 +459,12 @@ impl GossipRegistry {
                     consecutive_deltas: 0,
                     last_failure_time: None,
                 });
-                debug!(peer = %peer_addr, peers_count = gossip_state.peers.len(), "📌 Added new peer (listening address)");
+                debug!(
+                    peer = %peer_addr, 
+                    peers_count = gossip_state.peers.len(), 
+                    has_node_id = node_id.is_some(),
+                    "📌 Added new peer (listening address)"
+                );
 
                 // Pre-warm connection for immediate gossip (non-blocking)
                 // if self.config.immediate_propagation_enabled {
@@ -1234,6 +1266,7 @@ impl GossipRegistry {
                     .unwrap_or(PeerInfo {
                         address: peer_addr,
                         peer_address: None,
+                        node_id: None,
                         failures: 0,
                         last_attempt: 0,
                         last_success: 0,

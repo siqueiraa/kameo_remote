@@ -1,7 +1,7 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use tokio::{
-    io::AsyncReadExt,
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     time::{interval, Instant},
 };
@@ -22,6 +22,60 @@ pub struct GossipRegistryHandle {
 }
 
 impl GossipRegistryHandle {
+    
+    /// Create and start a new gossip registry with TLS encryption
+    /// 
+    /// This creates a secure gossip registry that uses TLS 1.3 for all connections.
+    /// The secret_key is used to generate the node's identity certificate.
+    pub async fn new_with_tls(
+        bind_addr: SocketAddr,
+        secret_key: crate::SecretKey,
+        config: Option<GossipConfig>,
+    ) -> Result<Self> {
+        let config = config.unwrap_or_default();
+        
+        // Create the TCP listener first to get the actual bound address
+        let listener = TcpListener::bind(bind_addr).await?;
+        let actual_bind_addr = listener.local_addr()?;
+        
+        // Create registry with TLS enabled
+        let mut registry = GossipRegistry::new(actual_bind_addr, config.clone());
+        registry.enable_tls(secret_key)?;
+        
+        let registry = Arc::new(registry);
+        
+        // Set the registry reference in the connection pool
+        {
+            let mut pool = registry.connection_pool.lock().await;
+            pool.set_registry(registry.clone());
+        }
+        
+        // Start the server with the existing listener
+        let server_registry = registry.clone();
+        let server_handle = tokio::spawn(async move {
+            if let Err(err) = start_gossip_server_with_listener(server_registry, listener).await {
+                error!(error = %err, "TLS server error");
+            }
+        });
+        
+        // Start the gossip timer
+        let timer_registry = registry.clone();
+        let timer_handle = tokio::spawn(async move {
+            start_gossip_timer(timer_registry).await;
+        });
+        
+        // Connection monitoring is now done in the gossip timer
+        let monitor_handle = None;
+        
+        info!(bind_addr = %actual_bind_addr, "TLS-enabled gossip registry started");
+        
+        Ok(Self {
+            registry,
+            _server_handle: server_handle,
+            _timer_handle: timer_handle,
+            _monitor_handle: monitor_handle,
+        })
+    }
 
     /// Create and start a new gossip registry
     /// 
@@ -322,17 +376,78 @@ async fn handle_connection(
 ) {
     debug!("🔌 HANDLE_CONNECTION: Starting to handle new incoming connection");
 
-    // Split stream for direct TCP access
-    let (reader, writer) = stream.into_split();
+    // Check if TLS is enabled
+    if let Some(tls_config) = &registry.tls_config {
+        // TLS is enabled - perform TLS handshake
+        info!("🔐 TLS ENABLED: Performing TLS handshake with peer {}", peer_addr);
+        
+        let acceptor = tls_config.acceptor();
+        match acceptor.accept(stream).await {
+            Ok(tls_stream) => {
+                info!("✅ TLS handshake successful with peer {}", peer_addr);
+                handle_tls_connection(tls_stream, peer_addr, registry).await;
+            }
+            Err(e) => {
+                error!(error = %e, peer = %peer_addr, "❌ TLS handshake failed - rejecting connection");
+                // Connection failed, don't continue
+                // This is correct - we should NOT fall back to plain TCP if TLS is enabled
+            }
+        }
+    } else {
+        // No TLS - panic for now to ensure we're using TLS
+        panic!("⚠️ TLS DISABLED: Server attempted to accept plain TCP connection from {}. TLS is required!", peer_addr);
+        
+        // Split stream for direct TCP access
+        let (reader, writer) = stream.into_split();
 
+        // Get registry reference for the handler
+        let registry_weak = Some(Arc::downgrade(&registry));
+
+        // Start the incoming persistent connection handler immediately
+        // It will handle ALL messages including the first one
+        tokio::spawn(async move {
+            debug!(peer = %peer_addr, "HANDLE.RS: Starting incoming direct TCP connection handler");
+            let sender_node_id = handle_incoming_connection_direct_tcp(
+                reader,
+                writer,
+                peer_addr,
+                registry.clone(),
+                registry_weak,
+            )
+            .await;
+            debug!(peer = %peer_addr, "HANDLE.RS: Incoming direct TCP connection handler exited");
+            
+            // Handle peer failure when connection is lost
+            if let Some(failed_node_id) = sender_node_id {
+                debug!(node_id = %failed_node_id, "HANDLE.RS: Triggering peer failure handling for node");
+                if let Err(e) = registry.handle_peer_connection_failure_by_node_id(&failed_node_id).await {
+                    warn!(error = %e, node_id = %failed_node_id, "HANDLE.RS: Failed to handle peer connection failure");
+                }
+            } else {
+                warn!(peer = %peer_addr, "HANDLE.RS: Cannot handle peer failure - sender node ID unknown");
+            }
+        });
+    }
+}
+
+/// Handle an incoming TLS connection
+async fn handle_tls_connection(
+    tls_stream: tokio_rustls::server::TlsStream<TcpStream>,
+    peer_addr: SocketAddr,
+    registry: Arc<GossipRegistry>,
+) {
+    use tokio::io::{AsyncRead, AsyncWrite};
+    
+    // Split the TLS stream
+    let (reader, writer) = tokio::io::split(tls_stream);
+    
     // Get registry reference for the handler
     let registry_weak = Some(Arc::downgrade(&registry));
-
-    // Start the incoming persistent connection handler immediately
-    // It will handle ALL messages including the first one
+    
+    // Start the incoming persistent connection handler
     tokio::spawn(async move {
-        debug!(peer = %peer_addr, "HANDLE.RS: Starting incoming direct TCP connection handler");
-        let sender_node_id = handle_incoming_connection_direct_tcp(
+        debug!(peer = %peer_addr, "HANDLE.RS: Starting incoming TLS connection handler");
+        let sender_node_id = handle_incoming_connection_tls(
             reader,
             writer,
             peer_addr,
@@ -340,7 +455,7 @@ async fn handle_connection(
             registry_weak,
         )
         .await;
-        debug!(peer = %peer_addr, "HANDLE.RS: Incoming direct TCP connection handler exited");
+        debug!(peer = %peer_addr, "HANDLE.RS: Incoming TLS connection handler exited");
         
         // Handle peer failure when connection is lost
         if let Some(failed_node_id) = sender_node_id {
@@ -352,6 +467,137 @@ async fn handle_connection(
             warn!(peer = %peer_addr, "HANDLE.RS: Cannot handle peer failure - sender node ID unknown");
         }
     });
+}
+
+/// Handle an incoming TLS connection - processes all messages over encrypted stream
+async fn handle_incoming_connection_tls<R, W>(
+    mut reader: R,
+    writer: W,
+    peer_addr: SocketAddr,
+    registry: Arc<GossipRegistry>,
+    registry_weak: Option<std::sync::Weak<GossipRegistry>>,
+) -> Option<String>
+where
+    R: AsyncReadExt + Unpin + Send + 'static,
+    W: AsyncWriteExt + Unpin + Send + 'static,
+{
+    let max_message_size = registry.config.max_message_size;
+    
+    // First, read the initial message to identify the sender
+    let msg_result = read_message_from_tls_reader(&mut reader, max_message_size).await;
+    
+    let sender_node_id = match &msg_result {
+        Ok(msg) => match msg {
+            RegistryMessage::DeltaGossip { delta } => delta.sender_peer_id.as_str().to_string(),
+            RegistryMessage::FullSync { sender_peer_id, .. } => sender_peer_id.as_str().to_string(),
+            RegistryMessage::FullSyncRequest { sender_peer_id, .. } => sender_peer_id.as_str().to_string(),
+            RegistryMessage::FullSyncResponse { sender_peer_id, .. } => sender_peer_id.as_str().to_string(),
+            RegistryMessage::DeltaGossipResponse { delta } => delta.sender_peer_id.as_str().to_string(),
+            RegistryMessage::PeerHealthQuery { sender, .. } => sender.as_str().to_string(),
+            RegistryMessage::PeerHealthReport { reporter, .. } => reporter.as_str().to_string(),
+            RegistryMessage::ImmediateAck { .. } => {
+                warn!("Received ImmediateAck as first message - cannot identify sender");
+                return None;
+            }
+            RegistryMessage::ActorMessage { .. } => {
+                warn!("Received ActorMessage as first message - cannot identify sender");
+                return None;
+            }
+        },
+        Err(e) => {
+            warn!(error = %e, "Failed to read initial message from TLS stream");
+            return None;
+        }
+    };
+    
+    debug!(peer_addr = %peer_addr, node_id = %sender_node_id, "Identified incoming TLS connection from node");
+    
+    // Process the initial message
+    if let Ok(msg) = msg_result {
+        if let Err(e) = handle_incoming_message(registry.clone(), peer_addr, msg).await {
+            warn!(error = %e, "Failed to process initial TLS message");
+        }
+    }
+    
+    // Add the TLS writer to the connection pool for bidirectional communication
+    {
+        use std::pin::Pin;
+        use tokio::io::AsyncWrite;
+        
+        // Box the writer as a trait object for heterogeneous storage
+        let boxed_writer: Pin<Box<dyn AsyncWrite + Send>> = Box::pin(writer);
+        
+        // Create a LockFreeStreamHandle for the TLS writer
+        let stream_handle = Arc::new(crate::connection_pool::LockFreeStreamHandle::new(
+            boxed_writer,
+            peer_addr,
+            crate::connection_pool::ChannelId::Global,
+            16384, // RING_BUFFER_SIZE
+        ));
+        
+        // Create a connection with the TLS stream handle
+        let mut connection = crate::connection_pool::LockFreeConnection::new(peer_addr);
+        connection.stream_handle = Some(stream_handle);
+        connection.set_state(crate::connection_pool::ConnectionState::Connected);
+        connection.update_last_used();
+        
+        // Add the connection to the pool by node ID
+        let connection_arc = Arc::new(connection);
+        let pool = registry.connection_pool.lock().await;
+        
+        // Add the connection using the sender's node ID
+        pool.add_connection_by_node_id(sender_node_id.clone(), peer_addr, connection_arc);
+        
+        debug!(node_id = %sender_node_id, peer_addr = %peer_addr, 
+              "Added incoming TLS connection to pool for bidirectional communication");
+    }
+    
+    // Continue reading messages from the TLS stream
+    // Note: writer has been moved to the connection pool, so we only have the reader
+    loop {
+        match read_message_from_tls_reader(&mut reader, max_message_size).await {
+            Ok(msg) => {
+                if let Err(e) = handle_incoming_message(registry.clone(), peer_addr, msg).await {
+                    warn!(error = %e, "Failed to process TLS message");
+                }
+            }
+            Err(e) => {
+                debug!(error = %e, "TLS connection closed or error reading message");
+                break;
+            }
+        }
+    }
+    
+    Some(sender_node_id)
+}
+
+/// Read a message from a TLS reader
+async fn read_message_from_tls_reader<R>(
+    reader: &mut R,
+    max_message_size: usize,
+) -> Result<RegistryMessage>
+where
+    R: AsyncReadExt + Unpin,
+{
+    // Read the message length (4 bytes)
+    let mut len_buf = [0u8; 4];
+    reader.read_exact(&mut len_buf).await?;
+    let msg_len = u32::from_be_bytes(len_buf) as usize;
+    
+    if msg_len > max_message_size {
+        return Err(crate::GossipError::MessageTooLarge {
+            size: msg_len,
+            max: max_message_size,
+        });
+    }
+    
+    // Read the message data
+    let mut msg_buf = vec![0u8; msg_len];
+    reader.read_exact(&mut msg_buf).await?;
+    
+    // Deserialize the message
+    let msg: RegistryMessage = rkyv::from_bytes::<RegistryMessage, rkyv::rancor::Error>(&msg_buf)?;
+    Ok(msg)
 }
 
 /// Handle an incoming direct TCP connection - processes all messages and manages the connection pool

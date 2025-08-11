@@ -1,10 +1,11 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration, pin::Pin};
 use std::fmt::Debug;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use std::sync::atomic::{AtomicBool, AtomicUsize, AtomicU32, AtomicU16, Ordering};
 use bytes::BufMut;
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::{
     current_timestamp,
@@ -414,7 +415,10 @@ pub struct LockFreeStreamHandle {
 
 impl LockFreeStreamHandle {
     /// Create a new lock-free streaming handle with background writer task
-    pub fn new(tcp_writer: tokio::net::tcp::OwnedWriteHalf, addr: SocketAddr, channel_id: ChannelId, buffer_size: usize) -> Self {
+    pub fn new<W>(tcp_writer: W, addr: SocketAddr, channel_id: ChannelId, buffer_size: usize) -> Self 
+    where
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
         let ring_buffer = Arc::new(LockFreeRingBuffer::new(buffer_size));
         let shutdown_signal = Arc::new(AtomicBool::new(false));
         let streaming_active = Arc::new(AtomicBool::new(false));
@@ -458,14 +462,16 @@ impl LockFreeStreamHandle {
     
     /// Background writer task - truly lock-free with exclusive TCP access
     /// OPTIMIZED FOR MAXIMUM THROUGHPUT - NO MUTEX NEEDED!
-    async fn background_writer_task(
-        tcp_writer: tokio::net::tcp::OwnedWriteHalf,
+    async fn background_writer_task<W>(
+        tcp_writer: W,
         ring_buffer: Arc<LockFreeRingBuffer>,
         shutdown_signal: Arc<AtomicBool>,
         bytes_written_counter: Arc<AtomicUsize>, // Track ALL bytes written to TCP
         streaming_active: Arc<AtomicBool>,
         mut streaming_rx: mpsc::UnboundedReceiver<StreamingCommand>,
-    ) {
+    ) where
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
         use tokio::io::AsyncWriteExt;
         use std::io::IoSlice;
         
@@ -2158,8 +2164,75 @@ impl ConnectionPool {
         // Configure socket
         stream.set_nodelay(true).map_err(GossipError::Network)?;
 
-        // Split the stream
-        let (mut reader, writer) = stream.into_split();
+        // Check if TLS is enabled
+        let (mut reader, writer) = if let Some(registry_arc) = registry_weak.as_ref().and_then(|w| w.upgrade()) {
+            if let Some(tls_config) = &registry_arc.tls_config {
+                // TLS is enabled - perform handshake as client
+                debug!("CONNECTION POOL: TLS enabled, checking for peer NodeId");
+                
+                // Look up the peer's NodeId from the registry's peer info
+                let peer_node_id = {
+                    let gossip_state = registry_arc.gossip_state.lock().await;
+                    gossip_state.peers.get(&addr)
+                        .and_then(|peer_info| peer_info.node_id)
+                };
+                
+                if let Some(node_id) = peer_node_id {
+                    // We have the NodeId - perform TLS handshake
+                    debug!("CONNECTION POOL: Found NodeId for peer {}, performing TLS handshake", addr);
+                    
+                    // Create DNS name from NodeId
+                    let dns_name = crate::tls::name::encode(&node_id);
+                    let server_name = rustls::pki_types::ServerName::try_from(dns_name)
+                        .map_err(|e| GossipError::TlsError(format!("Invalid DNS name: {}", e)))?;
+                    
+                    // Create TLS connector
+                    info!("🔐 TLS ENABLED: Initiating TLS connection to {} with NodeId {}", 
+                         addr, node_id.fmt_short());
+                    let connector = tokio_rustls::TlsConnector::from(tls_config.client_config.clone());
+                    
+                    // Perform TLS handshake
+                    match tokio::time::timeout(
+                        Duration::from_secs(10),
+                        connector.connect(server_name, stream)
+                    ).await {
+                        Ok(Ok(tls_stream)) => {
+                            info!("✅ TLS handshake successful with {} (NodeId: {})", 
+                                 addr, node_id.fmt_short());
+                            let (read_half, write_half) = tokio::io::split(tls_stream);
+                            (Box::pin(read_half) as Pin<Box<dyn AsyncRead + Send>>, 
+                             Box::pin(write_half) as Pin<Box<dyn AsyncWrite + Send>>)
+                        }
+                        Ok(Err(e)) => {
+                            error!("❌ TLS handshake failed with {} (expected NodeId: {}): {}", 
+                                   addr, node_id.fmt_short(), e);
+                            return Err(GossipError::TlsError(format!("TLS handshake failed: {}", e)));
+                        }
+                        Err(_) => {
+                            error!("⏱️ TLS handshake timed out with {} (expected NodeId: {})", 
+                                   addr, node_id.fmt_short());
+                            return Err(GossipError::Timeout);
+                        }
+                    }
+                } else {
+                    // No NodeId available - can't do TLS
+                    panic!("🔥 TLS is configured but no NodeId provided for peer {}. Cannot establish secure connection!", addr);
+                    let (read_half, write_half) = stream.into_split();
+                    (Box::pin(read_half) as Pin<Box<dyn AsyncRead + Send>>, 
+                     Box::pin(write_half) as Pin<Box<dyn AsyncWrite + Send>>)
+                }
+            } else {
+                // No TLS - use plain TCP
+                let (read_half, write_half) = stream.into_split();
+                (Box::pin(read_half) as Pin<Box<dyn AsyncRead + Send>>, 
+                 Box::pin(write_half) as Pin<Box<dyn AsyncWrite + Send>>)
+            }
+        } else {
+            // No registry reference - use plain TCP
+            let (read_half, write_half) = stream.into_split();
+            (Box::pin(read_half) as Pin<Box<dyn AsyncRead + Send>>, 
+             Box::pin(write_half) as Pin<Box<dyn AsyncWrite + Send>>)
+        };
         
         // Create lock-free connection for receiving
         let stream_handle = Arc::new(LockFreeStreamHandle::new(
@@ -3572,6 +3645,7 @@ pub(crate) async fn handle_incoming_message(
                         e.insert(crate::registry::PeerInfo {
                             address: sender_socket_addr,
                             peer_address: None,
+                            node_id: None,
                             failures: 0,
                             last_attempt: current_time,
                             last_success: current_time,
@@ -3893,6 +3967,7 @@ pub(crate) async fn handle_incoming_message(
                         e.insert(crate::registry::PeerInfo {
                             address: sender_socket_addr,
                             peer_address: None,
+                            node_id: None,
                             failures: 0,
                             last_attempt: current_time,
                             last_success: current_time,
@@ -4027,7 +4102,7 @@ pub(crate) async fn handle_incoming_message(
                     
                     // Try to send using peer ID
                     let frozen_buffer = buffer.freeze();
-                    let send_result = match pool.send_bytes_to_node_id(sender_peer_id.as_str(), frozen_buffer.clone()) {
+                    let send_result = match pool.send_bytes_to_node_id(&sender_peer_id.as_str(), frozen_buffer.clone()) {
                         Ok(()) => Ok(()),
                         Err(e) => {
                             warn!("Failed to send via peer ID {}: {}", sender_peer_id, e);
