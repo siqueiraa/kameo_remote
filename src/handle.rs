@@ -487,23 +487,34 @@ where
     // First, read the initial message to identify the sender
     let msg_result = read_message_from_tls_reader(&mut reader, max_message_size).await;
     
-    let sender_node_id = match &msg_result {
-        Ok(msg) => match msg {
-            RegistryMessage::DeltaGossip { delta } => delta.sender_peer_id.as_str().to_string(),
-            RegistryMessage::FullSync { sender_peer_id, .. } => sender_peer_id.as_str().to_string(),
-            RegistryMessage::FullSyncRequest { sender_peer_id, .. } => sender_peer_id.as_str().to_string(),
-            RegistryMessage::FullSyncResponse { sender_peer_id, .. } => sender_peer_id.as_str().to_string(),
-            RegistryMessage::DeltaGossipResponse { delta } => delta.sender_peer_id.as_str().to_string(),
-            RegistryMessage::PeerHealthQuery { sender, .. } => sender.as_str().to_string(),
-            RegistryMessage::PeerHealthReport { reporter, .. } => reporter.as_str().to_string(),
-            RegistryMessage::ImmediateAck { .. } => {
-                warn!("Received ImmediateAck as first message - cannot identify sender");
-                return None;
-            }
-            RegistryMessage::ActorMessage { .. } => {
-                warn!("Received ActorMessage as first message - cannot identify sender");
-                return None;
-            }
+    let (sender_node_id, initial_correlation_id) = match &msg_result {
+        Ok((msg, correlation_id)) => {
+            let node_id = match msg {
+                RegistryMessage::DeltaGossip { delta } => delta.sender_peer_id.as_str().to_string(),
+                RegistryMessage::FullSync { sender_peer_id, .. } => sender_peer_id.as_str().to_string(),
+                RegistryMessage::FullSyncRequest { sender_peer_id, .. } => sender_peer_id.as_str().to_string(),
+                RegistryMessage::FullSyncResponse { sender_peer_id, .. } => sender_peer_id.as_str().to_string(),
+                RegistryMessage::DeltaGossipResponse { delta } => delta.sender_peer_id.as_str().to_string(),
+                RegistryMessage::PeerHealthQuery { sender, .. } => sender.as_str().to_string(),
+                RegistryMessage::PeerHealthReport { reporter, .. } => reporter.as_str().to_string(),
+                RegistryMessage::ImmediateAck { .. } => {
+                    warn!("Received ImmediateAck as first message - cannot identify sender");
+                    return None;
+                }
+                RegistryMessage::ActorMessage { .. } => {
+                    // For ActorMessage, we can't determine sender from the message
+                    // But if it has a correlation_id, it's an Ask and we should handle it
+                    if correlation_id.is_some() {
+                        debug!("Received ActorMessage with Ask envelope as first message");
+                        // We'll use a placeholder sender ID for now
+                        "ask_sender".to_string()
+                    } else {
+                        warn!("Received ActorMessage as first message - cannot identify sender");
+                        return None;
+                    }
+                }
+            };
+            (node_id, *correlation_id)
         },
         Err(e) => {
             warn!(error = %e, "Failed to read initial message from TLS stream");
@@ -523,9 +534,27 @@ where
         }
     }
     
-    // Process the initial message
-    if let Ok(msg) = msg_result {
-        if let Err(e) = handle_incoming_message(registry.clone(), peer_addr, msg).await {
+    // Process the initial message with correlation ID if present
+    if let Ok((msg, correlation_id)) = msg_result {
+        // For ActorMessage with correlation_id, ensure it's set
+        let msg_to_handle = if let RegistryMessage::ActorMessage { 
+            actor_id, 
+            type_hash, 
+            payload, 
+            correlation_id: _
+        } = msg {
+            // Create a new ActorMessage with the correlation_id from the Ask envelope
+            RegistryMessage::ActorMessage {
+                actor_id,
+                type_hash,
+                payload,
+                correlation_id: initial_correlation_id,
+            }
+        } else {
+            msg
+        };
+        
+        if let Err(e) = handle_incoming_message(registry.clone(), peer_addr, msg_to_handle).await {
             warn!(error = %e, "Failed to process initial TLS message");
         }
     }
@@ -567,8 +596,26 @@ where
     // Note: writer has been moved to the connection pool, so we only have the reader
     loop {
         match read_message_from_tls_reader(&mut reader, max_message_size).await {
-            Ok(msg) => {
-                if let Err(e) = handle_incoming_message(registry.clone(), peer_addr, msg).await {
+            Ok((msg, correlation_id)) => {
+                // For ActorMessage with correlation_id from Ask envelope, ensure it's set
+                let msg_to_handle = if let RegistryMessage::ActorMessage { 
+                    actor_id, 
+                    type_hash, 
+                    payload, 
+                    correlation_id: _
+                } = msg {
+                    // Create a new ActorMessage with the correlation_id from the Ask envelope
+                    RegistryMessage::ActorMessage {
+                        actor_id,
+                        type_hash,
+                        payload,
+                        correlation_id,
+                    }
+                } else {
+                    msg
+                };
+                
+                if let Err(e) = handle_incoming_message(registry.clone(), peer_addr, msg_to_handle).await {
                     warn!(error = %e, "Failed to process TLS message");
                 }
             }
@@ -586,7 +633,7 @@ where
 async fn read_message_from_tls_reader<R>(
     reader: &mut R,
     max_message_size: usize,
-) -> Result<RegistryMessage>
+) -> Result<(RegistryMessage, Option<u16>)>
 where
     R: AsyncReadExt + Unpin,
 {
@@ -606,9 +653,31 @@ where
     let mut msg_buf = vec![0u8; msg_len];
     reader.read_exact(&mut msg_buf).await?;
     
-    // Deserialize the message
-    let msg: RegistryMessage = rkyv::from_bytes::<RegistryMessage, rkyv::rancor::Error>(&msg_buf)?;
-    Ok(msg)
+    // Check if this is an Ask message with envelope
+    if msg_len >= 8 && msg_buf[0] == crate::MessageType::Ask as u8 {
+        // This is an Ask message with envelope format:
+        // [type:1][correlation_id:2][reserved:5][payload:N]
+        
+        // Extract correlation ID (bytes 1-2)
+        let correlation_id = u16::from_be_bytes([msg_buf[1], msg_buf[2]]);
+        
+        // The actual RegistryMessage starts at byte 8
+        let payload = &msg_buf[8..];
+        
+        // Deserialize the RegistryMessage from the payload
+        let msg: RegistryMessage = rkyv::from_bytes::<RegistryMessage, rkyv::rancor::Error>(payload)?;
+        
+        debug!(
+            correlation_id = correlation_id,
+            "Received Ask message with correlation ID"
+        );
+        
+        Ok((msg, Some(correlation_id)))
+    } else {
+        // Regular message without Ask envelope
+        let msg: RegistryMessage = rkyv::from_bytes::<RegistryMessage, rkyv::rancor::Error>(&msg_buf)?;
+        Ok((msg, None))
+    }
 }
 
 /// Handle an incoming direct TCP connection - processes all messages and manages the connection pool

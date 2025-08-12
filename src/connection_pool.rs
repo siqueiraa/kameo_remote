@@ -480,12 +480,13 @@ impl LockFreeStreamHandle {
         // This requires either:
         // 1. Modifying StreamWriter trait to work with OwnedWriteHalf
         // 2. Or using a different socket splitting approach that allows io_uring
-        // Current implementation still uses efficient vectored I/O with batching
-        let mut writer = tokio::io::BufWriter::with_capacity(64 * 1024, tcp_writer);
+        // Use smaller buffer for lower latency (1KB instead of 64KB)
+        // Ask/reply operations need immediate flushing, not large buffering
+        let mut writer = tokio::io::BufWriter::with_capacity(1024, tcp_writer);
         
-        // Large batching buffers for maximum throughput
-        const RING_BATCH_SIZE: usize = 4096;  // Much larger batches
-        const FLUSH_THRESHOLD: usize = 256 * 1024; // 256KB before flush
+        // Smaller batches for lower latency
+        const RING_BATCH_SIZE: usize = 64;  // Smaller batches for faster processing
+        const FLUSH_THRESHOLD: usize = 4 * 1024; // 4KB before flush (much lower for ask/reply)
         
         let mut bytes_since_flush = 0;
         
@@ -549,7 +550,8 @@ impl LockFreeStreamHandle {
                         }
                     }
                 }
-                _ = tokio::time::sleep(Duration::from_micros(10)) => {
+                // Poll ring buffer immediately without sleep for low latency
+                _ = tokio::task::yield_now() => {
                     // Check if streaming is active - if so, skip ring buffer processing
                     if streaming_active.load(Ordering::Acquire) {
                         continue;
@@ -559,6 +561,7 @@ impl LockFreeStreamHandle {
                     let mut io_slices = Vec::with_capacity(RING_BATCH_SIZE);
                     let mut write_data = Vec::with_capacity(RING_BATCH_SIZE);
                     
+                    // Try to pop messages immediately for low latency
                     for _ in 0..RING_BATCH_SIZE {
                         if let Some(command) = ring_buffer.try_pop() {
                             write_data.push(command.data);
@@ -568,6 +571,7 @@ impl LockFreeStreamHandle {
                     }
                     
                     if !write_data.is_empty() {
+                        
                         // Create IoSlice array for vectored write
                         for data in &write_data {
                             io_slices.push(IoSlice::new(data));
@@ -614,6 +618,7 @@ impl LockFreeStreamHandle {
     
     /// Write Bytes to the lock-free ring buffer - NO BLOCKING, NO COPY
     pub fn write_bytes_nonblocking(&self, data: bytes::Bytes) -> Result<()> {
+        
         let sequence = self.sequence_counter.fetch_add(1, Ordering::Relaxed);
         
         let command = WriteCommand {
@@ -627,8 +632,16 @@ impl LockFreeStreamHandle {
             Ok(())
         } else {
             // Ring buffer full - drop the data (fire and forget)
+            warn!("Ring buffer full - dropping message");
             Ok(())
         }
+    }
+    
+    /// Flush the writer immediately - used for low-latency ask operations
+    pub fn flush_immediately(&self) -> Result<()> {
+        // Send a flush command to the writer task
+        self.streaming_tx.send(StreamingCommand::Flush)
+            .map_err(|_| GossipError::Shutdown)
     }
     
     /// Write data with vectored batching - still no blocking
@@ -1251,7 +1264,10 @@ impl ConnectionHandle {
         message.extend_from_slice(data);
         
         // Use lock-free ring buffer - NO MUTEX!
-        self.stream_handle.write_bytes_nonblocking(message.freeze())
+        self.stream_handle.write_bytes_nonblocking(message.freeze())?;
+        
+        // CRITICAL: Flush immediately for low-latency tell operations
+        self.stream_handle.flush_immediately()
     }
     
     /// Send a pre-formatted binary message (already has length prefix)
@@ -1335,7 +1351,10 @@ impl ConnectionHandle {
         }
         
         // Use lock-free ring buffer - NO MUTEX!
-        self.stream_handle.write_bytes_nonblocking(batch_buffer.freeze())
+        self.stream_handle.write_bytes_nonblocking(batch_buffer.freeze())?;
+        
+        // CRITICAL: Flush immediately for low-latency operations
+        self.stream_handle.flush_immediately()
     }
     
     /// Direct access to try_send for maximum performance testing
@@ -1375,6 +1394,7 @@ impl ConnectionHandle {
         // Allocate correlation ID
         let correlation_id = self.correlation.allocate(tx);
         
+        
         // Create ask message with length prefix + 8-byte header + payload
         let total_size = 8 + request.len();
         let mut message = bytes::BytesMut::with_capacity(4 + total_size);
@@ -1383,13 +1403,18 @@ impl ConnectionHandle {
         message.extend_from_slice(&(total_size as u32).to_be_bytes());
         
         // Header: [type:1][correlation_id:2][reserved:5]
-        message.put_u8(crate::MessageType::Ask as u8);
+        let ask_type = crate::MessageType::Ask as u8;
+        message.put_u8(ask_type);
         message.extend_from_slice(&correlation_id.to_be_bytes());
         message.extend_from_slice(&[0u8; 5]); // Reserved bytes
         message.extend_from_slice(request);
         
+        
         // Send the message
         self.stream_handle.write_bytes_nonblocking(message.freeze())?;
+        
+        // CRITICAL: Flush immediately for ask messages to minimize latency
+        self.stream_handle.flush_immediately()?;
         
         // Wait for response with custom timeout
         let result = match tokio::time::timeout(timeout, rx).await {
@@ -1430,6 +1455,9 @@ impl ConnectionHandle {
         
         // Send the message
         self.stream_handle.write_bytes_nonblocking(message.freeze())?;
+        
+        // CRITICAL: Flush immediately for ask messages to minimize latency
+        self.stream_handle.flush_immediately()?;
         
         // Return ReplyTo handle
         Ok(crate::ReplyTo {
@@ -1497,6 +1525,9 @@ impl ConnectionHandle {
         
         // Send all messages in one write
         self.stream_handle.write_bytes_nonblocking(bytes::Bytes::from(batch_message))?;
+        
+        // CRITICAL: Flush immediately for ask messages to minimize latency
+        self.stream_handle.flush_immediately()?;
         
         Ok(receivers)
     }
@@ -1567,6 +1598,9 @@ impl ConnectionHandle {
         
         // Single write for all messages
         self.stream_handle.write_bytes_nonblocking(batch_message.freeze())?;
+        
+        // CRITICAL: Flush immediately for ask messages to minimize latency
+        self.stream_handle.flush_immediately()?;
         
         Ok(())
     }
@@ -2865,6 +2899,15 @@ pub(crate) async fn handle_persistent_connection_reader(
                         //     // info!(peer = %peer_addr, len = len, "📦 LARGE MESSAGE: Complete message received, processing...");
                         // }
                         
+                        // Debug: Log first few bytes of every message
+                        if msg_data.len() >= 8 {
+                            info!(peer = %peer_addr, 
+                                  "🔍 SERVER RECV: msg_len={}, first_bytes=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}]",
+                                  msg_data.len(), 
+                                  msg_data[0], msg_data[1], msg_data[2], msg_data[3],
+                                  msg_data[4], msg_data[5], msg_data[6], msg_data[7]);
+                        }
+                        
                         // Check if this is an Ask/Response message by looking at first byte
                         if msg_data.len() >= 1 {
                             // Debug log for large messages
@@ -2884,12 +2927,16 @@ pub(crate) async fn handle_persistent_connection_reader(
                                 
                                 match msg_type {
                                     crate::MessageType::Ask => {
+                                        info!(peer = %peer_addr, correlation_id = correlation_id, payload_len = payload.len(),
+                                              "📨 ASK DEBUG: Received Ask message on bidirectional connection");
                                         
                                         // Try to deserialize the payload as a RegistryMessage
                                         // Note: payload might not be aligned, so we need to copy it to an aligned buffer
                                         let aligned_payload = payload.to_vec();
                                         match rkyv::from_bytes::<crate::registry::RegistryMessage, rkyv::rancor::Error>(&aligned_payload) {
                                             Ok(mut registry_msg) => {
+                                                info!(peer = %peer_addr, correlation_id = correlation_id, 
+                                                      "✅ ASK DEBUG: Successfully deserialized RegistryMessage");
                                                 debug!(peer = %peer_addr, correlation_id = correlation_id, "Received Ask with RegistryMessage payload");
                                             
                                             // If it's an ActorMessage, ensure it has the correlation_id from the Ask envelope
@@ -2923,6 +2970,9 @@ pub(crate) async fn handle_persistent_connection_reader(
                                                         ref payload,
                                                         correlation_id: Some(corr_id),
                                                     } = registry_msg {
+                                                        info!(peer = %peer_addr, actor_id = %actor_id, type_hash = %format!("{:08x}", type_hash),
+                                                              payload_len = payload.len(), correlation_id = corr_id,
+                                                              "🎯 ASK DEBUG: Processing ActorMessage ask");
                                                         // Handle the actor message directly
                                                         match registry.handle_actor_message(actor_id, *type_hash, payload, Some(corr_id)).await {
                                                             Ok(Some(reply_payload)) => {
@@ -4035,6 +4085,16 @@ pub(crate) async fn handle_incoming_message(
                 known_actors = known_actors.len(),
                 "📨 INCOMING: Received full sync message on bidirectional connection"
             );
+            
+            // IMPORTANT: Register the incoming connection with the peer_id mapping
+            // This allows bidirectional communication to work properly
+            {
+                let mut pool = registry.connection_pool.lock().await;
+                pool.peer_id_to_addr.insert(sender_peer_id.clone(), sender_socket_addr);
+                pool.addr_to_peer_id.insert(sender_socket_addr, sender_peer_id.clone());
+                debug!("BIDIRECTIONAL: Registered incoming connection - peer_id={} addr={}", 
+                      sender_peer_id, sender_socket_addr);
+            }
 
             // Only remaining async operation
             registry
