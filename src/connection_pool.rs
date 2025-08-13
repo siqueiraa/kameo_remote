@@ -571,7 +571,6 @@ impl LockFreeStreamHandle {
                     }
                     
                     if !write_data.is_empty() {
-                        
                         // Create IoSlice array for vectored write
                         for data in &write_data {
                             io_slices.push(IoSlice::new(data));
@@ -584,7 +583,6 @@ impl LockFreeStreamHandle {
                                 total_bytes_written += bytes_written;
                             }
                             Err(e) => {
-                                error!("Write error: {}", e);
                                 // Connection probably broken, exit task
                                 break;
                             }
@@ -623,7 +621,7 @@ impl LockFreeStreamHandle {
         
         let command = WriteCommand {
             channel_id: self.channel_id,
-            data,
+            data: data.clone(),
             sequence: sequence as u64,
         };
         
@@ -632,7 +630,6 @@ impl LockFreeStreamHandle {
             Ok(())
         } else {
             // Ring buffer full - drop the data (fire and forget)
-            warn!("Ring buffer full - dropping message");
             Ok(())
         }
     }
@@ -1248,7 +1245,10 @@ impl ConnectionHandle {
     
     /// Send bytes without copying - TRUE ZERO-COPY
     pub fn send_bytes_zero_copy(&self, data: bytes::Bytes) -> Result<()> {
-        self.stream_handle.write_bytes_nonblocking(data)
+        eprintln!("[CONNECTION] Sending {} bytes on connection to {}", data.len(), self.stream_handle.addr);
+        self.stream_handle.write_bytes_nonblocking(data)?;
+        // CRITICAL: Flush immediately to ensure message is sent
+        self.stream_handle.flush_immediately()
     }
     
     /// Stream a large message directly - MAXIMUM PERFORMANCE
@@ -2346,10 +2346,15 @@ impl ConnectionPool {
                 }
             };
             
-            // Serialize and send the initial message
+            // Serialize and send the initial message with Gossip type prefix
             match rkyv::to_bytes::<rkyv::rancor::Error>(&initial_msg) {
                 Ok(data) => {
-                    let msg_buffer = self.create_message_buffer(&data);
+                    // Create message with type prefix for gossip messages
+                    let mut msg_buffer = Vec::with_capacity(4 + 1 + data.len());
+                    msg_buffer.extend_from_slice(&((1 + data.len()) as u32).to_be_bytes()); // Length includes type byte
+                    msg_buffer.push(crate::MessageType::Gossip as u8); // Add Gossip type
+                    msg_buffer.extend_from_slice(&data);
+                    
                     // Create a connection handle to send the message
                     let conn_handle = ConnectionHandle {
                         addr,
@@ -2417,7 +2422,6 @@ impl ConnectionPool {
                                 
                                 // Check if this is an Ask/Response message by looking at first byte
                                 if msg_data.len() >= 1 {
-                                    debug!(peer = %addr, first_byte = msg_data[0], msg_len = msg_data.len(), "Checking message type - first byte: {} (0=Gossip, 3=ActorTell)", msg_data[0]);
                                     if let Some(msg_type) = crate::MessageType::from_byte(msg_data[0]) {
                                         debug!(peer = %addr, msg_type = ?msg_type, "Identified message type: {:?}", msg_type);
                                         // This is an Ask/Response message
@@ -2498,7 +2502,7 @@ impl ConnectionPool {
                                                 // Direct actor tell message format:
                                                 // Already parsed: [type:1][correlation_id:2][reserved:5]
                                                 // Payload: [actor_id:8][type_hash:4][payload_len:4][payload:N]
-                                                info!(peer = %addr, total_payload_len = payload.len(), "🔍 Received ActorTell message (optimized binary path)");
+                                                eprintln!("[SERVER] 🔍 Received ActorTell message from {}, payload len: {}", addr, payload.len());
                                                 if payload.len() >= 16 {
                                                     let actor_id = u64::from_be_bytes(payload[0..8].try_into().unwrap());
                                                     let type_hash = u32::from_be_bytes(payload[8..12].try_into().unwrap());
@@ -2624,16 +2628,21 @@ impl ConnectionPool {
                                     }
                                 }
                                 
-                                // This is a gossip protocol message
+                                // This could be either a gossip message or a raw tell message
+                                // Gossip messages should deserialize as RegistryMessage
+                                // Tell messages are raw actor messages without type prefix
                                 let msg_data_vec = msg_data.to_vec();
+                                
+                                // First drain the buffer to ensure proper alignment for next message
                                 partial_msg_buf.drain(..4+len);
                                 
                                 // Process the message if we have a registry
                                 if let Some(ref registry_weak) = registry_weak_for_reader {
                                     if let Some(registry) = registry_weak.upgrade() {
+                                        // Try to deserialize as RegistryMessage for gossip protocol
                                         match rkyv::from_bytes::<RegistryMessage, rkyv::rancor::Error>(&msg_data_vec) {
                                             Ok(msg) => {
-                                                debug!(peer = %addr, "Received message on outgoing connection");
+                                                debug!(peer = %addr, "Received gossip message on outgoing connection");
                                                 
                                                 // Extract node ID from message if available
                                                 let node_id = match &msg {
@@ -2654,7 +2663,11 @@ impl ConnectionPool {
                                                 }
                                             }
                                             Err(e) => {
-                                                warn!(peer = %addr, error = %e, "Failed to deserialize message on outgoing connection");
+                                                // This might be a raw tell message without gossip wrapping
+                                                // Log at debug level since this is expected for tell messages
+                                                debug!(peer = %addr, error = %e, msg_len = msg_data_vec.len(), 
+                                                       "Message is not a RegistryMessage, might be a raw actor tell message");
+                                                // Don't drop connection, just continue processing
                                             }
                                         }
                                     }

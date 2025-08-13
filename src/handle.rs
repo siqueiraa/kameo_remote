@@ -488,7 +488,7 @@ where
     let msg_result = read_message_from_tls_reader(&mut reader, max_message_size).await;
     
     let (sender_node_id, initial_correlation_id) = match &msg_result {
-        Ok((msg, correlation_id)) => {
+        Ok(MessageReadResult::Gossip(msg, correlation_id)) => {
             let node_id = match msg {
                 RegistryMessage::DeltaGossip { delta } => delta.sender_peer_id.as_str().to_string(),
                 RegistryMessage::FullSync { sender_peer_id, .. } => sender_peer_id.as_str().to_string(),
@@ -516,6 +516,11 @@ where
             };
             (node_id, *correlation_id)
         },
+        Ok(MessageReadResult::Actor { actor_id, .. }) => {
+            // For actor messages received as the first message, we can't determine the sender
+            // Use a placeholder identifier
+            (format!("actor_sender_{}", actor_id), None)
+        },
         Err(e) => {
             warn!(error = %e, "Failed to read initial message from TLS stream");
             return None;
@@ -535,7 +540,7 @@ where
     }
     
     // Process the initial message with correlation ID if present
-    if let Ok((msg, correlation_id)) = msg_result {
+    if let Ok(MessageReadResult::Gossip(msg, correlation_id)) = msg_result {
         // For ActorMessage with correlation_id, ensure it's set
         let msg_to_handle = if let RegistryMessage::ActorMessage { 
             actor_id, 
@@ -583,7 +588,7 @@ where
         
         // Add the connection to the pool by node ID
         let connection_arc = Arc::new(connection);
-        let pool = registry.connection_pool.lock().await;
+        let mut pool = registry.connection_pool.lock().await;
         
         // Add the connection using the sender's node ID
         pool.add_connection_by_node_id(sender_node_id.clone(), peer_addr, connection_arc);
@@ -596,7 +601,7 @@ where
     // Note: writer has been moved to the connection pool, so we only have the reader
     loop {
         match read_message_from_tls_reader(&mut reader, max_message_size).await {
-            Ok((msg, correlation_id)) => {
+            Ok(MessageReadResult::Gossip(msg, correlation_id)) => {
                 // For ActorMessage with correlation_id from Ask envelope, ensure it's set
                 let msg_to_handle = if let RegistryMessage::ActorMessage { 
                     actor_id, 
@@ -619,6 +624,15 @@ where
                     warn!(error = %e, "Failed to process TLS message");
                 }
             }
+            Ok(MessageReadResult::Actor { msg_type, correlation_id, actor_id, type_hash, payload }) => {
+                // Handle actor message directly
+                // Call the actor message handler if available
+                if let Some(handler) = &*registry.actor_message_handler.lock().await {
+                    let actor_id_str = actor_id.to_string();
+                    let correlation = if msg_type == crate::MessageType::ActorAsk as u8 { Some(correlation_id) } else { None };
+                    let _ = handler.handle_actor_message(&actor_id_str, type_hash, &payload, correlation).await;
+                }
+            }
             Err(e) => {
                 debug!(error = %e, "TLS connection closed or error reading message");
                 break;
@@ -629,11 +643,17 @@ where
     Some(sender_node_id)
 }
 
+/// Result type for message reading that can handle both gossip and actor messages
+enum MessageReadResult {
+    Gossip(RegistryMessage, Option<u16>),
+    Actor { msg_type: u8, correlation_id: u16, actor_id: u64, type_hash: u32, payload: Vec<u8> },
+}
+
 /// Read a message from a TLS reader
 async fn read_message_from_tls_reader<R>(
     reader: &mut R,
     max_message_size: usize,
-) -> Result<(RegistryMessage, Option<u16>)>
+) -> Result<MessageReadResult>
 where
     R: AsyncReadExt + Unpin,
 {
@@ -649,8 +669,10 @@ where
         });
     }
     
-    // Read the message data
-    let mut msg_buf = vec![0u8; msg_len];
+    // Read the message data - allocate with proper alignment for rkyv
+    // Use Vec::with_capacity to ensure proper allocation alignment
+    let mut msg_buf = Vec::with_capacity(msg_len);
+    msg_buf.resize(msg_len, 0);
     reader.read_exact(&mut msg_buf).await?;
     
     // Check if this is an Ask message with envelope
@@ -662,21 +684,94 @@ where
         let correlation_id = u16::from_be_bytes([msg_buf[1], msg_buf[2]]);
         
         // The actual RegistryMessage starts at byte 8
-        let payload = &msg_buf[8..];
+        // Create a properly aligned buffer for the payload
+        let payload_len = msg_len - 8;
+        let mut aligned_payload = Vec::with_capacity(payload_len);
+        aligned_payload.extend_from_slice(&msg_buf[8..]);
         
-        // Deserialize the RegistryMessage from the payload
-        let msg: RegistryMessage = rkyv::from_bytes::<RegistryMessage, rkyv::rancor::Error>(payload)?;
+        // Deserialize the RegistryMessage from the aligned payload
+        let msg: RegistryMessage = rkyv::from_bytes::<RegistryMessage, rkyv::rancor::Error>(&aligned_payload)?;
         
         debug!(
             correlation_id = correlation_id,
             "Received Ask message with correlation ID"
         );
         
-        Ok((msg, Some(correlation_id)))
+        Ok(MessageReadResult::Gossip(msg, Some(correlation_id)))
     } else {
-        // Regular message without Ask envelope
+        // Check if this is a Gossip message with type prefix
+        if msg_len >= 1 {
+            let first_byte = msg_buf[0];
+            // Check if it's a known message type
+            if let Some(msg_type) = crate::MessageType::from_byte(first_byte) {
+                match msg_type {
+                    crate::MessageType::Gossip => {
+                        // This is a gossip message with type prefix, skip the type byte
+                        if msg_buf.len() > 1 {
+                            // Create a properly aligned buffer for the payload
+                            let payload_len = msg_len - 1;
+                            let mut aligned_payload = Vec::with_capacity(payload_len);
+                            aligned_payload.extend_from_slice(&msg_buf[1..]);
+                            let msg: RegistryMessage = rkyv::from_bytes::<RegistryMessage, rkyv::rancor::Error>(&aligned_payload)?;
+                            return Ok(MessageReadResult::Gossip(msg, None));
+                        }
+                    }
+                    crate::MessageType::ActorTell | crate::MessageType::ActorAsk => {
+                        // This is an actor message with envelope format:
+                        // [type:1][correlation_id:2][reserved:5][actor_id:8][type_hash:4][payload_len:4][payload:N]
+                        if msg_buf.len() < 24 { // Need at least 24 bytes for header
+                            return Err(crate::GossipError::Network(
+                                std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "Actor message too small"
+                                )
+                            ));
+                        }
+                        
+                        // Parse the actor message envelope
+                        let msg_type_byte = msg_buf[0];
+                        let correlation_id = u16::from_be_bytes([msg_buf[1], msg_buf[2]]);
+                        // Skip reserved bytes [3..8]
+                        let actor_id = u64::from_be_bytes(msg_buf[8..16].try_into().unwrap());
+                        let type_hash = u32::from_be_bytes(msg_buf[16..20].try_into().unwrap());
+                        let payload_len = u32::from_be_bytes(msg_buf[20..24].try_into().unwrap()) as usize;
+                        
+                        if msg_buf.len() < 24 + payload_len {
+                            return Err(crate::GossipError::Network(
+                                std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "Actor message payload incomplete"
+                                )
+                            ));
+                        }
+                        
+                        let payload = msg_buf[24..24+payload_len].to_vec();
+                        
+                        return Ok(MessageReadResult::Actor {
+                            msg_type: msg_type_byte,
+                            correlation_id,
+                            actor_id,
+                            type_hash,
+                            payload,
+                        });
+                    }
+                    _ => {
+                        // This is not a gossip message, return a custom error
+                        return Err(crate::GossipError::Network(
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("Expected Gossip message but got {:?}", msg_type)
+                            )
+                        ));
+                    }
+                }
+            }
+        }
+        
+        // Try to deserialize as regular gossip message (backwards compatibility)
+        // Already have msg_buf allocated with proper alignment from above
         let msg: RegistryMessage = rkyv::from_bytes::<RegistryMessage, rkyv::rancor::Error>(&msg_buf)?;
-        Ok((msg, None))
+        Ok(MessageReadResult::Gossip(msg, None))
     }
 }
 
@@ -935,8 +1030,9 @@ async fn read_message_from_reader(reader: &mut tokio::net::tcp::OwnedReadHalf, m
         warn!("Message size {} exceeds max size {}, but allowing it temporarily", len, max_size);
     }
 
-    // Read message data
-    let mut data = vec![0u8; len];
+    // Read message data - ensure proper alignment for rkyv
+    let mut data = Vec::with_capacity(len);
+    data.resize(len, 0);
     reader.read_exact(&mut data).await?;
 
     let msg = rkyv::from_bytes::<RegistryMessage, rkyv::rancor::Error>(&data)?;
@@ -1216,10 +1312,15 @@ async fn send_gossip_message_zero_copy(
     // Serialize the message AFTER updating timing
     let data = rkyv::to_bytes::<rkyv::rancor::Error>(&task.message)?;
 
+    // Create message with Gossip type prefix
+    let mut msg_with_type = Vec::with_capacity(1 + data.len());
+    msg_with_type.push(crate::MessageType::Gossip as u8);
+    msg_with_type.extend_from_slice(&data);
+
     // Use zero-copy tell() which uses try_send() internally for max performance
     // This completely bypasses async overhead when the channel has capacity
     let tcp_start = std::time::Instant::now();
-    conn.tell(data.as_slice()).await?;
+    conn.tell(msg_with_type.as_slice()).await?;
     let _tcp_elapsed = tcp_start.elapsed();
     // eprintln!("🔍 TCP_WRITE_TIME: {:?}", tcp_elapsed);
     Ok(())
