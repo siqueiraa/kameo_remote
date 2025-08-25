@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration, collections::{HashMap, BTreeMap}};
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -6,12 +6,113 @@ use tokio::{
     time::{interval, Instant},
 };
 use tracing::{debug, error, info, instrument, warn};
+use bytes::{Bytes, BytesMut, BufMut};
 
 use crate::{
     connection_pool::{handle_incoming_message, ChannelId, ConnectionState, LockFreeConnection, LockFreeStreamHandle},
     registry::{GossipRegistry, GossipResult, GossipTask, RegistryMessage, RegistryStats},
     RemoteActorLocation, GossipConfig, GossipError, RegistrationPriority, Result,
 };
+
+/// Per-connection streaming state for managing partial streams
+#[derive(Debug)]
+struct StreamingState {
+    active_streams: HashMap<u64, InProgressStream>,
+    max_concurrent_streams: usize,
+}
+
+/// A stream that is currently being assembled
+#[derive(Debug)]
+struct InProgressStream {
+    stream_id: u64,
+    total_size: u64,
+    type_hash: u32,
+    actor_id: u64,
+    chunks: BTreeMap<u32, Bytes>, // chunk_index -> chunk_data
+    received_size: usize,
+    expected_chunks: Option<u32>,
+}
+
+impl StreamingState {
+    fn new() -> Self {
+        Self {
+            active_streams: HashMap::new(),
+            max_concurrent_streams: 16, // Reasonable limit
+        }
+    }
+    
+    fn start_stream(&mut self, header: crate::StreamHeader) -> Result<()> {
+        if self.active_streams.len() >= self.max_concurrent_streams {
+            return Err(GossipError::Network(
+                std::io::Error::new(
+                    std::io::ErrorKind::ResourceBusy,
+                    "Too many concurrent streams"
+                )
+            ));
+        }
+        
+        let stream = InProgressStream {
+            stream_id: header.stream_id,
+            total_size: header.total_size,
+            type_hash: header.type_hash,
+            actor_id: header.actor_id,
+            chunks: BTreeMap::new(),
+            received_size: 0,
+            expected_chunks: None,
+        };
+        
+        self.active_streams.insert(header.stream_id, stream);
+        Ok(())
+    }
+    
+    fn add_chunk(&mut self, header: crate::StreamHeader, chunk_data: Vec<u8>) -> Result<Option<Vec<u8>>> {
+        let stream = self.active_streams.get_mut(&header.stream_id)
+            .ok_or_else(|| GossipError::Network(
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Received chunk for unknown stream_id={}", header.stream_id)
+                )
+            ))?;
+        
+        // Store chunk
+        let chunk_bytes = Bytes::from(chunk_data);
+        stream.received_size += chunk_bytes.len();
+        stream.chunks.insert(header.chunk_index, chunk_bytes);
+        
+        // Check if we have all chunks (when total matches expected size)
+        if stream.received_size >= stream.total_size as usize {
+            self.assemble_complete_message(header.stream_id)
+        } else {
+            Ok(None)
+        }
+    }
+    
+    fn finalize_stream(&mut self, stream_id: u64) -> Result<Option<Vec<u8>>> {
+        // StreamEnd received - assemble the message
+        self.assemble_complete_message(stream_id)
+    }
+    
+    fn assemble_complete_message(&mut self, stream_id: u64) -> Result<Option<Vec<u8>>> {
+        let stream = self.active_streams.remove(&stream_id)
+            .ok_or_else(|| GossipError::Network(
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Cannot finalize unknown stream_id={}", stream_id)
+                )
+            ))?;
+        
+        // Assemble chunks in order
+        let mut complete_data = BytesMut::with_capacity(stream.total_size as usize);
+        for (chunk_index, chunk_data) in stream.chunks {
+            complete_data.put_slice(&chunk_data);
+        }
+        
+        info!("✅ STREAMING: Assembled complete message for stream_id={} ({} bytes for actor={})", 
+              stream_id, complete_data.len(), stream.actor_id);
+        
+        Ok(Some(complete_data.to_vec()))
+    }
+}
 
 /// Main API for the gossip registry with vector clocks and separated locks
 pub struct GossipRegistryHandle {
@@ -494,6 +595,9 @@ where
 {
     let max_message_size = registry.config.max_message_size;
     
+    // Initialize streaming state for this connection
+    let mut streaming_state = StreamingState::new();
+    
     // First, read the initial message to identify the sender
     let msg_result = read_message_from_tls_reader(&mut reader, max_message_size).await;
     
@@ -531,6 +635,10 @@ where
             // Use a placeholder identifier
             (format!("actor_sender_{}", actor_id), None)
         },
+        Ok(MessageReadResult::Streaming { stream_header, .. }) => {
+            // For streaming messages received as the first message, use the actor ID
+            (format!("stream_sender_{}", stream_header.actor_id), None)
+        },
         Err(e) => {
             warn!(error = %e, "Failed to read initial message from TLS stream");
             return None;
@@ -550,7 +658,8 @@ where
     }
     
     // Process the initial message with correlation ID if present
-    if let Ok(MessageReadResult::Gossip(msg, correlation_id)) = msg_result {
+    match msg_result {
+        Ok(MessageReadResult::Gossip(msg, correlation_id)) => {
         // For ActorMessage with correlation_id, ensure it's set
         let msg_to_handle = if let RegistryMessage::ActorMessage { 
             actor_id, 
@@ -569,8 +678,47 @@ where
             msg
         };
         
-        if let Err(e) = handle_incoming_message(registry.clone(), peer_addr, msg_to_handle).await {
-            warn!(error = %e, "Failed to process initial TLS message");
+            if let Err(e) = handle_incoming_message(registry.clone(), peer_addr, msg_to_handle).await {
+                warn!(error = %e, "Failed to process initial TLS message");
+            }
+        },
+        Ok(MessageReadResult::Actor { msg_type, correlation_id, actor_id, type_hash, payload }) => {
+            // Handle initial actor message directly
+            if let Some(handler) = &*registry.actor_message_handler.lock().await {
+                let actor_id_str = actor_id.to_string();
+                let correlation = if msg_type == crate::MessageType::ActorAsk as u8 { Some(correlation_id) } else { None };
+                let _ = handler.handle_actor_message(&actor_id_str, type_hash, &payload, correlation).await;
+            }
+        },
+        Ok(MessageReadResult::Streaming { msg_type, stream_header, chunk_data }) => {
+            // Handle initial streaming message
+            match msg_type {
+                msg_type if msg_type == crate::MessageType::StreamStart as u8 => {
+                    if let Err(e) = streaming_state.start_stream(stream_header) {
+                        warn!(error = %e, "Failed to start streaming for stream_id={}", stream_header.stream_id);
+                    }
+                },
+                msg_type if msg_type == crate::MessageType::StreamData as u8 => {
+                    // Data chunk - this should not be the first message typically, but handle it
+                    if let Err(e) = streaming_state.start_stream(stream_header) {
+                        debug!(error = %e, "Auto-starting stream for data chunk: stream_id={}", stream_header.stream_id);
+                    }
+                    if let Ok(Some(complete_data)) = streaming_state.add_chunk(stream_header, chunk_data) {
+                        // Complete message assembled - route to actor
+                        if let Some(handler) = &*registry.actor_message_handler.lock().await {
+                            let actor_id_str = stream_header.actor_id.to_string();
+                            let _ = handler.handle_actor_message(&actor_id_str, stream_header.type_hash, &complete_data, None).await;
+                        }
+                    }
+                },
+                _ => {
+                    warn!("Unexpected streaming message type as initial message: 0x{:02x}", msg_type);
+                }
+            }
+        },
+        Err(e) => {
+            warn!(error = %e, "Failed to read initial message - connection will be closed");
+            return None;
         }
     }
     
@@ -643,6 +791,37 @@ where
                     let _ = handler.handle_actor_message(&actor_id_str, type_hash, &payload, correlation).await;
                 }
             }
+            Ok(MessageReadResult::Streaming { msg_type, stream_header, chunk_data }) => {
+                // Handle streaming messages
+                match msg_type {
+                    msg_type if msg_type == crate::MessageType::StreamStart as u8 => {
+                        if let Err(e) = streaming_state.start_stream(stream_header) {
+                            warn!(error = %e, "Failed to start streaming for stream_id={}", stream_header.stream_id);
+                        }
+                    },
+                    msg_type if msg_type == crate::MessageType::StreamData as u8 => {
+                        if let Ok(Some(complete_data)) = streaming_state.add_chunk(stream_header, chunk_data) {
+                            // Complete message assembled - route to actor
+                            if let Some(handler) = &*registry.actor_message_handler.lock().await {
+                                let actor_id_str = stream_header.actor_id.to_string();
+                                let _ = handler.handle_actor_message(&actor_id_str, stream_header.type_hash, &complete_data, None).await;
+                            }
+                        }
+                    },
+                    msg_type if msg_type == crate::MessageType::StreamEnd as u8 => {
+                        if let Ok(Some(complete_data)) = streaming_state.finalize_stream(stream_header.stream_id) {
+                            // Complete message assembled - route to actor
+                            if let Some(handler) = &*registry.actor_message_handler.lock().await {
+                                let actor_id_str = stream_header.actor_id.to_string();
+                                let _ = handler.handle_actor_message(&actor_id_str, stream_header.type_hash, &complete_data, None).await;
+                            }
+                        }
+                    },
+                    _ => {
+                        warn!("Unknown streaming message type: 0x{:02x}", msg_type);
+                    }
+                }
+            }
             Err(e) => {
                 debug!(error = %e, "TLS connection closed or error reading message");
                 break;
@@ -653,10 +832,11 @@ where
     Some(sender_node_id)
 }
 
-/// Result type for message reading that can handle both gossip and actor messages
+/// Result type for message reading that can handle gossip, actor, and streaming messages
 enum MessageReadResult {
     Gossip(RegistryMessage, Option<u16>),
     Actor { msg_type: u8, correlation_id: u16, actor_id: u64, type_hash: u32, payload: Vec<u8> },
+    Streaming { msg_type: u8, stream_header: crate::StreamHeader, chunk_data: Vec<u8> },
 }
 
 /// Read a message from a TLS reader
@@ -765,12 +945,47 @@ where
                             payload,
                         });
                     }
+                    crate::MessageType::StreamStart | crate::MessageType::StreamData | crate::MessageType::StreamEnd => {
+                        // Handle streaming messages
+                        // Message format: [type:1][correlation_id:2][reserved:5][stream_header:36][chunk_data:N]
+                        if msg_buf.len() < 8 + crate::StreamHeader::SERIALIZED_SIZE {
+                            return Err(crate::GossipError::Network(
+                                std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "Streaming message header incomplete"
+                                )
+                            ));
+                        }
+                        
+                        // Parse the stream header (36 bytes starting at offset 8)
+                        let header_bytes = &msg_buf[8..8 + crate::StreamHeader::SERIALIZED_SIZE];
+                        let stream_header = crate::StreamHeader::from_bytes(header_bytes)
+                            .ok_or_else(|| crate::GossipError::Network(
+                                std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "Invalid stream header"
+                                )
+                            ))?;
+                        
+                        // Extract chunk data (everything after the header)
+                        let chunk_data = if msg_buf.len() > 8 + crate::StreamHeader::SERIALIZED_SIZE {
+                            msg_buf[8 + crate::StreamHeader::SERIALIZED_SIZE..].to_vec()
+                        } else {
+                            Vec::new()
+                        };
+                        
+                        return Ok(MessageReadResult::Streaming {
+                            msg_type: first_byte,
+                            stream_header,
+                            chunk_data,
+                        });
+                    }
                     _ => {
-                        // This is not a gossip message, return a custom error
+                        // This is not a recognized message type, return a custom error
                         return Err(crate::GossipError::Network(
                             std::io::Error::new(
                                 std::io::ErrorKind::InvalidData,
-                                format!("Expected Gossip message but got {:?}", msg_type)
+                                format!("Unknown message type: 0x{:02x}", first_byte)
                             )
                         ));
                     }

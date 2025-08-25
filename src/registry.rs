@@ -255,6 +255,26 @@ pub struct StreamAssembly {
     pub received_bytes: usize,
 }
 
+impl StreamAssembly {
+    /// Check if the stream assembly is complete (all chunks received with no gaps)
+    pub fn is_complete(&self) -> bool {
+        let expected_chunks = (self.header.total_size + crate::connection_pool::STREAM_CHUNK_SIZE as u64 - 1) / crate::connection_pool::STREAM_CHUNK_SIZE as u64;
+        
+        if self.chunks.len() as u64 != expected_chunks {
+            return false;
+        }
+        
+        // Verify all indices 0..N-1 are present (no gaps)
+        for i in 0..expected_chunks as u32 {
+            if !self.chunks.contains_key(&i) {
+                return false;
+            }
+        }
+        
+        true
+    }
+}
+
 impl GossipRegistry {
     /// Create a new gossip registry
     pub fn new(bind_addr: SocketAddr, config: GossipConfig) -> Self {
@@ -2814,22 +2834,48 @@ impl GossipRegistry {
     pub async fn complete_stream_assembly(&self, stream_id: u64) -> Option<Vec<u8>> {
         let mut assemblies = self.stream_assemblies.lock().await;
         if let Some(assembly) = assemblies.remove(&stream_id) {
-            // Verify we have all chunks
+            // Verify we have all chunks with proper gap detection
             let expected_chunks = (assembly.header.total_size + crate::connection_pool::STREAM_CHUNK_SIZE as u64 - 1) / crate::connection_pool::STREAM_CHUNK_SIZE as u64;
+            
+            // ✅ PROPER: Check both count and verify all chunk indices are present
             if assembly.chunks.len() as u64 != expected_chunks {
                 warn!(
                     stream_id = stream_id,
                     expected = expected_chunks,
                     received = assembly.chunks.len(),
-                    "Incomplete stream assembly"
+                    "Incomplete stream assembly - wrong count"
                 );
                 return None;
             }
             
-            // Reassemble complete message
+            // ✅ PROPER: Verify all indices 0..N-1 are present (no gaps)
+            for i in 0..expected_chunks as u32 {
+                if !assembly.chunks.contains_key(&i) {
+                    warn!(
+                        stream_id = stream_id,
+                        expected_chunks = expected_chunks,
+                        missing_chunk = i,
+                        received_chunks = ?assembly.chunks.keys().collect::<Vec<_>>(),
+                        "Incomplete stream assembly - missing chunk index"
+                    );
+                    return None;
+                }
+            }
+            
+            // ✅ PROPER: Reassemble in correct order using chunk indices
             let mut complete = Vec::with_capacity(assembly.header.total_size as usize);
-            for (_, chunk) in assembly.chunks {
-                complete.extend_from_slice(&chunk);
+            for i in 0..expected_chunks as u32 {
+                if let Some(chunk) = assembly.chunks.get(&i) {
+                    complete.extend_from_slice(chunk);
+                } else {
+                    // This should never happen due to the gap check above
+                    error!(
+                        stream_id = stream_id,
+                        chunk_index = i,
+                        "Critical error: chunk missing during assembly after gap check"
+                    );
+                    return None;
+                }
             }
             
             info!(

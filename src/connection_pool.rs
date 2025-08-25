@@ -755,8 +755,6 @@ impl LockFreeStreamHandle {
         };
         
         let start_msg = serialize_stream_message(MessageType::StreamStart, &start_header);
-        info!("📤 STREAMING: Sending StreamStart for {} MB message, stream_id={}", 
-              msg.len() as f64 / 1_048_576.0, stream_id);
         self.streaming_tx.send(StreamingCommand::WriteBytes(start_msg.into()))
             .map_err(|_| GossipError::Shutdown)?;
         
@@ -801,7 +799,6 @@ impl LockFreeStreamHandle {
         
         // Send StreamEnd
         let end_msg = serialize_stream_message(MessageType::StreamEnd, &start_header);
-        info!("📤 STREAMING: Sending StreamEnd for stream_id={}", stream_id);
         self.streaming_tx.send(StreamingCommand::WriteBytes(end_msg.into()))
             .map_err(|_| GossipError::Shutdown)?;
         self.streaming_tx.send(StreamingCommand::Flush)
