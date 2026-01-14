@@ -135,7 +135,7 @@ async fn test_ask_with_lookup_and_performance() {
     // Lookup actors and create connections
     let db_location = node1.lookup("database_service").await.unwrap();
     let db_conn = node1
-        .get_connection(match db_location.peer_id.as_str() {
+        .get_connection(match db_location.peer_id.as_str().as_str() {
             "node1" => "127.0.0.1:30001".parse().unwrap(),
             "node2" => "127.0.0.1:30002".parse().unwrap(),
             "node3" => "127.0.0.1:30003".parse().unwrap(),
@@ -146,7 +146,7 @@ async fn test_ask_with_lookup_and_performance() {
 
     let compute_location = node1.lookup("compute_service").await.unwrap();
     let compute_conn = node1
-        .get_connection(match compute_location.peer_id.as_str() {
+        .get_connection(match compute_location.peer_id.as_str().as_str() {
             "node1" => "127.0.0.1:30001".parse().unwrap(),
             "node2" => "127.0.0.1:30002".parse().unwrap(),
             "node3" => "127.0.0.1:30003".parse().unwrap(),
@@ -157,7 +157,7 @@ async fn test_ask_with_lookup_and_performance() {
 
     let cache_location = node1.lookup("cache_service").await.unwrap();
     let cache_conn = node1
-        .get_connection(match cache_location.peer_id.as_str() {
+        .get_connection(match cache_location.peer_id.as_str().as_str() {
             "node1" => "127.0.0.1:30001".parse().unwrap(),
             "node2" => "127.0.0.1:30002".parse().unwrap(),
             "node3" => "127.0.0.1:30003".parse().unwrap(),

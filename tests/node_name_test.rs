@@ -1,4 +1,4 @@
-use kameo_remote::{GossipConfig, GossipRegistryHandle, KeyPair, PeerId};
+use kameo_remote::{GossipConfig, GossipRegistryHandle, PeerId, SecretKey};
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -9,23 +9,22 @@ async fn test_node_name_based_connections() {
         .with_env_filter("kameo_remote=debug")
         .try_init();
 
-    // Create configs with key pairs
+    // Create configs
     let config_a = GossipConfig {
-        key_pair: Some(KeyPair::new_for_testing("test_node_a")),
         gossip_interval: Duration::from_secs(5),
         ..Default::default()
     };
 
     let config_b = GossipConfig {
-        key_pair: Some(KeyPair::new_for_testing("test_node_b")),
         gossip_interval: Duration::from_secs(5),
         ..Default::default()
     };
 
-    // Start Node A first
-    let node_a = GossipRegistryHandle::new(
+    // Start Node A first with TLS
+    let secret_a = SecretKey::generate();
+    let node_a = GossipRegistryHandle::new_with_tls(
         "127.0.0.1:0".parse().unwrap(), // Use port 0 for dynamic allocation
-        vec![],
+        secret_a,
         Some(config_a),
     )
     .await
@@ -34,8 +33,9 @@ async fn test_node_name_based_connections() {
     let node_a_addr = node_a.registry.bind_addr;
     println!("Node A started at {}", node_a_addr);
 
-    // Start Node B
-    let node_b = GossipRegistryHandle::new("127.0.0.1:0".parse().unwrap(), vec![], Some(config_b))
+    // Start Node B with TLS
+    let secret_b = SecretKey::generate();
+    let node_b = GossipRegistryHandle::new_with_tls("127.0.0.1:0".parse().unwrap(), secret_b, Some(config_b))
         .await
         .expect("Failed to create node B");
 
@@ -64,10 +64,10 @@ async fn test_node_name_based_connections() {
         let pool = node_b.registry.connection_pool.lock().await;
         println!("Node B pool state:");
         println!("  Total connections: {}", pool.connection_count());
-        println!("  Node mappings: {}", pool.node_id_to_addr.len());
+        println!("  Node mappings: {}", pool.peer_id_to_addr.len());
 
         // Verify Node B knows about Node A
-        assert!(pool.node_id_to_addr.contains_key("test_node_a"));
+        assert!(pool.peer_id_to_addr.contains_key(&PeerId::new("test_node_a")));
         assert_eq!(pool.connection_count(), 1);
     }
 
@@ -76,10 +76,10 @@ async fn test_node_name_based_connections() {
         let pool = node_a.registry.connection_pool.lock().await;
         println!("Node A pool state:");
         println!("  Total connections: {}", pool.connection_count());
-        println!("  Node mappings: {}", pool.node_id_to_addr.len());
+        println!("  Node mappings: {}", pool.peer_id_to_addr.len());
 
         // After exchange, Node A should know about Node B
-        assert!(pool.node_id_to_addr.contains_key("test_node_b"));
+        assert!(pool.peer_id_to_addr.contains_key(&PeerId::new("test_node_b")));
     }
 
     // Clean shutdown

@@ -167,7 +167,7 @@ async fn test_tell_with_lookup_and_performance_comparison() {
         .await
         .expect("chat_service not found");
     let chat_conn = node1
-        .get_connection(match chat_location.peer_id.as_str() {
+        .get_connection(match chat_location.peer_id.as_str().as_str() {
             "node1" => "127.0.0.1:29001".parse().unwrap(),
             "node2" => "127.0.0.1:29002".parse().unwrap(),
             "node3" => "127.0.0.1:29003".parse().unwrap(),
@@ -181,7 +181,7 @@ async fn test_tell_with_lookup_and_performance_comparison() {
         .await
         .expect("auth_service not found");
     let auth_conn = node1
-        .get_connection(match auth_location.peer_id.as_str() {
+        .get_connection(match auth_location.peer_id.as_str().as_str() {
             "node1" => "127.0.0.1:29001".parse().unwrap(),
             "node2" => "127.0.0.1:29002".parse().unwrap(),
             "node3" => "127.0.0.1:29003".parse().unwrap(),
@@ -195,7 +195,7 @@ async fn test_tell_with_lookup_and_performance_comparison() {
         .await
         .expect("storage_service not found");
     let storage_conn = node1
-        .get_connection(match storage_location.peer_id.as_str() {
+        .get_connection(match storage_location.peer_id.as_str().as_str() {
             "node1" => "127.0.0.1:29001".parse().unwrap(),
             "node2" => "127.0.0.1:29002".parse().unwrap(),
             "node3" => "127.0.0.1:29003".parse().unwrap(),

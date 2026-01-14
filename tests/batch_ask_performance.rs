@@ -107,7 +107,6 @@ async fn test_batch_ask_performance() -> Result<()> {
                     for (i, receiver) in receivers.into_iter().enumerate() {
                         match receiver.await {
                             Ok(response) => {
-                                all_responses.push(response);
                                 // Verify response is i+1
                                 if response.len() >= 4 {
                                     let value = u32::from_be_bytes([
@@ -124,6 +123,7 @@ async fn test_batch_ask_performance() -> Result<()> {
                                         );
                                     }
                                 }
+                                all_responses.push(response);
                             }
                             Err(e) => error!("Response {} failed: {:?}", batch_start + i, e),
                         }

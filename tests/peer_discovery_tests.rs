@@ -3,10 +3,22 @@
 //! Multi-node test scenarios for gossip-based peer discovery.
 //! These tests verify the peer discovery functionality implemented in Phases 1-5.
 
-use kameo_remote::{GossipConfig, GossipRegistryHandle};
+use kameo_remote::{GossipConfig, GossipRegistryHandle, SecretKey};
 use std::net::SocketAddr;
+use std::sync::Once;
 use std::time::Duration;
 use tokio::time::sleep;
+
+/// Initialize crypto provider once for all tests
+static CRYPTO_INIT: Once = Once::new();
+
+fn init_crypto() {
+    CRYPTO_INIT.call_once(|| {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .expect("Failed to install crypto provider");
+    });
+}
 
 /// Test helper: Create a GossipConfig with peer discovery enabled
 fn peer_discovery_config() -> GossipConfig {
@@ -20,6 +32,17 @@ fn peer_discovery_config() -> GossipConfig {
     config
 }
 
+/// Test helper: Create a TLS-enabled node
+async fn create_tls_node(
+    config: GossipConfig,
+) -> Result<GossipRegistryHandle, Box<dyn std::error::Error>> {
+    init_crypto();
+    let secret_key = SecretKey::generate();
+    let node = GossipRegistryHandle::new_with_tls("127.0.0.1:0".parse()?, secret_key, Some(config))
+        .await?;
+    Ok(node)
+}
+
 /// Scenario 1: Bootstrap mesh formation
 /// A, B, C connect via bootstrap - all should have 2 connections within 2 gossip intervals
 #[tokio::test]
@@ -28,17 +51,17 @@ async fn test_mesh_formation_3_nodes() -> Result<(), Box<dyn std::error::Error>>
 
     // Node A (bootstrap node)
     let node_a =
-        GossipRegistryHandle::new("127.0.0.1:0".parse()?, vec![], Some(config.clone())).await?;
+        create_tls_node(config.clone()).await?;
     let addr_a = node_a.registry.bind_addr;
 
     // Node B - creates without seeds, then bootstraps
     let node_b =
-        GossipRegistryHandle::new("127.0.0.1:0".parse()?, vec![], Some(config.clone())).await?;
+        create_tls_node(config.clone()).await?;
     let addr_b = node_b.registry.bind_addr;
 
     // Node C - creates without seeds, then bootstraps
     let node_c =
-        GossipRegistryHandle::new("127.0.0.1:0".parse()?, vec![], Some(config.clone())).await?;
+        create_tls_node(config.clone()).await?;
     let addr_c = node_c.registry.bind_addr;
 
     // Add peers manually to track them
@@ -92,12 +115,12 @@ async fn test_local_connection_wins() -> Result<(), Box<dyn std::error::Error>> 
 
     // Node A
     let node_a =
-        GossipRegistryHandle::new("127.0.0.1:0".parse()?, vec![], Some(config.clone())).await?;
+        create_tls_node(config.clone()).await?;
     let addr_a = node_a.registry.bind_addr;
 
     // Node B
     let node_b =
-        GossipRegistryHandle::new("127.0.0.1:0".parse()?, vec![], Some(config.clone())).await?;
+        create_tls_node(config.clone()).await?;
     let addr_b = node_b.registry.bind_addr;
 
     // Add peers and bootstrap
@@ -141,12 +164,12 @@ async fn test_feature_flag_disabled_legacy_behavior() -> Result<(), Box<dyn std:
 
     // Node A
     let node_a =
-        GossipRegistryHandle::new("127.0.0.1:0".parse()?, vec![], Some(config.clone())).await?;
+        create_tls_node(config.clone()).await?;
     let addr_a = node_a.registry.bind_addr;
 
     // Node B connects to A
     let node_b =
-        GossipRegistryHandle::new("127.0.0.1:0".parse()?, vec![], Some(config.clone())).await?;
+        create_tls_node(config.clone()).await?;
     let addr_b = node_b.registry.bind_addr;
 
     // Add peers and bootstrap
@@ -188,7 +211,7 @@ async fn test_stale_peer_eviction_ttl() -> Result<(), Box<dyn std::error::Error>
 
     // Node A
     let node_a =
-        GossipRegistryHandle::new("127.0.0.1:0".parse()?, vec![], Some(config.clone())).await?;
+        create_tls_node(config.clone()).await?;
 
     // Manually add a peer that will become stale (simulating discovery)
     let fake_peer_addr: SocketAddr = "127.0.0.1:59999".parse()?;
@@ -219,7 +242,7 @@ async fn test_connect_on_demand_soft_cap() -> Result<(), Box<dyn std::error::Err
 
     // Node A (hub)
     let node_a =
-        GossipRegistryHandle::new("127.0.0.1:0".parse()?, vec![], Some(config.clone())).await?;
+        create_tls_node(config.clone()).await?;
     let addr_a = node_a.registry.bind_addr;
 
     // Nodes B, C, D all connect to A
@@ -228,7 +251,7 @@ async fn test_connect_on_demand_soft_cap() -> Result<(), Box<dyn std::error::Err
 
     for _ in 0..3 {
         let node =
-            GossipRegistryHandle::new("127.0.0.1:0".parse()?, vec![], Some(config.clone())).await?;
+            create_tls_node(config.clone()).await?;
         let addr = node.registry.bind_addr;
 
         // Add peer tracking both ways
@@ -270,12 +293,12 @@ async fn test_known_peers_no_amnesia() -> Result<(), Box<dyn std::error::Error>>
 
     // Node A
     let node_a =
-        GossipRegistryHandle::new("127.0.0.1:0".parse()?, vec![], Some(config.clone())).await?;
+        create_tls_node(config.clone()).await?;
     let addr_a = node_a.registry.bind_addr;
 
     // Node B connects to A
     let node_b =
-        GossipRegistryHandle::new("127.0.0.1:0".parse()?, vec![], Some(config.clone())).await?;
+        create_tls_node(config.clone()).await?;
     let addr_b = node_b.registry.bind_addr;
 
     // Add peers and bootstrap
@@ -328,12 +351,12 @@ async fn test_peer_discovery_metrics() -> Result<(), Box<dyn std::error::Error>>
 
     // Node A
     let node_a =
-        GossipRegistryHandle::new("127.0.0.1:0".parse()?, vec![], Some(config.clone())).await?;
+        create_tls_node(config.clone()).await?;
     let addr_a = node_a.registry.bind_addr;
 
     // Node B connects to A
     let node_b =
-        GossipRegistryHandle::new("127.0.0.1:0".parse()?, vec![], Some(config.clone())).await?;
+        create_tls_node(config.clone()).await?;
     let addr_b = node_b.registry.bind_addr;
 
     // Add peers and bootstrap
@@ -373,16 +396,16 @@ async fn test_failure_recovery_backoff() -> Result<(), Box<dyn std::error::Error
 
     // Create hub node A
     let node_a =
-        GossipRegistryHandle::new("127.0.0.1:0".parse()?, vec![], Some(config.clone())).await?;
+        create_tls_node(config.clone()).await?;
     let addr_a = node_a.registry.bind_addr;
 
     // Create nodes B, C that connect to A
     let node_b =
-        GossipRegistryHandle::new("127.0.0.1:0".parse()?, vec![], Some(config.clone())).await?;
+        create_tls_node(config.clone()).await?;
     let addr_b = node_b.registry.bind_addr;
 
     let node_c =
-        GossipRegistryHandle::new("127.0.0.1:0".parse()?, vec![], Some(config.clone())).await?;
+        create_tls_node(config.clone()).await?;
     let addr_c = node_c.registry.bind_addr;
 
     // Setup mesh
@@ -426,12 +449,12 @@ async fn test_simultaneous_dial_tiebreaker() -> Result<(), Box<dyn std::error::E
 
     // Node A
     let node_a =
-        GossipRegistryHandle::new("127.0.0.1:0".parse()?, vec![], Some(config.clone())).await?;
+        create_tls_node(config.clone()).await?;
     let addr_a = node_a.registry.bind_addr;
 
     // Node B
     let node_b =
-        GossipRegistryHandle::new("127.0.0.1:0".parse()?, vec![], Some(config.clone())).await?;
+        create_tls_node(config.clone()).await?;
     let addr_b = node_b.registry.bind_addr;
 
     // Both nodes configured to connect to each other (mutual dial)
@@ -473,7 +496,7 @@ async fn test_advertised_address_routing() -> Result<(), Box<dyn std::error::Err
 
     // Node A binds to any address
     let node_a =
-        GossipRegistryHandle::new("127.0.0.1:0".parse()?, vec![], Some(config.clone())).await?;
+        create_tls_node(config.clone()).await?;
     let addr_a = node_a.registry.bind_addr;
 
     // Set advertise_address to the actual bound address
@@ -481,7 +504,7 @@ async fn test_advertised_address_routing() -> Result<(), Box<dyn std::error::Err
 
     // Node B should be able to connect using advertised address
     let node_b =
-        GossipRegistryHandle::new("127.0.0.1:0".parse()?, vec![], Some(config.clone())).await?;
+        create_tls_node(config.clone()).await?;
 
     // Add peer and bootstrap
     node_b.registry.add_peer(addr_a).await;
@@ -514,7 +537,7 @@ async fn test_ssrf_bogon_filtering() -> Result<(), Box<dyn std::error::Error>> {
 
     // Node A with bogon filtering enabled
     let node_a =
-        GossipRegistryHandle::new("127.0.0.1:0".parse()?, vec![], Some(config.clone())).await?;
+        create_tls_node(config.clone()).await?;
 
     // Try to add a loopback peer (should be filtered in discovery)
     let loopback_addr: SocketAddr = "127.0.0.1:22".parse()?;
@@ -536,6 +559,7 @@ async fn test_ssrf_bogon_filtering() -> Result<(), Box<dyn std::error::Error>> {
 /// A (v2) connects to B (v1) - should not send PeerListGossip
 #[tokio::test]
 async fn test_version_negotiation_legacy() -> Result<(), Box<dyn std::error::Error>> {
+    init_crypto();
     // Node A with peer discovery enabled (v2)
     let mut config_v2 = peer_discovery_config();
     config_v2.enable_peer_discovery = true;
@@ -545,10 +569,12 @@ async fn test_version_negotiation_legacy() -> Result<(), Box<dyn std::error::Err
     config_v1.enable_peer_discovery = false;
     config_v1.gossip_interval = Duration::from_millis(200);
 
-    let node_a = GossipRegistryHandle::new("127.0.0.1:0".parse()?, vec![], Some(config_v2)).await?;
+    let secret_a = SecretKey::generate();
+    let node_a = GossipRegistryHandle::new_with_tls("127.0.0.1:0".parse()?, secret_a, Some(config_v2)).await?;
     let addr_a = node_a.registry.bind_addr;
 
-    let node_b = GossipRegistryHandle::new("127.0.0.1:0".parse()?, vec![], Some(config_v1)).await?;
+    let secret_b = SecretKey::generate();
+    let node_b = GossipRegistryHandle::new_with_tls("127.0.0.1:0".parse()?, secret_b, Some(config_v1)).await?;
     let addr_b = node_b.registry.bind_addr;
 
     // Connect them
@@ -581,19 +607,19 @@ async fn test_partition_heal_behavior() -> Result<(), Box<dyn std::error::Error>
 
     // Create 4 nodes
     let node_a =
-        GossipRegistryHandle::new("127.0.0.1:0".parse()?, vec![], Some(config.clone())).await?;
+        create_tls_node(config.clone()).await?;
     let addr_a = node_a.registry.bind_addr;
 
     let node_b =
-        GossipRegistryHandle::new("127.0.0.1:0".parse()?, vec![], Some(config.clone())).await?;
+        create_tls_node(config.clone()).await?;
     let addr_b = node_b.registry.bind_addr;
 
     let node_c =
-        GossipRegistryHandle::new("127.0.0.1:0".parse()?, vec![], Some(config.clone())).await?;
+        create_tls_node(config.clone()).await?;
     let addr_c = node_c.registry.bind_addr;
 
     let node_d =
-        GossipRegistryHandle::new("127.0.0.1:0".parse()?, vec![], Some(config.clone())).await?;
+        create_tls_node(config.clone()).await?;
     let addr_d = node_d.registry.bind_addr;
 
     // Create initial mesh: A-B and C-D (two partitions)
@@ -640,11 +666,11 @@ async fn test_identity_tls_verification() -> Result<(), Box<dyn std::error::Erro
 
     // Create two nodes
     let node_a =
-        GossipRegistryHandle::new("127.0.0.1:0".parse()?, vec![], Some(config.clone())).await?;
+        create_tls_node(config.clone()).await?;
     let addr_a = node_a.registry.bind_addr;
 
     let node_b =
-        GossipRegistryHandle::new("127.0.0.1:0".parse()?, vec![], Some(config.clone())).await?;
+        create_tls_node(config.clone()).await?;
     let addr_b = node_b.registry.bind_addr;
 
     // Connect nodes
@@ -680,7 +706,7 @@ async fn test_known_peers_lru_capacity() -> Result<(), Box<dyn std::error::Error
     config.known_peers_capacity = 5; // Very small for testing
 
     let node_a =
-        GossipRegistryHandle::new("127.0.0.1:0".parse()?, vec![], Some(config.clone())).await?;
+        create_tls_node(config.clone()).await?;
 
     // Add more peers than capacity
     for i in 0..10 {
