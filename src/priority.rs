@@ -2,19 +2,24 @@ use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 
 /// Priority levels for actor registrations
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Archive, RkyvSerialize, RkyvDeserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+    Default,
 )]
 pub enum RegistrationPriority {
     /// Normal priority - uses standard gossip intervals
+    #[default]
     Normal = 0,
     /// Immediate priority - triggers immediate propagation
     Immediate = 1,
-}
-
-impl Default for RegistrationPriority {
-    fn default() -> Self {
-        RegistrationPriority::Normal
-    }
 }
 
 impl RegistrationPriority {
@@ -46,20 +51,15 @@ impl RegistrationPriority {
 }
 
 /// Consistency levels for read operations
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, RkyvSerialize, RkyvDeserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, RkyvSerialize, RkyvDeserialize, Default)]
 pub enum ConsistencyLevel {
     /// Eventual consistency - may read stale data
+    #[default]
     Eventual,
     /// Causal consistency - respects causality
     Causal,
     /// Strong consistency - reads most recent data
     Strong,
-}
-
-impl Default for ConsistencyLevel {
-    fn default() -> Self {
-        ConsistencyLevel::Eventual
-    }
 }
 
 #[cfg(test)]

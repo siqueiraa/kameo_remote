@@ -303,6 +303,11 @@ impl VectorClock {
         self.clocks.len()
     }
 
+    /// Check if the vector clock is empty
+    pub fn is_empty(&self) -> bool {
+        self.clocks.is_empty()
+    }
+
     /// Compact the vector clock if it exceeds the maximum size (thread-safe)
     pub fn compact(&self, max_size: usize) {
         if self.clocks.len() <= max_size {
@@ -614,7 +619,7 @@ impl PeerId {
 
     /// Get hex representation
     pub fn to_hex(&self) -> String {
-        hex::encode(&self.0)
+        hex::encode(self.0)
     }
 
     /// Get as a string (for backward compatibility)
@@ -855,8 +860,7 @@ impl Peer {
 
         // All retries failed
         let final_error = last_error.unwrap_or_else(|| {
-            GossipError::Network(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            GossipError::Network(std::io::Error::other(
                 "Unknown error during connection attempts",
             ))
         });

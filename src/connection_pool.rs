@@ -89,9 +89,10 @@ impl BufferConfig {
             tcp_buffer_size: MASTER_BUFFER_SIZE,
         }
     }
+}
 
-    /// Create a default BufferConfig with master buffer size
-    pub fn default() -> Self {
+impl Default for BufferConfig {
+    fn default() -> Self {
         // Use master constant instead of magic number!
         Self {
             ring_buffer_slots: RING_BUFFER_SLOTS,
@@ -664,8 +665,7 @@ impl LockFreeStreamHandle {
         }
     }
 
-    /// Write data to the lock-free ring buffer - NO BLOCKING
-    /// DEPRECATED: Use send_bytes_zero_copy instead to avoid copying
+    // DEPRECATED: write_nonblocking - Use send_bytes_zero_copy instead to avoid copying
     // pub fn write_nonblocking(&self, data: &[u8]) -> Result<()> {
     //     // TODO: This still copies data - need to migrate all callers to send_bytes_zero_copy
     //     warn!("DEPRECATED: write_nonblocking called - should use send_bytes_zero_copy");
@@ -888,7 +888,7 @@ impl LockFreeStreamHandle {
         debug!(
             "✅ STREAMING: Successfully streamed {} MB in {} chunks",
             msg.len() as f64 / 1_048_576.0,
-            (msg.len() + CHUNK_SIZE - 1) / CHUNK_SIZE
+            msg.len().div_ceil(CHUNK_SIZE)
         );
 
         Ok(())
@@ -1141,10 +1141,7 @@ impl CorrelationTracker {
         let mut pending = self.pending[slot].lock();
 
         if let Some(sender) = pending.take() {
-            match sender.send(response) {
-                Ok(_) => {}
-                Err(_) => {}
-            }
+            if sender.send(response).is_ok() {}
         }
     }
 }
@@ -1501,8 +1498,7 @@ impl ConnectionHandle {
         // Wait for response with custom timeout
         let result = match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(response)) => Ok(response),
-            Ok(Err(_)) => Err(crate::GossipError::Network(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            Ok(Err(_)) => Err(crate::GossipError::Network(std::io::Error::other(
                 "Response channel closed",
             ))),
             Err(_) => Err(crate::GossipError::Timeout),
@@ -1644,8 +1640,7 @@ impl ConnectionHandle {
             let timeout_future = async move {
                 match tokio::time::timeout(timeout, receiver).await {
                     Ok(Ok(response)) => Ok(response),
-                    Ok(Err(_)) => Err(crate::GossipError::Network(std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    Ok(Err(_)) => Err(crate::GossipError::Network(std::io::Error::other(
                         "Response channel closed",
                     ))),
                     Err(_) => Err(crate::GossipError::Timeout),
@@ -1721,7 +1716,7 @@ impl ConnectionHandle {
     {
         // Serialize the data using rkyv for maximum performance
         let payload = rkyv::to_bytes::<rkyv::rancor::Error>(data)
-            .map_err(|e| crate::GossipError::Serialization(e))?;
+            .map_err(crate::GossipError::Serialization)?;
 
         // Create stream frame: [frame_type, channel_id, flags, seq_id[2], payload_len[4]]
         let frame_header = StreamFrameHeader {
@@ -1733,7 +1728,7 @@ impl ConnectionHandle {
         };
 
         let header_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&frame_header)
-            .map_err(|e| crate::GossipError::Serialization(e))?;
+            .map_err(crate::GossipError::Serialization)?;
 
         // Combine header and payload for single write
         let mut combined = bytes::BytesMut::with_capacity(header_bytes.len() + payload.len());
@@ -1768,12 +1763,12 @@ impl ConnectionHandle {
 
         for item in batch {
             let payload = rkyv::to_bytes::<rkyv::rancor::Error>(item)
-                .map_err(|e| crate::GossipError::Serialization(e))?;
+                .map_err(crate::GossipError::Serialization)?;
 
             let frame_header = StreamFrameHeader {
                 frame_type: StreamFrameType::Data as u8,
                 channel_id: ChannelId::TellAsk as u8,
-                flags: if item as *const _ == batch.last().unwrap() as *const _ {
+                flags: if std::ptr::eq(item, batch.last().unwrap()) {
                     0
                 } else {
                     StreamFrameFlags::More as u8
@@ -1783,7 +1778,7 @@ impl ConnectionHandle {
             };
 
             let header_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&frame_header)
-                .map_err(|e| crate::GossipError::Serialization(e))?;
+                .map_err(crate::GossipError::Serialization)?;
             total_payload.extend_from_slice(&header_bytes);
             total_payload.extend_from_slice(&payload);
         }
@@ -2044,10 +2039,10 @@ impl ConnectionPool {
 
         if connection_count >= self.max_connections {
             self.connection_counter.fetch_sub(1, Ordering::AcqRel);
-            return Err(crate::GossipError::Network(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Max connections ({}) reached", self.max_connections),
-            )));
+            return Err(crate::GossipError::Network(std::io::Error::other(format!(
+                "Max connections ({}) reached",
+                self.max_connections
+            ))));
         }
 
         // Split the stream for reading and writing
@@ -2104,7 +2099,7 @@ impl ConnectionPool {
                 "Available connections: {:?}",
                 self.connections
                     .iter()
-                    .map(|e| e.key().clone())
+                    .map(|e| *e.key())
                     .collect::<Vec<_>>()
             );
         }
@@ -2298,11 +2293,10 @@ impl ConnectionPool {
                         correlation: conn
                             .correlation
                             .clone()
-                            .unwrap_or_else(|| CorrelationTracker::new()),
+                            .unwrap_or_else(CorrelationTracker::new),
                     });
                 } else {
-                    return Err(crate::GossipError::Network(std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    return Err(crate::GossipError::Network(std::io::Error::other(
                         "Connection exists but no stream handle",
                     )));
                 }
@@ -2387,12 +2381,11 @@ impl ConnectionPool {
                         correlation: conn
                             .correlation
                             .clone()
-                            .unwrap_or_else(|| CorrelationTracker::new()),
+                            .unwrap_or_else(CorrelationTracker::new),
                     });
                 } else {
                     // Connection exists but no stream handle - this shouldn't happen
-                    return Err(crate::GossipError::Network(std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    return Err(crate::GossipError::Network(std::io::Error::other(
                         "Connection exists but no stream handle",
                     )));
                 }
@@ -2614,18 +2607,8 @@ impl ConnectionPool {
                 let gossip_state = registry_arc.gossip_state.lock().await;
 
                 RegistryMessage::FullSync {
-                    local_actors: actor_state
-                        .local_actors
-                        .clone()
-                        .into_iter()
-                        .map(|(k, v)| (k, v))
-                        .collect(),
-                    known_actors: actor_state
-                        .known_actors
-                        .clone()
-                        .into_iter()
-                        .map(|(k, v)| (k, v))
-                        .collect(),
+                    local_actors: actor_state.local_actors.clone().into_iter().collect(),
+                    known_actors: actor_state.known_actors.clone().into_iter().collect(),
                     sender_peer_id: registry_arc.peer_id.clone(),
                     sequence: gossip_state.gossip_sequence,
                     wall_clock_time: crate::current_timestamp(),
@@ -2648,7 +2631,7 @@ impl ConnectionPool {
                         correlation: connection_arc
                             .correlation
                             .clone()
-                            .unwrap_or_else(|| CorrelationTracker::new()),
+                            .unwrap_or_else(CorrelationTracker::new),
                     };
                     if let Err(e) = conn_handle.send_data(msg_buffer).await {
                         warn!(peer = %addr, error = %e, "Failed to send initial FullSync message");
@@ -2716,7 +2699,7 @@ impl ConnectionPool {
                                 }
 
                                 // Check if this is an Ask/Response message by looking at first byte
-                                if msg_data.len() >= 1 {
+                                if !msg_data.is_empty() {
                                     if let Some(msg_type) =
                                         crate::MessageType::from_byte(msg_data[0])
                                     {
@@ -2921,7 +2904,7 @@ impl ConnectionPool {
                                                     >= crate::StreamHeader::SERIALIZED_SIZE
                                                 {
                                                     if let Some(header) =
-                                                        crate::StreamHeader::from_bytes(&payload)
+                                                        crate::StreamHeader::from_bytes(payload)
                                                     {
                                                         info!(peer = %addr, stream_id = header.stream_id, total_size = header.total_size,
                                                               type_hash = %format!("{:08x}", header.type_hash), actor_id = header.actor_id,
@@ -2948,7 +2931,7 @@ impl ConnectionPool {
                                                     >= crate::StreamHeader::SERIALIZED_SIZE
                                                 {
                                                     if let Some(header) =
-                                                        crate::StreamHeader::from_bytes(&payload)
+                                                        crate::StreamHeader::from_bytes(payload)
                                                     {
                                                         let data_start =
                                                             crate::StreamHeader::SERIALIZED_SIZE;
@@ -2988,7 +2971,7 @@ impl ConnectionPool {
                                                     >= crate::StreamHeader::SERIALIZED_SIZE
                                                 {
                                                     if let Some(header) =
-                                                        crate::StreamHeader::from_bytes(&payload)
+                                                        crate::StreamHeader::from_bytes(payload)
                                                     {
                                                         info!(peer = %addr, stream_id = header.stream_id,
                                                               "📤 StreamEnd: Completing streaming transfer");
@@ -3169,11 +3152,11 @@ impl ConnectionPool {
         // Return a lock-free ConnectionHandle
         Ok(ConnectionHandle {
             addr,
-            stream_handle: stream_handle,
+            stream_handle,
             correlation: connection_arc
                 .correlation
                 .clone()
-                .unwrap_or_else(|| CorrelationTracker::new()),
+                .unwrap_or_else(CorrelationTracker::new),
         })
     }
 
@@ -3266,16 +3249,14 @@ pub(crate) async fn handle_persistent_connection_reader(
 
     // For incoming connections with a writer, create a stream handle
     // For outgoing connections, we'll use the existing handle from the pool
-    let response_handle = if let Some(writer) = writer {
-        Some(Arc::new(LockFreeStreamHandle::new(
+    let response_handle = writer.map(|writer| {
+        Arc::new(LockFreeStreamHandle::new(
             writer,
             peer_addr,
             ChannelId::Global,
             BufferConfig::default(),
-        )))
-    } else {
-        None
-    };
+        ))
+    });
 
     loop {
         match reader.read(&mut read_buf).await {
@@ -3345,7 +3326,7 @@ pub(crate) async fn handle_persistent_connection_reader(
                         }
 
                         // Check if this is an Ask/Response message by looking at first byte
-                        if msg_data.len() >= 1 {
+                        if !msg_data.is_empty() {
                             // Debug log for large messages
                             // if len > 1024 * 1024 {
                             //     info!(peer = %peer_addr, first_byte = msg_data[0], "📦 LARGE MESSAGE first byte: {} (0=Gossip, 3=ActorTell)", msg_data[0]);
@@ -3823,7 +3804,7 @@ pub(crate) async fn handle_persistent_connection_reader(
                                         // Parse stream header from payload
                                         if payload.len() >= crate::StreamHeader::SERIALIZED_SIZE {
                                             if let Some(header) =
-                                                crate::StreamHeader::from_bytes(&payload)
+                                                crate::StreamHeader::from_bytes(payload)
                                             {
                                                 info!(peer = %peer_addr, stream_id = header.stream_id, total_size = header.total_size,
                                                       type_hash = %format!("{:08x}", header.type_hash), actor_id = header.actor_id,
@@ -3845,7 +3826,7 @@ pub(crate) async fn handle_persistent_connection_reader(
                                         // Parse stream header and data
                                         if payload.len() >= crate::StreamHeader::SERIALIZED_SIZE {
                                             if let Some(header) =
-                                                crate::StreamHeader::from_bytes(&payload)
+                                                crate::StreamHeader::from_bytes(payload)
                                             {
                                                 let data_start =
                                                     crate::StreamHeader::SERIALIZED_SIZE;
@@ -3879,7 +3860,7 @@ pub(crate) async fn handle_persistent_connection_reader(
                                         // Parse stream header and complete assembly
                                         if payload.len() >= crate::StreamHeader::SERIALIZED_SIZE {
                                             if let Some(header) =
-                                                crate::StreamHeader::from_bytes(&payload)
+                                                crate::StreamHeader::from_bytes(payload)
                                             {
                                                 info!(peer = %peer_addr, stream_id = header.stream_id,
                                                       "📤 StreamEnd: Completing streaming transfer");
@@ -3956,15 +3937,14 @@ pub(crate) async fn handle_persistent_connection_reader(
                                 >(&msg_data_vec)
                                 {
                                     // Debug: Show timing right after TCP read, before any processing
-                                    match &msg {
-                                        crate::registry::RegistryMessage::DeltaGossip { delta } => {
-                                            let tcp_transmission_nanos = tcp_read_timestamp
-                                                - delta.precise_timing_nanos as u128;
-                                            let _tcp_transmission_ms =
-                                                tcp_transmission_nanos as f64 / 1_000_000.0;
-                                            // eprintln!("🔍 TCP_TRANSMISSION_TIME: {}ms ({}ns)", _tcp_transmission_ms, tcp_transmission_nanos);
-                                        }
-                                        _ => {}
+                                    if let crate::registry::RegistryMessage::DeltaGossip { delta } =
+                                        &msg
+                                    {
+                                        let tcp_transmission_nanos =
+                                            tcp_read_timestamp - delta.precise_timing_nanos as u128;
+                                        let _tcp_transmission_ms =
+                                            tcp_transmission_nanos as f64 / 1_000_000.0;
+                                        // eprintln!("🔍 TCP_TRANSMISSION_TIME: {}ms ({}ns)", _tcp_transmission_ms, tcp_transmission_nanos);
                                     }
 
                                     if let Err(e) =
@@ -4570,8 +4550,8 @@ pub(crate) async fn handle_incoming_message(
 
                 // Create a FullSyncResponse message
                 let response = RegistryMessage::FullSyncResponse {
-                    local_actors: our_local_actors.into_iter().map(|(k, v)| (k, v)).collect(),
-                    known_actors: our_known_actors.into_iter().map(|(k, v)| (k, v)).collect(),
+                    local_actors: our_local_actors.into_iter().collect(),
+                    known_actors: our_known_actors.into_iter().collect(),
                     sender_peer_id: registry.peer_id.clone(), // Use peer ID
                     sequence: our_sequence,
                     wall_clock_time: crate::current_timestamp(),
@@ -4622,14 +4602,14 @@ pub(crate) async fn handle_incoming_message(
                         "FULLSYNC RESPONSE DEBUG: Available connections by addr: {:?}",
                         pool.connections
                             .iter()
-                            .map(|entry| entry.key().clone())
+                            .map(|entry| *entry.key())
                             .collect::<Vec<_>>()
                     );
                     debug!(
                         "FULLSYNC RESPONSE DEBUG: Available node mappings: {:?}",
                         pool.peer_id_to_addr
                             .iter()
-                            .map(|entry| (entry.key().clone(), entry.value().clone()))
+                            .map(|entry| (entry.key().clone(), *entry.value()))
                             .collect::<Vec<_>>()
                     );
                     debug!(
@@ -4999,7 +4979,7 @@ pub(crate) async fn handle_incoming_message(
             let mut pending_acks = registry.pending_acks.lock().await;
             if let Some(sender) = pending_acks.remove(&actor_name) {
                 // Send the success status through the oneshot channel
-                if let Err(_) = sender.send(success) {
+                if sender.send(success).is_err() {
                     warn!(
                         actor_name = %actor_name,
                         "Failed to send ACK to waiting registration - receiver dropped"
