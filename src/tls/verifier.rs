@@ -27,7 +27,7 @@ pub fn extract_node_id_from_cert(cert: &CertificateDer<'_>) -> Result<NodeId, Er
     let key_bytes = &cert_bytes[cert_bytes.len().saturating_sub(32)..];
 
     PublicKey::from_bytes(key_bytes)
-        .map_err(|e| Error::General(format!("Invalid public key in certificate: {}", e).into()))
+        .map_err(|e| Error::General(format!("Invalid public key in certificate: {}", e)))
 }
 
 /// Verify that a certificate is self-signed with the given NodeId
@@ -38,14 +38,11 @@ pub fn verify_self_signed(
     let cert_node_id = extract_node_id_from_cert(cert)?;
 
     if cert_node_id != *expected_node_id {
-        return Err(Error::General(
-            format!(
-                "Certificate NodeId mismatch: expected {}, got {}",
-                expected_node_id.fmt_short(),
-                cert_node_id.fmt_short()
-            )
-            .into(),
-        ));
+        return Err(Error::General(format!(
+            "Certificate NodeId mismatch: expected {}, got {}",
+            expected_node_id.fmt_short(),
+            cert_node_id.fmt_short()
+        )));
     }
 
     // TODO: Verify the certificate signature once we have proper cert generation

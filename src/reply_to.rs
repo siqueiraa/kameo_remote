@@ -59,8 +59,8 @@ impl ReplyTo {
             >,
         >,
     {
-        let response = rkyv::to_bytes::<rkyv::rancor::Error>(value)
-            .map_err(|e| GossipError::Serialization(e))?;
+        let response =
+            rkyv::to_bytes::<rkyv::rancor::Error>(value).map_err(GossipError::Serialization)?;
         self.reply(&response).await
     }
 

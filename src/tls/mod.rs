@@ -166,14 +166,11 @@ impl ServerCertVerifier for NodeIdServerVerifier {
         let actual_node_id = extract_node_id_from_cert(end_entity)?;
 
         if actual_node_id != expected_node_id {
-            return Err(Error::General(
-                format!(
-                    "NodeId mismatch: expected {}, got {}",
-                    expected_node_id.fmt_short(),
-                    actual_node_id.fmt_short()
-                )
-                .into(),
-            ));
+            return Err(Error::General(format!(
+                "NodeId mismatch: expected {}, got {}",
+                expected_node_id.fmt_short(),
+                actual_node_id.fmt_short()
+            )));
         }
 
         Ok(ServerCertVerified::assertion())
@@ -199,12 +196,12 @@ impl ServerCertVerifier for NodeIdServerVerifier {
 
         // Convert rustls signature to ed25519-dalek signature
         let signature = ed25519_dalek::Signature::from_slice(dss.signature())
-            .map_err(|e| Error::General(format!("Invalid signature: {}", e).into()))?;
+            .map_err(|e| Error::General(format!("Invalid signature: {}", e)))?;
 
         // Verify using the public key
         node_id
             .verify(message, &signature)
-            .map_err(|e| Error::General(format!("Signature verification failed: {}", e).into()))?;
+            .map_err(|e| Error::General(format!("Signature verification failed: {}", e)))?;
 
         Ok(HandshakeSignatureValid::assertion())
     }
@@ -256,12 +253,12 @@ impl ClientCertVerifier for NodeIdClientVerifier {
 
         // Convert rustls signature to ed25519-dalek signature
         let signature = ed25519_dalek::Signature::from_slice(dss.signature())
-            .map_err(|e| Error::General(format!("Invalid signature: {}", e).into()))?;
+            .map_err(|e| Error::General(format!("Invalid signature: {}", e)))?;
 
         // Verify using the public key
         node_id
             .verify(message, &signature)
-            .map_err(|e| Error::General(format!("Signature verification failed: {}", e).into()))?;
+            .map_err(|e| Error::General(format!("Signature verification failed: {}", e)))?;
 
         Ok(HandshakeSignatureValid::assertion())
     }
@@ -353,7 +350,7 @@ fn extract_node_id_from_cert(cert: &CertificateDer<'_>) -> std::result::Result<N
 
     // Create NodeId from the public key bytes
     NodeId::from_bytes(key_bytes)
-        .map_err(|e| Error::General(format!("Invalid public key in certificate: {}", e).into()))
+        .map_err(|e| Error::General(format!("Invalid public key in certificate: {}", e)))
 }
 
 #[cfg(test)]

@@ -1062,8 +1062,7 @@ where
 
     // Read the message data - allocate with proper alignment for rkyv
     // Use Vec::with_capacity to ensure proper allocation alignment
-    let mut msg_buf = Vec::with_capacity(msg_len);
-    msg_buf.resize(msg_len, 0);
+    let mut msg_buf = vec![0; msg_len];
     reader.read_exact(&mut msg_buf).await?;
 
     // Check if this is an Ask message with envelope
@@ -1261,21 +1260,15 @@ async fn send_gossip_message_zero_copy(
     let current_time_nanos = crate::current_timestamp_nanos();
 
     // Debug: Check if there's a delay in the task creation vs sending
-    match &task.message {
-        crate::registry::RegistryMessage::DeltaGossip { delta } => {
-            for change in &delta.changes {
-                match change {
-                    crate::registry::RegistryChange::ActorAdded { location, .. } => {
-                        let creation_time_nanos = location.wall_clock_time as u128 * 1_000_000_000;
-                        let delay_nanos = current_time_nanos as u128 - creation_time_nanos;
-                        let _delay_ms = delay_nanos as f64 / 1_000_000.0;
-                        // eprintln!("🔍 DELTA_SEND_DELAY: {}ms between delta creation and sending", delay_ms);
-                    }
-                    _ => {}
-                }
+    if let crate::registry::RegistryMessage::DeltaGossip { delta } = &task.message {
+        for change in &delta.changes {
+            if let crate::registry::RegistryChange::ActorAdded { location, .. } = change {
+                let creation_time_nanos = location.wall_clock_time as u128 * 1_000_000_000;
+                let delay_nanos = current_time_nanos as u128 - creation_time_nanos;
+                let _delay_ms = delay_nanos as f64 / 1_000_000.0;
+                // eprintln!("🔍 DELTA_SEND_DELAY: {}ms between delta creation and sending", delay_ms);
             }
         }
-        _ => {}
     }
 
     match &mut task.message {
@@ -1286,7 +1279,7 @@ async fn send_gossip_message_zero_copy(
                 match change {
                     crate::registry::RegistryChange::ActorAdded { location, .. } => {
                         // Set wall_clock_time to nanoseconds for consistent timing measurements
-                        location.wall_clock_time = (current_time_nanos / 1_000_000_000) as u64;
+                        location.wall_clock_time = current_time_nanos / 1_000_000_000;
                     }
                     crate::registry::RegistryChange::ActorRemoved { .. } => {
                         // No wall_clock_time to update

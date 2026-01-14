@@ -21,6 +21,10 @@ use crate::{
     GossipConfig, GossipError, RegistrationPriority, RemoteActorLocation, Result,
 };
 
+/// Future type for actor message handling responses
+pub type ActorMessageFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<Vec<u8>>>> + Send + 'a>>;
+
 /// Callback trait for handling incoming actor messages
 pub trait ActorMessageHandler: Send + Sync {
     /// Handle an incoming actor message
@@ -30,7 +34,7 @@ pub trait ActorMessageHandler: Send + Sync {
         type_hash: u32,
         payload: &[u8],
         correlation_id: Option<u16>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<Vec<u8>>>> + Send + '_>>;
+    ) -> ActorMessageFuture<'_>;
 }
 
 /// Registry change types for delta tracking with vector clocks
@@ -355,9 +359,10 @@ pub struct StreamAssembly {
 impl StreamAssembly {
     /// Check if the stream assembly is complete (all chunks received with no gaps)
     pub fn is_complete(&self) -> bool {
-        let expected_chunks =
-            (self.header.total_size + crate::connection_pool::STREAM_CHUNK_SIZE as u64 - 1)
-                / crate::connection_pool::STREAM_CHUNK_SIZE as u64;
+        let expected_chunks = self
+            .header
+            .total_size
+            .div_ceil(crate::connection_pool::STREAM_CHUNK_SIZE as u64);
 
         if self.chunks.len() as u64 != expected_chunks {
             return false;
@@ -393,7 +398,7 @@ impl GossipRegistry {
         let connection_pool =
             ConnectionPool::new(config.max_pooled_connections, config.connection_timeout);
 
-        let registry = Self {
+        Self {
             bind_addr,
             peer_id,
             config: config.clone(),
@@ -439,9 +444,7 @@ impl GossipRegistry {
             actor_message_handler: Arc::new(Mutex::new(None)),
             stream_assemblies: Arc::new(Mutex::new(HashMap::new())),
             pending_acks: Arc::new(Mutex::new(HashMap::new())),
-        };
-
-        registry
+        }
     }
 
     /// Enable TLS for secure connections
@@ -498,7 +501,7 @@ impl GossipRegistry {
         }
     }
 
-    /// Add bootstrap peers for initial connection
+    // Add bootstrap peers for initial connection (DEPRECATED)
     // pub async fn add_bootstrap_peers(&self, bootstrap_peers: Vec<SocketAddr>) {
     //     let mut gossip_state = self.gossip_state.lock().await;
     //     let current_time = current_timestamp();
@@ -699,8 +702,7 @@ impl GossipRegistry {
                     "Sync registration failed according to peer for actor '{}'",
                     name
                 );
-                Err(GossipError::Network(io::Error::new(
-                    io::ErrorKind::Other,
+                Err(GossipError::Network(io::Error::other(
                     "Peer rejected registration",
                 )))
             }
@@ -1194,11 +1196,10 @@ impl GossipRegistry {
                             }
                         };
 
-                        if should_remove {
-                            if actor_state.known_actors.remove(name.as_str()).is_some() {
-                                applied += 1;
-                                debug!(actor_name = %name, "applied actor removal");
-                            }
+                        if should_remove && actor_state.known_actors.remove(name.as_str()).is_some()
+                        {
+                            applied += 1;
+                            debug!(actor_name = %name, "applied actor removal");
                         }
                     }
                 }
@@ -1993,7 +1994,7 @@ impl GossipRegistry {
                 .filter(|(_, info)| {
                     // Check if peer has been disconnected for too long
                     info.failures >= self.config.max_peer_failures
-                        && info.last_failure_time.map_or(false, |failure_time| {
+                        && info.last_failure_time.is_some_and(|failure_time| {
                             (current_time - failure_time) > dead_peer_timeout_secs
                         })
                 })
@@ -2253,18 +2254,15 @@ impl GossipRegistry {
                 .insert(self.bind_addr, our_report);
 
             // If we don't have a pending failure, create one
-            if !gossip_state
-                .pending_peer_failures
-                .contains_key(&failed_peer_addr)
+            if let std::collections::hash_map::Entry::Vacant(e) =
+                gossip_state.pending_peer_failures.entry(failed_peer_addr)
             {
                 let pending = PendingFailure {
                     first_detected: current_time,
                     consensus_deadline: current_time + 5, // 5 second timeout
                     query_sent: false,
                 };
-                gossip_state
-                    .pending_peer_failures
-                    .insert(failed_peer_addr, pending);
+                e.insert(pending);
 
                 info!(
                     failed_peer = %failed_peer_addr,
@@ -2392,18 +2390,15 @@ impl GossipRegistry {
                 .insert(self.bind_addr, our_report);
 
             // If we don't have a pending failure, create one
-            if !gossip_state
-                .pending_peer_failures
-                .contains_key(&failed_peer_addr)
+            if let std::collections::hash_map::Entry::Vacant(e) =
+                gossip_state.pending_peer_failures.entry(failed_peer_addr)
             {
                 let pending = PendingFailure {
                     first_detected: current_time,
                     consensus_deadline: current_time + 5, // 5 second timeout
                     query_sent: false,
                 };
-                gossip_state
-                    .pending_peer_failures
-                    .insert(failed_peer_addr, pending);
+                e.insert(pending);
 
                 info!(
                     failed_peer = %failed_peer_addr,
@@ -2543,7 +2538,7 @@ impl GossipRegistry {
                         );
                     } else {
                         // Multiple nodes - check consensus
-                        let majority = (total_peers + 1) / 2;
+                        let majority = total_peers.div_ceil(2);
 
                         if dead_count >= majority || current_time >= pending.consensus_deadline {
                             completed_failures.push(*peer_addr);
@@ -3034,9 +3029,10 @@ impl GossipRegistry {
         let mut assemblies = self.stream_assemblies.lock().await;
         if let Some(assembly) = assemblies.remove(&stream_id) {
             // Verify we have all chunks with proper gap detection
-            let expected_chunks =
-                (assembly.header.total_size + crate::connection_pool::STREAM_CHUNK_SIZE as u64 - 1)
-                    / crate::connection_pool::STREAM_CHUNK_SIZE as u64;
+            let expected_chunks = assembly
+                .header
+                .total_size
+                .div_ceil(crate::connection_pool::STREAM_CHUNK_SIZE as u64);
 
             // ✅ PROPER: Check both count and verify all chunk indices are present
             if assembly.chunks.len() as u64 != expected_chunks {
