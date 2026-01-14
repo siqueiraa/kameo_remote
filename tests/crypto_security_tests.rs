@@ -58,9 +58,9 @@ async fn test_deterministic_keypair_for_testing() {
     println!("🧪 Testing deterministic keypair generation for tests...");
 
     // Generate the same seed multiple times
-    let keypair1 = KeyPair::from_seed_for_testing(42);
-    let keypair2 = KeyPair::from_seed_for_testing(42);
-    let keypair3 = KeyPair::from_seed_for_testing(43); // Different seed
+    let keypair1 = KeyPair::new_for_testing("42");
+    let keypair2 = KeyPair::new_for_testing("42");
+    let keypair3 = KeyPair::new_for_testing("43"); // Different seed
 
     // Same seeds should produce identical keypairs
     assert_eq!(
@@ -143,10 +143,10 @@ async fn test_peer_id_conversions() {
     assert_eq!(peer_id, peer_id_from_hex, "Hex roundtrip should work");
 
     // Test bytes conversion roundtrip
-    let bytes = peer_id.as_bytes();
+    let bytes = peer_id.to_bytes();
     assert_eq!(bytes.len(), 32, "PeerId bytes should be 32 bytes");
 
-    let peer_id_from_bytes = PeerId::from_bytes(bytes).expect("Should parse valid bytes");
+    let peer_id_from_bytes = PeerId::from_bytes(&bytes).expect("Should parse valid bytes");
     assert_eq!(peer_id, peer_id_from_bytes, "Bytes roundtrip should work");
 
     // Test Display and string conversion
@@ -169,7 +169,7 @@ async fn test_key_mismatch_connection_rejection() {
     println!("🚫 Testing connection rejection with mismatched keys...");
 
     // Create server with specific keypair
-    let server_keypair = KeyPair::from_seed_for_testing(1);
+    let server_keypair = KeyPair::new_for_testing("1");
     let server_peer_id = server_keypair.peer_id();
     let server_addr = "127.0.0.1:29101".parse().unwrap();
 
@@ -185,7 +185,7 @@ async fn test_key_mismatch_connection_rejection() {
     println!("   🖥️  Server started with PeerId: {}", server_peer_id);
 
     // Create client with different keypair
-    let client_keypair = KeyPair::from_seed_for_testing(2); // Different seed!
+    let client_keypair = KeyPair::new_for_testing("2"); // Different seed!
     let client_peer_id = client_keypair.peer_id();
     let client_addr = "127.0.0.1:29102".parse().unwrap();
 
@@ -215,7 +215,7 @@ async fn test_key_mismatch_connection_rejection() {
 
     // Test 2: Client tries to connect using wrong PeerId (should fail)
     println!("   🔗 Test 2: Client connecting with wrong PeerId...");
-    let wrong_keypair = KeyPair::from_seed_for_testing(99); // Completely different
+    let wrong_keypair = KeyPair::new_for_testing("99"); // Completely different
     let wrong_peer_id = wrong_keypair.peer_id();
 
     let wrong_peer = client_registry.add_peer(&wrong_peer_id).await;
@@ -257,10 +257,10 @@ async fn test_invalid_key_edge_cases() {
     println!("⚠️  Testing invalid key edge cases...");
 
     // Test invalid hex strings
-    let invalid_hex_cases = vec![
-        "",             // Empty
-        "invalid",      // Not hex
-        "abc",          // Too short
+    let invalid_hex_cases: Vec<String> = vec![
+        "".to_string(),             // Empty
+        "invalid".to_string(),      // Not hex
+        "abc".to_string(),          // Too short
         "a".repeat(63), // One character too short
         "a".repeat(65), // One character too long
         "g".repeat(64), // Invalid hex characters

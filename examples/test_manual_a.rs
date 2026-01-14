@@ -77,7 +77,7 @@ async fn main() {
                 configured_count += 1;
 
                 // Check if we have an active connection to this node
-                let has_connection = pool.get_connection_by_node_id(node_id.as_str()).is_some();
+                let has_connection = pool.get_connection_by_node_id(&node_id.as_str()).is_some();
                 if has_connection {
                     connected_count += 1;
                 }
