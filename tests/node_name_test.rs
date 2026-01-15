@@ -35,9 +35,13 @@ async fn test_node_name_based_connections() {
 
     // Start Node B with TLS
     let secret_b = SecretKey::generate();
-    let node_b = GossipRegistryHandle::new_with_tls("127.0.0.1:0".parse().unwrap(), secret_b, Some(config_b))
-        .await
-        .expect("Failed to create node B");
+    let node_b = GossipRegistryHandle::new_with_tls(
+        "127.0.0.1:0".parse().unwrap(),
+        secret_b,
+        Some(config_b),
+    )
+    .await
+    .expect("Failed to create node B");
 
     let node_b_addr = node_b.registry.bind_addr;
     println!("Node B started at {}", node_b_addr);
@@ -67,7 +71,9 @@ async fn test_node_name_based_connections() {
         println!("  Node mappings: {}", pool.peer_id_to_addr.len());
 
         // Verify Node B knows about Node A
-        assert!(pool.peer_id_to_addr.contains_key(&PeerId::new("test_node_a")));
+        assert!(pool
+            .peer_id_to_addr
+            .contains_key(&PeerId::new("test_node_a")));
         assert_eq!(pool.connection_count(), 1);
     }
 
@@ -79,7 +85,9 @@ async fn test_node_name_based_connections() {
         println!("  Node mappings: {}", pool.peer_id_to_addr.len());
 
         // After exchange, Node A should know about Node B
-        assert!(pool.peer_id_to_addr.contains_key(&PeerId::new("test_node_b")));
+        assert!(pool
+            .peer_id_to_addr
+            .contains_key(&PeerId::new("test_node_b")));
     }
 
     // Clean shutdown

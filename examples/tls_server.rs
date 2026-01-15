@@ -1,9 +1,8 @@
-use kameo_remote::{GossipConfig, GossipRegistryHandle, NodeId, SecretKey};
+use kameo_remote::{GossipConfig, GossipRegistryHandle, SecretKey};
 use std::env;
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
-use tracing::{debug, error, info, warn};
 
 /// TLS-enabled gossip server - runs as a standalone process
 ///

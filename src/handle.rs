@@ -354,6 +354,20 @@ impl GossipRegistryHandle {
         self.registry.get_connection(addr).await
     }
 
+    /// Get a connection handle by peer ID (ensures TLS NodeId is known)
+    pub async fn get_connection_to_peer(
+        &self,
+        peer_id: &crate::PeerId,
+    ) -> Result<crate::connection_pool::ConnectionHandle> {
+        let node_name = peer_id.as_str();
+        self.registry
+            .connection_pool
+            .lock()
+            .await
+            .get_connection_to_node(&node_name)
+            .await
+    }
+
     /// Bootstrap peer connections non-blocking (Phase 4)
     ///
     /// Dials seed peers asynchronously - doesn't block startup on gossip propagation.
@@ -552,7 +566,29 @@ async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
                 }
                 // Only gossip peer list if peer discovery is enabled
                 if registry.config.enable_peer_discovery {
-                    registry.gossip_peer_list().await;
+                    let tasks = registry.gossip_peer_list().await;
+                    if tasks.is_empty() {
+                        continue;
+                    }
+
+                    let mut futures = Vec::new();
+                    for task in tasks {
+                        let registry_clone = registry.clone();
+                        let future = tokio::spawn(async move {
+                            if let Err(err) =
+                                send_gossip_message_zero_copy(task, registry_clone).await
+                            {
+                                warn!(error = %err, "peer list gossip send failed");
+                            }
+                        });
+                        futures.push(future);
+                    }
+
+                    for future in futures {
+                        if let Err(err) = future.await {
+                            error!(error = %err, "peer list gossip task panicked");
+                        }
+                    }
                 }
             }
         }
@@ -630,10 +666,48 @@ async fn handle_connection(
 
 /// Handle an incoming TLS connection
 async fn handle_tls_connection(
-    tls_stream: tokio_rustls::server::TlsStream<TcpStream>,
+    mut tls_stream: tokio_rustls::server::TlsStream<TcpStream>,
     peer_addr: SocketAddr,
     registry: Arc<GossipRegistry>,
 ) {
+    let negotiated_alpn = tls_stream
+        .get_ref()
+        .1
+        .alpn_protocol()
+        .map(|proto| proto.to_vec());
+
+    let capabilities = match crate::handshake::perform_hello_handshake(
+        &mut tls_stream,
+        negotiated_alpn.as_deref(),
+        registry.config.enable_peer_discovery,
+    )
+    .await
+    {
+        Ok(caps) => {
+            eprintln!(
+                "inbound hello capabilities from {} can_send={}",
+                peer_addr,
+                caps.can_send_peer_list()
+            );
+            caps
+        }
+        Err(err) => {
+            warn!(
+                peer = %peer_addr,
+                error = %err,
+                "Hello handshake failed, closing inbound TLS connection"
+            );
+            return;
+        }
+    };
+
+    registry.set_peer_capabilities(peer_addr, capabilities.clone());
+    if let Some(node_id) = registry.lookup_node_id(&peer_addr).await {
+        registry
+            .associate_peer_capabilities_with_node(peer_addr, node_id)
+            .await;
+    }
+
     // Split the TLS stream
     let (reader, writer) = tokio::io::split(tls_stream);
 
@@ -643,29 +717,40 @@ async fn handle_tls_connection(
     // Start the incoming persistent connection handler
     tokio::spawn(async move {
         debug!(peer = %peer_addr, "HANDLE.RS: Starting incoming TLS connection handler");
-        let sender_node_id = handle_incoming_connection_tls(
+        match handle_incoming_connection_tls(
             reader,
             writer,
             peer_addr,
             registry.clone(),
             registry_weak,
         )
-        .await;
-        debug!(peer = %peer_addr, "HANDLE.RS: Incoming TLS connection handler exited");
-
-        // Handle peer failure when connection is lost
-        if let Some(failed_node_id) = sender_node_id {
-            debug!(node_id = %failed_node_id, "HANDLE.RS: Triggering peer failure handling for node");
-            if let Err(e) = registry
-                .handle_peer_connection_failure_by_node_id(&failed_node_id)
-                .await
-            {
-                warn!(error = %e, node_id = %failed_node_id, "HANDLE.RS: Failed to handle peer connection failure");
+        .await
+        {
+            ConnectionCloseOutcome::Normal {
+                node_id: Some(failed_node_id),
+            } => {
+                debug!(node_id = %failed_node_id, "HANDLE.RS: Triggering peer failure handling for node");
+                if let Err(e) = registry
+                    .handle_peer_connection_failure_by_node_id(&failed_node_id)
+                    .await
+                {
+                    warn!(error = %e, node_id = %failed_node_id, "HANDLE.RS: Failed to handle peer connection failure");
+                }
             }
-        } else {
-            warn!(peer = %peer_addr, "HANDLE.RS: Cannot handle peer failure - sender node ID unknown");
+            ConnectionCloseOutcome::Normal { node_id: None } => {
+                warn!(peer = %peer_addr, "HANDLE.RS: Cannot handle peer failure - sender node ID unknown");
+            }
+            ConnectionCloseOutcome::DroppedByTieBreaker => {
+                debug!(peer = %peer_addr, "HANDLE.RS: Dropped duplicate connection via tie-breaker");
+            }
         }
+        debug!(peer = %peer_addr, "HANDLE.RS: Incoming TLS connection handler exited");
     });
+}
+
+enum ConnectionCloseOutcome {
+    Normal { node_id: Option<String> },
+    DroppedByTieBreaker,
 }
 
 /// Handle an incoming TLS connection - processes all messages over encrypted stream
@@ -675,7 +760,7 @@ async fn handle_incoming_connection_tls<R, W>(
     peer_addr: SocketAddr,
     registry: Arc<GossipRegistry>,
     _registry_weak: Option<std::sync::Weak<GossipRegistry>>,
-) -> Option<String>
+) -> ConnectionCloseOutcome
 where
     R: AsyncReadExt + Unpin + Send + 'static,
     W: AsyncWriteExt + Unpin + Send + 'static,
@@ -708,7 +793,7 @@ where
                 RegistryMessage::PeerHealthReport { reporter, .. } => reporter.as_str().to_string(),
                 RegistryMessage::ImmediateAck { .. } => {
                     warn!("Received ImmediateAck as first message - cannot identify sender");
-                    return None;
+                    return ConnectionCloseOutcome::Normal { node_id: None };
                 }
                 RegistryMessage::ActorMessage { .. } => {
                     // For ActorMessage, we can't determine sender from the message
@@ -719,7 +804,7 @@ where
                         "ask_sender".to_string()
                     } else {
                         warn!("Received ActorMessage as first message - cannot identify sender");
-                        return None;
+                        return ConnectionCloseOutcome::Normal { node_id: None };
                     }
                 }
                 RegistryMessage::PeerListGossip { sender_addr, .. } => sender_addr.clone(),
@@ -737,7 +822,7 @@ where
         }
         Err(e) => {
             warn!(error = %e, "Failed to read initial message from TLS stream");
-            return None;
+            return ConnectionCloseOutcome::Normal { node_id: None };
         }
     };
 
@@ -746,14 +831,94 @@ where
     // Update the gossip state with the NodeId for this peer
     // This is critical for bidirectional TLS connections
     {
-        let node_id =
+        let node_id_opt =
             crate::migration::migrate_peer_id_to_node_id(&crate::PeerId::new(&sender_node_id)).ok();
-        if let Some(node_id) = node_id {
+        if let Some(node_id) = node_id_opt {
             registry
                 .add_peer_with_node_id(peer_addr, Some(node_id))
                 .await;
+            registry
+                .associate_peer_capabilities_with_node(peer_addr, node_id)
+                .await;
             debug!(peer_addr = %peer_addr, "Updated gossip state with NodeId for incoming TLS connection");
         }
+    }
+
+    // Register the TLS writer with the connection pool before handling the first message so responses work
+    {
+        use std::pin::Pin;
+        use tokio::io::AsyncWrite;
+
+        let boxed_writer: Pin<Box<dyn AsyncWrite + Send>> = Box::pin(writer);
+        let stream_handle = Arc::new(crate::connection_pool::LockFreeStreamHandle::new(
+            boxed_writer,
+            peer_addr,
+            crate::connection_pool::ChannelId::Global,
+            crate::connection_pool::BufferConfig::default(),
+        ));
+
+        let mut connection = crate::connection_pool::LockFreeConnection::new(
+            peer_addr,
+            crate::connection_pool::ConnectionDirection::Inbound,
+        );
+        connection.stream_handle = Some(stream_handle);
+        connection.set_state(crate::connection_pool::ConnectionState::Connected);
+        connection.update_last_used();
+
+        let connection_arc = Arc::new(connection);
+
+        let keep_connection = {
+            let pool = registry.connection_pool.lock().await;
+            let peer_id = crate::PeerId::new(&sender_node_id);
+            let has_existing = pool.has_connection_by_peer_id(&peer_id);
+
+            if has_existing {
+                if registry.should_keep_connection(&sender_node_id, false) {
+                    debug!(
+                        node_id = %sender_node_id,
+                        "tie-breaker: favoring inbound connection, dropping existing outbound"
+                    );
+                    if let Some(existing) = pool.disconnect_connection_by_node_id(&sender_node_id) {
+                        if let Some(handle) = existing.stream_handle.as_ref() {
+                            handle.shutdown();
+                        }
+                    }
+                    pool.add_connection_by_node_id(
+                        sender_node_id.clone(),
+                        peer_addr,
+                        connection_arc.clone(),
+                    );
+                    true
+                } else {
+                    debug!(
+                        node_id = %sender_node_id,
+                        "tie-breaker: rejecting inbound duplicate connection"
+                    );
+                    registry.clear_peer_capabilities(&peer_addr);
+                    false
+                }
+            } else {
+                pool.add_connection_by_node_id(
+                    sender_node_id.clone(),
+                    peer_addr,
+                    connection_arc.clone(),
+                );
+                true
+            }
+        };
+
+        if !keep_connection {
+            if let Some(handle) = connection_arc.stream_handle.as_ref() {
+                handle.shutdown();
+            }
+            return ConnectionCloseOutcome::DroppedByTieBreaker;
+        }
+
+        debug!(
+            node_id = %sender_node_id,
+            peer_addr = %peer_addr,
+            "Added incoming TLS connection to pool for bidirectional communication"
+        );
     }
 
     // Process the initial message with correlation ID if present
@@ -848,64 +1013,7 @@ where
         }
         Err(e) => {
             warn!(error = %e, "Failed to read initial message - connection will be closed");
-            return None;
-        }
-    }
-
-    // Add the TLS writer to the connection pool for bidirectional communication
-    {
-        use std::pin::Pin;
-        use tokio::io::AsyncWrite;
-
-        // Box the writer as a trait object for heterogeneous storage
-        let boxed_writer: Pin<Box<dyn AsyncWrite + Send>> = Box::pin(writer);
-
-        // Create a LockFreeStreamHandle for the TLS writer
-        let stream_handle = Arc::new(crate::connection_pool::LockFreeStreamHandle::new(
-            boxed_writer,
-            peer_addr,
-            crate::connection_pool::ChannelId::Global,
-            crate::connection_pool::BufferConfig::default(), // Use BufferConfig with 1MB buffer
-        ));
-
-        // Create a connection with the TLS stream handle
-        let mut connection = crate::connection_pool::LockFreeConnection::new(peer_addr);
-        connection.stream_handle = Some(stream_handle);
-        connection.set_state(crate::connection_pool::ConnectionState::Connected);
-        connection.update_last_used();
-
-        // Add the connection to the pool by node ID
-        let connection_arc = Arc::new(connection);
-
-        // DUPLICATE CONNECTION TIE-BREAKER (Phase 4):
-        // Check if we already have a connection to this peer
-        let should_add = if registry.has_connection_to_node(&sender_node_id).await {
-            // We have an existing connection - use tie-breaker
-            // This is an INBOUND connection (is_outbound = false)
-            if registry.should_keep_connection(&sender_node_id, false) {
-                debug!(
-                    node_id = %sender_node_id,
-                    "tie-breaker: keeping new inbound connection, will close existing outbound"
-                );
-                true
-            } else {
-                debug!(
-                    node_id = %sender_node_id,
-                    "tie-breaker: keeping existing outbound connection, rejecting new inbound"
-                );
-                false
-            }
-        } else {
-            true
-        };
-
-        if should_add {
-            let pool = registry.connection_pool.lock().await;
-            // Add the connection using the sender's node ID
-            pool.add_connection_by_node_id(sender_node_id.clone(), peer_addr, connection_arc);
-
-            debug!(node_id = %sender_node_id, peer_addr = %peer_addr,
-                  "Added incoming TLS connection to pool for bidirectional communication");
+            return ConnectionCloseOutcome::Normal { node_id: None };
         }
     }
 
@@ -1020,7 +1128,9 @@ where
         }
     }
 
-    Some(sender_node_id)
+    ConnectionCloseOutcome::Normal {
+        node_id: Some(sender_node_id),
+    }
 }
 
 /// Result type for message reading that can handle gossip, actor, and streaming messages
@@ -1253,6 +1363,18 @@ async fn send_gossip_message_zero_copy(
             }
         }
     };
+
+    if matches!(
+        task.message,
+        crate::registry::RegistryMessage::PeerListGossip { .. }
+    ) && !registry.peer_supports_peer_list(&task.peer_addr).await
+    {
+        debug!(
+            peer = %task.peer_addr,
+            "Skipping PeerListGossip send - peer lacks negotiated capability"
+        );
+        return Ok(());
+    }
 
     // CRITICAL: Set precise timing RIGHT BEFORE TCP write to exclude all scheduling delays
     // Update wall_clock_time in delta changes to current time for accurate propagation measurement

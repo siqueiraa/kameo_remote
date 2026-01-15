@@ -492,7 +492,7 @@ async fn test_tell_with_lookup_and_performance_comparison() {
     println!("======================================");
 
     let volume_count = 300; // 100 messages per service
-    let services = vec!["chat_service", "auth_service", "storage_service"];
+    let _services = ["chat_service", "auth_service", "storage_service"];
 
     println!(
         "\n🔸 Test 3A: High Volume Individual ({}x3 = {} total messages)",

@@ -271,7 +271,7 @@ async fn test_register_actor_sync_real_multiple_peers() {
         let addr = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
         let handle = GossipRegistryHandle::new(addr, vec![], Some(config.clone()))
             .await
-            .expect(&format!("Failed to start node{}", i));
+            .unwrap_or_else(|_| panic!("Failed to start node{}", i));
         let actual_addr = handle.registry.bind_addr;
 
         handles.push(handle);
@@ -280,14 +280,14 @@ async fn test_register_actor_sync_real_multiple_peers() {
     }
 
     // Connect all nodes as peers (full mesh)
-    for i in 0..4 {
-        for j in 0..4 {
+    for (i, handle) in handles.iter().enumerate() {
+        for (j, addr) in addrs.iter().enumerate() {
             if i != j {
-                let peer_id = kameo_remote::PeerId::new(&format!("node{}", j));
-                let peer = handles[i].add_peer(&peer_id).await;
-                peer.connect(&addrs[j])
+                let peer_id = kameo_remote::PeerId::new(format!("node{}", j));
+                let peer = handle.add_peer(&peer_id).await;
+                peer.connect(addr)
                     .await
-                    .expect(&format!("Failed to connect node{} to node{}", i, j));
+                    .unwrap_or_else(|_| panic!("Failed to connect node{} to node{}", i, j));
             }
         }
     }

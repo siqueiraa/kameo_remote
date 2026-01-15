@@ -4,7 +4,7 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
-use tracing::{debug, error, info, warn};
+use tracing::debug;
 
 /// TLS-enabled gossip client - connects to TLS server
 ///

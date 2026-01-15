@@ -1,5 +1,7 @@
 use bytes::BufMut;
+use futures::FutureExt;
 use std::fmt::Debug;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicUsize, Ordering};
 use std::{collections::HashMap, net::SocketAddr, pin::Pin, sync::Arc, time::Duration};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -36,6 +38,11 @@ pub const RING_BUFFER_SLOTS: usize = 1024; // Number of WriteCommand slots in ri
 pub struct BufferConfig {
     ring_buffer_slots: usize, // Number of message slots in ring buffer
     tcp_buffer_size: usize,   // Size in bytes for TCP buffers
+}
+
+#[cfg(feature = "test-helpers")]
+fn process_mock_request(request: &str) -> Vec<u8> {
+    format!("mock-response:{}", request).into_bytes()
 }
 
 impl BufferConfig {
@@ -169,6 +176,13 @@ impl From<u32> for ConnectionState {
     }
 }
 
+/// Direction of the TCP connection relative to this node
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionDirection {
+    Inbound,
+    Outbound,
+}
+
 /// Lock-free connection metadata
 #[derive(Debug)]
 pub struct LockFreeConnection {
@@ -180,6 +194,7 @@ pub struct LockFreeConnection {
     pub failure_count: AtomicUsize,
     pub stream_handle: Option<Arc<LockFreeStreamHandle>>,
     pub(crate) correlation: Option<Arc<CorrelationTracker>>,
+    pub direction: ConnectionDirection,
 }
 
 impl Clone for LockFreeConnection {
@@ -193,12 +208,13 @@ impl Clone for LockFreeConnection {
             failure_count: AtomicUsize::new(self.failure_count.load(Ordering::Relaxed)),
             stream_handle: self.stream_handle.clone(),
             correlation: self.correlation.clone(),
+            direction: self.direction,
         }
     }
 }
 
 impl LockFreeConnection {
-    pub fn new(addr: SocketAddr) -> Self {
+    pub fn new(addr: SocketAddr, direction: ConnectionDirection) -> Self {
         Self {
             addr,
             state: AtomicU32::new(ConnectionState::Disconnected as u32),
@@ -208,6 +224,7 @@ impl LockFreeConnection {
             failure_count: AtomicUsize::new(0),
             stream_handle: None,
             correlation: Some(CorrelationTracker::new()),
+            direction,
         }
     }
 
@@ -454,9 +471,11 @@ pub struct LockFreeStreamHandle {
     addr: SocketAddr,
     channel_id: ChannelId,
     sequence_counter: Arc<AtomicUsize>,
+    frame_sequence: Arc<AtomicUsize>,
     bytes_written: Arc<AtomicUsize>, // This tracks actual TCP bytes written
     ring_buffer: Arc<LockFreeRingBuffer>,
     shutdown_signal: Arc<AtomicBool>,
+    flush_pending: Arc<AtomicBool>,
     /// Atomic flag for coordinating streaming mode
     streaming_active: Arc<AtomicBool>,
     /// Channel to send streaming commands to background task
@@ -479,6 +498,7 @@ impl LockFreeStreamHandle {
         let ring_buffer = Arc::new(LockFreeRingBuffer::new(buffer_config.ring_buffer_slots()));
         let shutdown_signal = Arc::new(AtomicBool::new(false));
         let streaming_active = Arc::new(AtomicBool::new(false));
+        let flush_pending = Arc::new(AtomicBool::new(false));
 
         // Create shared counter for actual TCP bytes written
         let bytes_written = Arc::new(AtomicUsize::new(0));
@@ -492,6 +512,7 @@ impl LockFreeStreamHandle {
             let shutdown_signal = shutdown_signal.clone();
             let bytes_written_for_task = bytes_written.clone();
             let streaming_active_for_task = streaming_active.clone();
+            let flush_pending_for_task = flush_pending.clone();
 
             tokio::spawn(async move {
                 Self::background_writer_task(
@@ -499,6 +520,7 @@ impl LockFreeStreamHandle {
                     ring_buffer,
                     shutdown_signal,
                     bytes_written_for_task,
+                    flush_pending_for_task,
                     streaming_active_for_task,
                     streaming_rx,
                 )
@@ -510,9 +532,11 @@ impl LockFreeStreamHandle {
             addr,
             channel_id,
             sequence_counter: Arc::new(AtomicUsize::new(0)),
+            frame_sequence: Arc::new(AtomicUsize::new(0)),
             bytes_written, // This now tracks actual TCP bytes written
             ring_buffer,
             shutdown_signal,
+            flush_pending,
             streaming_active,
             streaming_tx,
             buffer_config,
@@ -526,6 +550,7 @@ impl LockFreeStreamHandle {
         ring_buffer: Arc<LockFreeRingBuffer>,
         shutdown_signal: Arc<AtomicBool>,
         bytes_written_counter: Arc<AtomicUsize>, // Track ALL bytes written to TCP
+        flush_pending: Arc<AtomicBool>,
         streaming_active: Arc<AtomicBool>,
         mut streaming_rx: mpsc::UnboundedReceiver<StreamingCommand>,
     ) where
@@ -534,8 +559,8 @@ impl LockFreeStreamHandle {
         use std::io::IoSlice;
         use tokio::io::AsyncWriteExt;
 
-        // Use direct tokio writer with vectored I/O for now
-        // TODO: Integrate platform-specific writers (io_uring on Linux 5.1+)
+        // Use direct tokio writer with vectored I/O for now.
+        // Future optimization: wire in platform-specific writers (io_uring on Linux 5.1+).
         // This requires either:
         // 1. Modifying StreamWriter trait to work with OwnedWriteHalf
         // 2. Or using a different socket splitting approach that allows io_uring
@@ -570,6 +595,7 @@ impl LockFreeStreamHandle {
                         }
                         StreamingCommand::Flush => {
                             let _ = writer.flush().await;
+                            flush_pending.store(false, Ordering::Release);
                         }
                         StreamingCommand::VectoredWrite(cmd) => {
                             // Zero-copy vectored I/O - header + payload in single syscall
@@ -665,13 +691,6 @@ impl LockFreeStreamHandle {
         }
     }
 
-    // DEPRECATED: write_nonblocking - Use send_bytes_zero_copy instead to avoid copying
-    // pub fn write_nonblocking(&self, data: &[u8]) -> Result<()> {
-    //     // TODO: This still copies data - need to migrate all callers to send_bytes_zero_copy
-    //     warn!("DEPRECATED: write_nonblocking called - should use send_bytes_zero_copy");
-    //     self.write_bytes_nonblocking(bytes::Bytes::copy_from_slice(data))
-    // }
-
     /// Write Bytes to the lock-free ring buffer - NO BLOCKING, NO COPY
     pub fn write_bytes_nonblocking(&self, data: bytes::Bytes) -> Result<()> {
         let sequence = self.sequence_counter.fetch_add(1, Ordering::Relaxed);
@@ -693,10 +712,21 @@ impl LockFreeStreamHandle {
 
     /// Flush the writer immediately - used for low-latency ask operations
     pub fn flush_immediately(&self) -> Result<()> {
-        // Send a flush command to the writer task
-        self.streaming_tx
-            .send(StreamingCommand::Flush)
-            .map_err(|_| GossipError::Shutdown)
+        // Coalesce flush requests to avoid flooding the writer task.
+        if self
+            .flush_pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.streaming_tx
+                .send(StreamingCommand::Flush)
+                .map_err(|_| {
+                    self.flush_pending.store(false, Ordering::Release);
+                    GossipError::Shutdown
+                })
+        } else {
+            Ok(())
+        }
     }
 
     /// Write data with vectored batching - still no blocking
@@ -754,6 +784,11 @@ impl LockFreeStreamHandle {
     /// Get sequence counter
     pub fn sequence_number(&self) -> usize {
         self.sequence_counter.load(Ordering::Relaxed)
+    }
+
+    /// Get next stream frame sequence ID (wraps at u16::MAX)
+    fn next_frame_sequence_id(&self) -> u16 {
+        (self.frame_sequence.fetch_add(1, Ordering::Relaxed) & 0xFFFF) as u16
     }
 
     /// Get socket address
@@ -1069,6 +1104,9 @@ pub struct ConnectionPool {
     /// Connection counter for load balancing
     connection_counter: AtomicUsize,
 }
+
+unsafe impl Send for ConnectionPool {}
+unsafe impl Sync for ConnectionPool {}
 
 /// Maximum number of pending responses (must be power of 2 for fast modulo)
 const PENDING_RESPONSES_SIZE: usize = 1024;
@@ -1723,7 +1761,7 @@ impl ConnectionHandle {
             frame_type: StreamFrameType::Data as u8,
             channel_id: ChannelId::TellAsk as u8,
             flags: 0,
-            sequence_id: 0, // TODO: Add sequence tracking for ordering
+            sequence_id: self.stream_handle.next_frame_sequence_id(),
             payload_len: payload.len() as u32,
         };
 
@@ -1773,7 +1811,7 @@ impl ConnectionHandle {
                 } else {
                     StreamFrameFlags::More as u8
                 },
-                sequence_id: 0, // TODO: Add sequence tracking
+                sequence_id: self.stream_handle.next_frame_sequence_id(),
                 payload_len: payload.len() as u32,
             };
 
@@ -1834,6 +1872,12 @@ impl ConnectionPool {
     /// Set the registry reference for handling incoming messages
     pub fn set_registry(&mut self, registry: std::sync::Arc<GossipRegistry>) {
         self.registry = Some(std::sync::Arc::downgrade(&registry));
+    }
+
+    fn clear_capabilities_for_addr(&self, addr: &SocketAddr) {
+        if let Some(registry) = self.registry.as_ref().and_then(|w| w.upgrade()) {
+            registry.clear_peer_capabilities(addr);
+        }
     }
 
     /// Store or update the address for a node
@@ -2056,7 +2100,7 @@ impl ConnectionPool {
             BufferConfig::default(),
         ));
 
-        let mut connection = LockFreeConnection::new(addr);
+        let mut connection = LockFreeConnection::new(addr, ConnectionDirection::Outbound);
         connection.stream_handle = Some(stream_handle);
         connection.set_state(ConnectionState::Connected);
         connection.update_last_used();
@@ -2155,6 +2199,26 @@ impl ConnectionPool {
             }
 
             self.connection_counter.fetch_sub(1, Ordering::AcqRel);
+            self.clear_capabilities_for_addr(&addr);
+            Some(connection)
+        } else {
+            None
+        }
+    }
+
+    /// Disconnect and remove a connection by node ID
+    pub fn disconnect_connection_by_node_id(
+        &self,
+        node_id: &str,
+    ) -> Option<Arc<LockFreeConnection>> {
+        let peer_id = crate::PeerId::new(node_id);
+        if let Some((_, connection)) = self.connections_by_peer.remove(&peer_id) {
+            let addr = connection.addr;
+            self.connections.remove(&addr);
+            self.addr_to_peer_id.remove(&addr);
+            self.peer_id_to_addr.remove(&peer_id);
+            self.connection_counter.fetch_sub(1, Ordering::AcqRel);
+            self.clear_capabilities_for_addr(&addr);
             Some(connection)
         } else {
             None
@@ -2254,7 +2318,19 @@ impl ConnectionPool {
             if conn.value().is_connected() {
                 conn.value().update_last_used();
                 debug!(addr = %addr, "using existing persistent connection (fast path)");
-                // TODO: ConnectionHandle needs refactoring for lock-free connections
+                if let Some(ref stream_handle) = conn.value().stream_handle {
+                    return Some(ConnectionHandle {
+                        addr,
+                        stream_handle: stream_handle.clone(),
+                        correlation: conn
+                            .value()
+                            .correlation
+                            .clone()
+                            .unwrap_or_else(CorrelationTracker::new),
+                    });
+                }
+
+                debug!(addr = %addr, "existing connection missing stream handle");
                 return None;
             } else {
                 // Remove disconnected connection
@@ -2416,6 +2492,46 @@ impl ConnectionPool {
             }
         }
 
+        // Duplicate connection tie-breaker: decide whether to reuse an existing link
+        if let (Some(registry_arc), Some(node_id_value)) = (
+            registry_weak.as_ref().and_then(|w| w.upgrade()),
+            node_id.as_ref(),
+        ) {
+            let remote_node_id = node_id_value.to_string();
+            if let Some(existing_conn) = self.get_connection_by_node_id(&remote_node_id) {
+                if !registry_arc.should_keep_connection(&remote_node_id, true) {
+                    debug!(
+                        remote = %remote_node_id,
+                        "tie-breaker: reusing existing connection instead of dialing outbound"
+                    );
+                    if let Some(ref stream_handle) = existing_conn.stream_handle {
+                        return Ok(ConnectionHandle {
+                            addr: existing_conn.addr,
+                            stream_handle: stream_handle.clone(),
+                            correlation: existing_conn
+                                .correlation
+                                .clone()
+                                .unwrap_or_else(CorrelationTracker::new),
+                        });
+                    } else {
+                        return Err(GossipError::Network(std::io::Error::other(
+                            "Existing connection missing stream handle",
+                        )));
+                    }
+                } else {
+                    debug!(
+                        remote = %remote_node_id,
+                        "tie-breaker: replacing existing connection with outbound dial"
+                    );
+                    if let Some(removed) = self.disconnect_connection_by_node_id(&remote_node_id) {
+                        if let Some(handle) = removed.stream_handle.as_ref() {
+                            handle.shutdown();
+                        }
+                    }
+                }
+            }
+        }
+
         // Connect with timeout
         debug!("CONNECTION POOL: Attempting to connect to {}", addr);
         let stream = tokio::time::timeout(connection_timeout, TcpStream::connect(addr))
@@ -2443,105 +2559,152 @@ impl ConnectionPool {
                 debug!("CONNECTION POOL: TLS enabled, checking for peer NodeId");
 
                 // Use provided NodeId if available, otherwise look it up from gossip state
-                let peer_node_id = if node_id.is_some() {
-                    node_id
-                } else {
-                    // Look up the peer's NodeId from the registry's peer info
-                    let gossip_state = registry_arc.gossip_state.lock().await;
-                    gossip_state
-                        .peers
-                        .get(&addr)
-                        .and_then(|peer_info| peer_info.node_id)
-                };
+                let peer_node_id = node_id
+                    .or_else(|| registry_arc.lookup_node_id(&addr).now_or_never().flatten())
+                    .or_else(|| {
+                        registry_arc
+                            .peer_capability_addr_to_node
+                            .get(&addr)
+                            .map(|entry| *entry.value())
+                    });
 
-                if let Some(node_id) = peer_node_id {
-                    // We have the NodeId - perform TLS handshake
+                let mut discovered_node_id = peer_node_id;
+                let (server_name, server_name_label) = if let Some(node_id) = discovered_node_id {
                     debug!(
                         "CONNECTION POOL: Found NodeId for peer {}, performing TLS handshake",
                         addr
                     );
-
-                    // Create DNS name from NodeId
                     let dns_name = crate::tls::name::encode(&node_id);
                     let server_name = rustls::pki_types::ServerName::try_from(dns_name)
                         .map_err(|e| GossipError::TlsError(format!("Invalid DNS name: {}", e)))?;
-
-                    // Create TLS connector
-                    info!(
-                        "🔐 TLS ENABLED: Initiating TLS connection to {} with NodeId {}",
-                        addr,
-                        node_id.fmt_short()
-                    );
-                    let connector =
-                        tokio_rustls::TlsConnector::from(tls_config.client_config.clone());
-
-                    // Perform TLS handshake
-                    match tokio::time::timeout(
-                        Duration::from_secs(10),
-                        connector.connect(server_name, stream),
+                    (server_name, format!("NodeId {}", node_id.fmt_short()))
+                } else {
+                    // Use placeholder DNS name so TLS can still negotiate; verifier will extract NodeId from cert
+                    let placeholder = format!("peer-{}.kameo.invalid", addr.port());
+                    let server_name = rustls::pki_types::ServerName::try_from(placeholder.clone())
+                        .map_err(|e| {
+                            GossipError::TlsError(format!("Invalid fallback DNS name: {}", e))
+                        })?;
+                    (
+                        server_name,
+                        format!("placeholder SNI {} (NodeId unknown)", placeholder),
                     )
-                    .await
-                    {
-                        Ok(Ok(tls_stream)) => {
+                };
+
+                info!(
+                    "🔐 TLS ENABLED: Initiating TLS connection to {} using {}",
+                    addr, server_name_label
+                );
+                let connector = tokio_rustls::TlsConnector::from(tls_config.client_config.clone());
+
+                match tokio::time::timeout(
+                    Duration::from_secs(10),
+                    connector.connect(server_name, stream),
+                )
+                .await
+                {
+                    Ok(Ok(mut tls_stream)) => {
+                        if discovered_node_id.is_none() {
+                            if let Some(certs) = tls_stream.get_ref().1.peer_certificates() {
+                                if let Some(cert) = certs.first() {
+                                    match crate::tls::extract_node_id_from_cert(cert) {
+                                        Ok(node_id) => {
+                                            debug!(addr = %addr, "Extracted NodeId {} from peer certificate", node_id.fmt_short());
+                                            if registry_arc.lookup_node_id(&addr).await.is_none() {
+                                                registry_arc
+                                                    .add_peer_with_node_id(addr, Some(node_id))
+                                                    .await;
+                                            }
+                                            discovered_node_id = Some(node_id);
+                                        }
+                                        Err(err) => {
+                                            warn!(addr = %addr, error = %err, "Failed to extract NodeId from peer certificate");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if let Some(node_id) = discovered_node_id {
                             info!(
                                 "✅ TLS handshake successful with {} (NodeId: {})",
                                 addr,
                                 node_id.fmt_short()
                             );
-                            let (read_half, write_half) = tokio::io::split(tls_stream);
-                            (
-                                Box::pin(read_half) as Pin<Box<dyn AsyncRead + Send>>,
-                                Box::pin(write_half) as Pin<Box<dyn AsyncWrite + Send>>,
-                            )
+                        } else {
+                            info!("✅ TLS handshake successful with {} (NodeId unknown)", addr);
                         }
-                        Ok(Err(e)) => {
-                            error!(
-                                "❌ TLS handshake failed with {} (expected NodeId: {}): {}",
-                                addr,
-                                node_id.fmt_short(),
-                                e
-                            );
-                            return Err(GossipError::TlsError(format!(
-                                "TLS handshake failed: {}",
-                                e
-                            )));
+
+                        let negotiated_alpn = tls_stream
+                            .get_ref()
+                            .1
+                            .alpn_protocol()
+                            .map(|proto| proto.to_vec());
+
+                        let enable_peer_discovery = registry_arc.config.enable_peer_discovery;
+                        let peer_caps = match crate::handshake::perform_hello_handshake(
+                            &mut tls_stream,
+                            negotiated_alpn.as_deref(),
+                            enable_peer_discovery,
+                        )
+                        .await
+                        {
+                            Ok(caps) => {
+                                eprintln!(
+                                    "outbound hello capabilities to {} can_send={}",
+                                    addr,
+                                    caps.can_send_peer_list()
+                                );
+                                caps
+                            }
+                            Err(err) => {
+                                warn!(
+                                    addr = %addr,
+                                    error = %err,
+                                    "Hello handshake failed after TLS session establishment"
+                                );
+                                return Err(err);
+                            }
+                        };
+                        registry_arc.set_peer_capabilities(addr, peer_caps.clone());
+
+                        if let Some(node_id) = discovered_node_id
+                            .or_else(|| registry_arc.lookup_node_id(&addr).now_or_never().flatten())
+                        {
+                            registry_arc
+                                .associate_peer_capabilities_with_node(addr, node_id)
+                                .await;
                         }
-                        Err(_) => {
-                            error!(
-                                "⏱️ TLS handshake timed out with {} (expected NodeId: {})",
-                                addr,
-                                node_id.fmt_short()
-                            );
-                            return Err(GossipError::Timeout);
-                        }
+
+                        let (read_half, write_half) = tokio::io::split(tls_stream);
+                        (
+                            Box::pin(read_half) as Pin<Box<dyn AsyncRead + Send>>,
+                            Box::pin(write_half) as Pin<Box<dyn AsyncWrite + Send>>,
+                        )
                     }
-                } else {
-                    // No NodeId available - can't do TLS, return error instead of panic
-                    error!("❌ TLS is configured but no NodeId available for peer {}. Cannot establish secure connection.", addr);
-                    return Err(GossipError::TlsError(format!(
-                        "Cannot establish TLS connection to {} without NodeId. Peer may not have connected yet.",
-                        addr
-                    )));
-                    // COMMENTED OUT: Plain TCP fallback - migrating to TLS-only
-                    // let (read_half, write_half) = stream.into_split();
-                    // (Box::pin(read_half) as Pin<Box<dyn AsyncRead + Send>>,
-                    //  Box::pin(write_half) as Pin<Box<dyn AsyncWrite + Send>>)
+                    Ok(Err(e)) => {
+                        error!(addr = %addr, error = %e, "❌ TLS handshake failed");
+                        return Err(GossipError::TlsError(format!(
+                            "TLS handshake failed: {}",
+                            e
+                        )));
+                    }
+                    Err(_) => {
+                        error!(
+                            addr = %addr,
+                            "⏱️ TLS handshake timed out (NodeId hint: {:?})",
+                            discovered_node_id.as_ref().map(|id| id.fmt_short())
+                        );
+                        return Err(GossipError::Timeout);
+                    }
                 }
             } else {
                 // No TLS configured - panic to enforce TLS-only
                 panic!("🔥 TLS is NOT configured but is required! Cannot establish plain TCP connection to {}", addr);
-                // COMMENTED OUT: Plain TCP path - migrating to TLS-only
-                // let (read_half, write_half) = stream.into_split();
-                // (Box::pin(read_half) as Pin<Box<dyn AsyncRead + Send>>,
-                //  Box::pin(write_half) as Pin<Box<dyn AsyncWrite + Send>>)
             }
         } else {
             // No registry reference - panic to enforce TLS requirement
             panic!("🔥 No registry reference available - TLS cannot be verified! Cannot establish connection to {}", addr);
-            // COMMENTED OUT: Plain TCP fallback - migrating to TLS-only
-            // let (read_half, write_half) = stream.into_split();
-            // (Box::pin(read_half) as Pin<Box<dyn AsyncRead + Send>>,
-            //  Box::pin(write_half) as Pin<Box<dyn AsyncWrite + Send>>)
         };
 
         // Create lock-free connection for receiving
@@ -2552,7 +2715,7 @@ impl ConnectionPool {
             BufferConfig::default(),
         ));
 
-        let mut conn = LockFreeConnection::new(addr);
+        let mut conn = LockFreeConnection::new(addr, ConnectionDirection::Outbound);
         conn.stream_handle = Some(stream_handle.clone());
         conn.set_state(ConnectionState::Connected);
         conn.update_last_used();
@@ -2681,12 +2844,17 @@ impl ConnectionPool {
 
                         // Process complete messages
                         while partial_msg_buf.len() >= 4 {
-                            let len = u32::from_be_bytes([
-                                partial_msg_buf[0],
-                                partial_msg_buf[1],
-                                partial_msg_buf[2],
-                                partial_msg_buf[3],
-                            ]) as usize;
+                        let len = u32::from_be_bytes([
+                            partial_msg_buf[0],
+                            partial_msg_buf[1],
+                            partial_msg_buf[2],
+                            partial_msg_buf[3],
+                        ]) as usize;
+                        debug!(
+                            peer = %addr,
+                            frame_len = len,
+                            "🔍 TLS reader got frame length prefix (client stream)"
+                        );
 
                             if partial_msg_buf.len() >= 4 + len {
                                 // We have a complete message
@@ -2700,8 +2868,15 @@ impl ConnectionPool {
 
                                 // Check if this is an Ask/Response message by looking at first byte
                                 if !msg_data.is_empty() {
+                                    let msg_type_byte = msg_data[0];
+                                    debug!(
+                                        peer = %addr,
+                                        msg_type_byte,
+                                        payload_bytes = msg_data.len(),
+                                        "🔍 TLS reader inspecting message type (client stream)"
+                                    );
                                     if let Some(msg_type) =
-                                        crate::MessageType::from_byte(msg_data[0])
+                                        crate::MessageType::from_byte(msg_type_byte)
                                     {
                                         debug!(peer = %addr, msg_type = ?msg_type, "Identified message type: {:?}", msg_type);
                                         // This is an Ask/Response message
@@ -2895,8 +3070,162 @@ impl ConnectionPool {
                                                 }
                                             }
                                             crate::MessageType::ActorAsk => {
-                                                // TODO: Implement ActorAsk handling
-                                                warn!(peer = %addr, "ActorAsk not yet implemented");
+                                                // Direct actor ask message format:
+                                                // Already parsed: [type:1][correlation_id:2][reserved:5]
+                                                // Payload: [actor_id:8][type_hash:4][payload_len:4][payload:N]
+                                                if payload.len() >= 16 {
+                                                    let actor_id = u64::from_be_bytes(
+                                                        payload[0..8].try_into().unwrap(),
+                                                    );
+                                                    let type_hash = u32::from_be_bytes(
+                                                        payload[8..12].try_into().unwrap(),
+                                                    );
+                                                    let payload_len = u32::from_be_bytes(
+                                                        payload[12..16].try_into().unwrap(),
+                                                    ) as usize;
+
+                                                    if payload.len() >= 16 + payload_len {
+                                                        let actor_payload =
+                                                            &payload[16..16 + payload_len];
+
+                                                        if let Some(ref registry_weak) =
+                                                            registry_weak_for_reader
+                                                        {
+                                                            if let Some(registry) =
+                                                                registry_weak.upgrade()
+                                                            {
+                                                                let actor_id_str =
+                                                                    actor_id.to_string();
+                                                                match registry
+                                                                    .handle_actor_message(
+                                                                        &actor_id_str,
+                                                                        type_hash,
+                                                                        actor_payload,
+                                                                        Some(correlation_id),
+                                                                    )
+                                                                    .await
+                                                                {
+                                                                    Ok(Some(reply_payload)) => {
+                                                                        if let Some(
+                                                                            ref stream_handle,
+                                                                        ) = reader_connection
+                                                                            .stream_handle
+                                                                        {
+                                                                            let mut response =
+                                                                                bytes::BytesMut::with_capacity(
+                                                                                    4 + 8 + reply_payload.len(),
+                                                                                );
+                                                                            let total_len =
+                                                                                8 + reply_payload.len() as u32;
+                                                                            response.extend_from_slice(
+                                                                                &total_len.to_be_bytes(),
+                                                                            );
+                                                                            response.put_u8(
+                                                                                crate::MessageType::Response
+                                                                                    as u8,
+                                                                            );
+                                                                            response.extend_from_slice(
+                                                                                &correlation_id.to_be_bytes(),
+                                                                            );
+                                                                            response.extend_from_slice(
+                                                                                &[0u8; 5],
+                                                                            );
+                                                                            response.extend_from_slice(
+                                                                                &reply_payload,
+                                                                            );
+
+                                                                            if let Err(e) =
+                                                                                stream_handle
+                                                                                    .write_bytes_nonblocking(
+                                                                                        response.freeze(),
+                                                                                    )
+                                                                            {
+                                                                                warn!(peer = %addr, error = %e, "Failed to send ActorAsk response");
+                                                                            } else {
+                                                                                debug!(peer = %addr, correlation_id = correlation_id, "Sent ActorAsk response");
+                                                                            }
+                                                                        } else {
+                                                                            warn!(peer = %addr, "ActorAsk response dropped: missing stream handle");
+                                                                        }
+                                                                    }
+                                                                    Ok(None) => {
+                                                                        debug!(peer = %addr, correlation_id = correlation_id, "ActorAsk handled with no reply");
+                                                                    }
+                                                                    Err(e) => {
+                                                                        error!(peer = %addr, error = %e, "Failed to handle ActorAsk");
+                                                                    }
+                                                                }
+                                                            } else {
+                                                                error!(peer = %addr, "Registry weak reference could not be upgraded");
+                                                            }
+                                                        } else {
+                                                            error!(peer = %addr, "No registry weak reference available");
+                                                        }
+                                                    } else {
+                                                        let mut handled_as_registry = false;
+                                                        if let Some(ref registry_weak) =
+                                                            registry_weak_for_reader
+                                                        {
+                                                            if let Some(registry) =
+                                                                registry_weak.upgrade()
+                                                            {
+                                                                let msg_data_vec = msg_data.to_vec();
+                                                                if let Ok(registry_msg) = rkyv::from_bytes::<
+                                                                    crate::registry::RegistryMessage,
+                                                                    rkyv::rancor::Error,
+                                                                >(&msg_data_vec)
+                                                                {
+                                                                    handled_as_registry = true;
+                                                                    if let Err(e) =
+                                                                        handle_incoming_message(
+                                                                            registry,
+                                                                            addr,
+                                                                            registry_msg,
+                                                                        )
+                                                                        .await
+                                                                    {
+                                                                        warn!(peer = %addr, error = %e, "Failed to handle registry message fallback");
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+
+                                                        if !handled_as_registry {
+                                                            error!(peer = %addr, expected = 16 + payload_len, actual = payload.len(),
+                                                                  "ActorAsk payload too short");
+                                                        }
+                                                    }
+                                                } else {
+                                                    let mut handled_as_registry = false;
+                                                    if let Some(ref registry_weak) =
+                                                        registry_weak_for_reader
+                                                    {
+                                                        if let Some(registry) = registry_weak.upgrade() {
+                                                            let msg_data_vec = msg_data.to_vec();
+                                                            if let Ok(registry_msg) = rkyv::from_bytes::<
+                                                                crate::registry::RegistryMessage,
+                                                                rkyv::rancor::Error,
+                                                            >(&msg_data_vec)
+                                                            {
+                                                                handled_as_registry = true;
+                                                                if let Err(e) =
+                                                                    handle_incoming_message(
+                                                                        registry,
+                                                                        addr,
+                                                                        registry_msg,
+                                                                    )
+                                                                    .await
+                                                                {
+                                                                    warn!(peer = %addr, error = %e, "Failed to handle registry message fallback");
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+
+                                                    if !handled_as_registry {
+                                                        error!(peer = %addr, payload_len = payload.len(), "ActorAsk header too short");
+                                                    }
+                                                }
                                             }
                                             crate::MessageType::StreamStart => {
                                                 // Parse stream header from payload
@@ -3175,6 +3504,7 @@ impl ConnectionPool {
             // Dropping the sender will cause the receiver to return None,
             // signaling the connection handler to shut down
             // No need to drop writer
+            self.clear_capabilities_for_addr(&addr);
         }
     }
 
@@ -3275,6 +3605,11 @@ pub(crate) async fn handle_persistent_connection_reader(
                         partial_msg_buf[2],
                         partial_msg_buf[3],
                     ]) as usize;
+                    debug!(
+                        peer = %peer_addr,
+                        frame_len = len,
+                        "🔍 TLS reader got frame length prefix (server stream)"
+                    );
 
                     if len > 100 * 1024 * 1024 {
                         warn!(peer = %peer_addr, len = len, "Message too large - possible buffer corruption");
@@ -3327,11 +3662,18 @@ pub(crate) async fn handle_persistent_connection_reader(
 
                         // Check if this is an Ask/Response message by looking at first byte
                         if !msg_data.is_empty() {
+                            let msg_type_byte = msg_data[0];
+                            debug!(
+                                peer = %peer_addr,
+                                msg_type_byte,
+                                payload_bytes = msg_data.len(),
+                                "🔍 TLS reader inspecting message type (server stream)"
+                            );
                             // Debug log for large messages
                             // if len > 1024 * 1024 {
                             //     info!(peer = %peer_addr, first_byte = msg_data[0], "📦 LARGE MESSAGE first byte: {} (0=Gossip, 3=ActorTell)", msg_data[0]);
                             // }
-                            if let Some(msg_type) = crate::MessageType::from_byte(msg_data[0]) {
+                            if let Some(msg_type) = crate::MessageType::from_byte(msg_type_byte) {
                                 // This is an Ask/Response message
                                 if msg_data.len() < 8 {
                                     warn!(peer = %peer_addr, "Ask/Response message too small");
@@ -3797,8 +4139,171 @@ pub(crate) async fn handle_persistent_connection_reader(
                                         }
                                     }
                                     crate::MessageType::ActorAsk => {
-                                        // TODO: Implement ActorAsk handling
-                                        warn!(peer = %peer_addr, "ActorAsk not yet implemented");
+                                        // Direct actor ask message format:
+                                        // Already parsed: [type:1][correlation_id:2][reserved:5]
+                                        // Payload: [actor_id:8][type_hash:4][payload_len:4][payload:N]
+                                        if payload.len() >= 16 {
+                                            let actor_id = u64::from_be_bytes(
+                                                payload[0..8].try_into().unwrap(),
+                                            );
+                                            let type_hash = u32::from_be_bytes(
+                                                payload[8..12].try_into().unwrap(),
+                                            );
+                                            let payload_len = u32::from_be_bytes(
+                                                payload[12..16].try_into().unwrap(),
+                                            ) as usize;
+
+                                            if payload.len() >= 16 + payload_len {
+                                                let actor_payload =
+                                                    &payload[16..16 + payload_len];
+
+                                                if let Some(ref registry_weak) = registry_weak {
+                                                    if let Some(registry) = registry_weak.upgrade()
+                                                    {
+                                                        let actor_id_str =
+                                                            actor_id.to_string();
+                                                        match registry
+                                                            .handle_actor_message(
+                                                                &actor_id_str,
+                                                                type_hash,
+                                                                actor_payload,
+                                                                Some(correlation_id),
+                                                            )
+                                                            .await
+                                                        {
+                                                            Ok(Some(reply_payload)) => {
+                                                                let mut response = bytes::BytesMut::with_capacity(
+                                                                    4 + 8 + reply_payload.len(),
+                                                                );
+                                                                let total_len =
+                                                                    8 + reply_payload.len() as u32;
+                                                                response.extend_from_slice(
+                                                                    &total_len.to_be_bytes(),
+                                                                );
+                                                                response.put_u8(
+                                                                    crate::MessageType::Response
+                                                                        as u8,
+                                                                );
+                                                                response.extend_from_slice(
+                                                                    &correlation_id.to_be_bytes(),
+                                                                );
+                                                                response.extend_from_slice(
+                                                                    &[0u8; 5],
+                                                                );
+                                                                response
+                                                                    .extend_from_slice(&reply_payload);
+
+                                                                if let Some(ref handle) =
+                                                                    response_handle
+                                                                {
+                                                                    if let Err(e) = handle
+                                                                        .write_bytes_nonblocking(
+                                                                            response.freeze(),
+                                                                        )
+                                                                    {
+                                                                        warn!(peer = %peer_addr, error = %e, "Failed to send ActorAsk response");
+                                                                    } else {
+                                                                        debug!(peer = %peer_addr, correlation_id = correlation_id, "Sent ActorAsk response");
+                                                                    }
+                                                                } else {
+                                                                    let pool = registry
+                                                                        .connection_pool
+                                                                        .lock()
+                                                                        .await;
+                                                                    if let Some(conn) = pool
+                                                                        .connections
+                                                                        .get(&peer_addr)
+                                                                        .map(|c| c.value().clone())
+                                                                    {
+                                                                        if let Some(
+                                                                            ref stream_handle,
+                                                                        ) = conn.stream_handle
+                                                                        {
+                                                                            if let Err(e) = stream_handle.write_bytes_nonblocking(response.freeze()) {
+                                                                                warn!(peer = %peer_addr, error = %e, "Failed to send ActorAsk response");
+                                                                            } else {
+                                                                                debug!(peer = %peer_addr, correlation_id = correlation_id, "Sent ActorAsk response through connection pool");
+                                                                            }
+                                                                        } else {
+                                                                            warn!(peer = %peer_addr, "Connection has no stream handle");
+                                                                        }
+                                                                    } else {
+                                                                        warn!(peer = %peer_addr, "No connection found in pool for ActorAsk reply");
+                                                                    }
+                                                                }
+                                                            }
+                                                            Ok(None) => {
+                                                                debug!(peer = %peer_addr, correlation_id = correlation_id, "ActorAsk handled with no reply");
+                                                            }
+                                                            Err(e) => {
+                                                                warn!(peer = %peer_addr, error = %e, correlation_id = correlation_id, "Failed to handle ActorAsk");
+                                                            }
+                                                        }
+                                                    } else {
+                                                        warn!(peer = %peer_addr, "Registry weak reference could not be upgraded");
+                                                    }
+                                                } else {
+                                                    warn!(peer = %peer_addr, "No registry weak reference available");
+                                                }
+                                            } else {
+                                                let mut handled_as_registry = false;
+                                                if let Some(ref registry_weak) = registry_weak {
+                                                    if let Some(registry) = registry_weak.upgrade()
+                                                    {
+                                                        let msg_data_vec = msg_data.to_vec();
+                                                        if let Ok(registry_msg) = rkyv::from_bytes::<
+                                                            crate::registry::RegistryMessage,
+                                                            rkyv::rancor::Error,
+                                                        >(&msg_data_vec)
+                                                        {
+                                                            handled_as_registry = true;
+                                                            if let Err(e) =
+                                                                handle_incoming_message(
+                                                                    registry,
+                                                                    peer_addr,
+                                                                    registry_msg,
+                                                                )
+                                                                .await
+                                                            {
+                                                                warn!(peer = %peer_addr, error = %e, "Failed to handle registry message fallback");
+                                                            }
+                                                        }
+                                                    }
+                                                }
+
+                                                if !handled_as_registry {
+                                                    warn!(peer = %peer_addr, expected = 16 + payload_len, actual = payload.len(),
+                                                          "ActorAsk payload too short");
+                                                }
+                                            }
+                                        } else {
+                                            let mut handled_as_registry = false;
+                                            if let Some(ref registry_weak) = registry_weak {
+                                                if let Some(registry) = registry_weak.upgrade() {
+                                                    let msg_data_vec = msg_data.to_vec();
+                                                    if let Ok(registry_msg) = rkyv::from_bytes::<
+                                                        crate::registry::RegistryMessage,
+                                                        rkyv::rancor::Error,
+                                                    >(&msg_data_vec)
+                                                    {
+                                                        handled_as_registry = true;
+                                                        if let Err(e) = handle_incoming_message(
+                                                            registry,
+                                                            peer_addr,
+                                                            registry_msg,
+                                                        )
+                                                        .await
+                                                        {
+                                                            warn!(peer = %peer_addr, error = %e, "Failed to handle registry message fallback");
+                                                        }
+                                                    }
+                                                }
+                                            }
+
+                                            if !handled_as_registry {
+                                                warn!(peer = %peer_addr, payload_len = payload.len(), "ActorAsk header too short");
+                                            }
+                                        }
                                     }
                                     crate::MessageType::StreamStart => {
                                         // Parse stream header from payload
@@ -3979,86 +4484,793 @@ pub(crate) async fn handle_persistent_connection_reader(
 }
 
 /// Handle an incoming message on a bidirectional connection
-pub(crate) async fn handle_incoming_message(
+pub(crate) fn handle_incoming_message(
     registry: Arc<GossipRegistry>,
     _peer_addr: SocketAddr,
     msg: RegistryMessage,
-) -> Result<()> {
-    match msg {
-        RegistryMessage::DeltaGossip { delta } => {
-            debug!(
-                sender = %delta.sender_peer_id,
-                since_sequence = delta.since_sequence,
-                changes = delta.changes.len(),
-                "received delta gossip message on bidirectional connection"
-            );
+) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
+    Box::pin(async move {
+        match msg {
+            RegistryMessage::DeltaGossip { delta } => {
+                debug!(
+                    sender = %delta.sender_peer_id,
+                    since_sequence = delta.since_sequence,
+                    changes = delta.changes.len(),
+                    "received delta gossip message on bidirectional connection"
+                );
 
-            // OPTIMIZATION: Do all peer management in one lock acquisition
-            {
-                let mut gossip_state = registry.gossip_state.lock().await;
+                // OPTIMIZATION: Do all peer management in one lock acquisition
+                {
+                    let mut gossip_state = registry.gossip_state.lock().await;
 
-                // Use the actual peer address we received from
-                let sender_socket_addr = _peer_addr;
+                    // Use the actual peer address we received from
+                    let sender_socket_addr = _peer_addr;
 
-                // Add the sender as a peer (inlined to avoid separate lock)
-                if delta.sender_peer_id != registry.peer_id {
-                    if let std::collections::hash_map::Entry::Vacant(e) =
-                        gossip_state.peers.entry(sender_socket_addr)
-                    {
-                        let current_time = crate::current_timestamp();
-                        e.insert(crate::registry::PeerInfo {
-                            address: sender_socket_addr,
-                            peer_address: None,
-                            node_id: None,
-                            failures: 0,
-                            last_attempt: current_time,
-                            last_success: current_time,
-                            last_sequence: 0,
-                            last_sent_sequence: 0,
-                            consecutive_deltas: 0,
-                            last_failure_time: None,
-                        });
+                    // Add the sender as a peer (inlined to avoid separate lock)
+                    if delta.sender_peer_id != registry.peer_id {
+                        if let std::collections::hash_map::Entry::Vacant(e) =
+                            gossip_state.peers.entry(sender_socket_addr)
+                        {
+                            let current_time = crate::current_timestamp();
+                            e.insert(crate::registry::PeerInfo {
+                                address: sender_socket_addr,
+                                peer_address: None,
+                                node_id: None,
+                                failures: 0,
+                                last_attempt: current_time,
+                                last_success: current_time,
+                                last_sequence: 0,
+                                last_sent_sequence: 0,
+                                consecutive_deltas: 0,
+                                last_failure_time: None,
+                            });
+                        }
+                    }
+
+                    // Check if this is a previously failed peer
+                    let was_failed = gossip_state
+                        .peers
+                        .get(&sender_socket_addr)
+                        .map(|info| info.failures >= registry.config.max_peer_failures)
+                        .unwrap_or(false);
+
+                    if was_failed {
+                        info!(
+                            peer = %delta.sender_peer_id,
+                            "✅ Received delta from previously failed peer - connection restored!"
+                        );
+
+                        // Clear the pending failure record
+                        gossip_state
+                            .pending_peer_failures
+                            .remove(&sender_socket_addr);
+                    }
+
+                    // Update peer info and check if we need to clear pending failures
+                    let need_to_clear_pending =
+                        if let Some(peer_info) = gossip_state.peers.get_mut(&sender_socket_addr) {
+                            // Always reset failure state when we receive messages from the peer
+                            // This proves the peer is alive and communicating
+                            let had_failures = peer_info.failures > 0;
+                            if had_failures {
+                                info!(peer = %delta.sender_peer_id,
+                              prev_failures = peer_info.failures,
+                              "🔄 Resetting failure state after receiving DeltaGossip");
+                                peer_info.failures = 0;
+                                peer_info.last_failure_time = None;
+                            }
+                            peer_info.last_success = crate::current_timestamp();
+
+                            peer_info.last_sequence =
+                                std::cmp::max(peer_info.last_sequence, delta.current_sequence);
+                            peer_info.consecutive_deltas += 1;
+
+                            had_failures
+                        } else {
+                            false
+                        };
+
+                    // Clear pending failure record if needed
+                    if need_to_clear_pending {
+                        gossip_state
+                            .pending_peer_failures
+                            .remove(&sender_socket_addr);
+                    }
+                    gossip_state.delta_exchanges += 1;
+                }
+
+                // CRITICAL OPTIMIZATION: Inline apply_delta to eliminate function call overhead
+                // Apply the delta directly here to minimize async scheduling delays
+                {
+                    let total_changes = delta.changes.len();
+                    // Use the actual peer address we received from
+                    let sender_addr = _peer_addr;
+
+                    // Pre-compute priority flags to avoid redundant checks
+                    let has_immediate = delta.changes.iter().any(|change| match change {
+                        crate::registry::RegistryChange::ActorAdded { priority, .. } => {
+                            priority.should_trigger_immediate_gossip()
+                        }
+                        crate::registry::RegistryChange::ActorRemoved { priority, .. } => {
+                            priority.should_trigger_immediate_gossip()
+                        }
+                    });
+
+                    if has_immediate {
+                        info!(
+                            "🎯 RECEIVING IMMEDIATE CHANGES: {} total changes from {}",
+                            total_changes, sender_addr
+                        );
+                    }
+
+                    // Pre-capture timing info outside lock for better performance - use high resolution timing
+                    let _received_instant = std::time::Instant::now();
+                    let received_timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos();
+
+                    // eprintln!("🔍 RECEIVED_TIMESTAMP: {}ns", received_timestamp);
+
+                    // Collect immediate actors for ACK before consuming changes
+                    let mut immediate_actors = Vec::new();
+                    for change in &delta.changes {
+                        if let crate::registry::RegistryChange::ActorAdded {
+                            name, priority, ..
+                        } = change
+                        {
+                            if priority.should_trigger_immediate_gossip() {
+                                immediate_actors.push(name.clone());
+                            }
+                        }
+                    }
+
+                    // OPTIMIZATION: Fast-path state updates with try_lock to avoid blocking
+                    let (applied_count, _pending_updates) = {
+                        // Try non-blocking access first
+                        if let Ok(mut actor_state) = registry.actor_state.try_write() {
+                            // Fast path - direct update without batching overhead
+                            let mut applied = 0;
+                            for change in delta.changes {
+                                match change {
+                                    crate::registry::RegistryChange::ActorAdded {
+                                        name,
+                                        location,
+                                        priority: _,
+                                    } => {
+                                        // Don't override local actors
+                                        if actor_state.local_actors.contains_key(name.as_str()) {
+                                            continue;
+                                        }
+
+                                        // Quick conflict check
+                                        let should_apply =
+                                            match actor_state.known_actors.get(name.as_str()) {
+                                                Some(existing) => {
+                                                    location.wall_clock_time
+                                                        > existing.wall_clock_time
+                                                        || (location.wall_clock_time
+                                                            == existing.wall_clock_time
+                                                            && location.address > existing.address)
+                                                }
+                                                None => true,
+                                            };
+
+                                        if should_apply {
+                                            actor_state
+                                                .known_actors
+                                                .insert(name.clone(), location.clone());
+                                            applied += 1;
+
+                                            // Inline timing calculation for immediate priority
+                                            if location.priority.should_trigger_immediate_gossip() {
+                                                let network_time_nanos = received_timestamp
+                                                    - delta.precise_timing_nanos as u128;
+                                                let network_time_ms =
+                                                    network_time_nanos as f64 / 1_000_000.0;
+                                                let propagation_time_ms = network_time_ms; // Same as network time for now
+                                                let processing_only_time_ms = 0.0; // No additional processing time beyond network
+
+                                                eprintln!("🔍 FAST_PATH: Processing immediate priority actor: {} propagation_time_ms={:.3}ms", name, propagation_time_ms);
+
+                                                info!(
+                                                    actor_name = %name,
+                                                    priority = ?location.priority,
+                                                    propagation_time_ms = propagation_time_ms,
+                                                    network_processing_time_ms = network_time_ms,
+                                                    processing_only_time_ms = processing_only_time_ms,
+                                                    "RECEIVED_ACTOR"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    crate::registry::RegistryChange::ActorRemoved {
+                                        name,
+                                        vector_clock,
+                                        removing_node_id,
+                                        priority: _,
+                                    } => {
+                                        // Check vector clock ordering before applying removal
+                                        let should_remove =
+                                            match actor_state.known_actors.get(name.as_str()) {
+                                                Some(existing_location) => {
+                                                    match vector_clock
+                                                        .compare(&existing_location.vector_clock)
+                                                    {
+                                                        crate::ClockOrdering::After => true,
+                                                        crate::ClockOrdering::Concurrent => {
+                                                            // For concurrent removals, use node_id as deterministic tiebreaker
+                                                            // This ensures all nodes make the same decision
+                                                            removing_node_id
+                                                                > existing_location.node_id
+                                                        }
+                                                        _ => false, // Ignore outdated removals (Before or Equal)
+                                                    }
+                                                }
+                                                None => false, // Actor doesn't exist
+                                            };
+
+                                        if should_remove
+                                            && actor_state
+                                                .known_actors
+                                                .remove(name.as_str())
+                                                .is_some()
+                                        {
+                                            applied += 1;
+                                        }
+                                    }
+                                }
+                            }
+                            (applied, Vec::new())
+                        } else {
+                            // Fallback to batched approach if lock is contended
+                            let actor_state = registry.actor_state.read().await;
+                            let mut pending_updates = Vec::new();
+                            let mut pending_removals = Vec::new();
+
+                            for change in &delta.changes {
+                                match change {
+                                    crate::registry::RegistryChange::ActorAdded {
+                                        name,
+                                        location,
+                                        priority: _,
+                                    } => {
+                                        // Don't override local actors - early exit
+                                        if actor_state.local_actors.contains_key(name.as_str()) {
+                                            debug!(
+                                                actor_name = %name,
+                                                "skipping remote actor update - actor is local"
+                                            );
+                                            continue;
+                                        }
+
+                                        // Check if we already know about this actor
+                                        let should_apply =
+                                            match actor_state.known_actors.get(name.as_str()) {
+                                                Some(existing_location) => {
+                                                    // Use vector clock for causal ordering
+                                                    match location
+                                                        .vector_clock
+                                                        .compare(&existing_location.vector_clock)
+                                                    {
+                                                        crate::ClockOrdering::After => true,
+                                                        crate::ClockOrdering::Concurrent => {
+                                                            // For concurrent updates, use node_id as tiebreaker
+                                                            location.node_id
+                                                                > existing_location.node_id
+                                                        }
+                                                        _ => false, // Keep existing for Before or Equal
+                                                    }
+                                                }
+                                                None => {
+                                                    debug!(
+                                                        actor_name = %name,
+                                                        "applying new actor"
+                                                    );
+                                                    true // New actor
+                                                }
+                                            };
+
+                                        if should_apply {
+                                            pending_updates.push((name.clone(), location.clone()));
+                                        }
+                                    }
+                                    crate::registry::RegistryChange::ActorRemoved {
+                                        name,
+                                        vector_clock,
+                                        removing_node_id,
+                                        priority: _,
+                                    } => {
+                                        // Check vector clock ordering before queueing removal
+                                        if let Some(existing_location) =
+                                            actor_state.known_actors.get(name.as_str())
+                                        {
+                                            match vector_clock
+                                                .compare(&existing_location.vector_clock)
+                                            {
+                                                crate::ClockOrdering::After => {
+                                                    // Queue removal if it's after
+                                                    pending_removals.push((
+                                                        name.clone(),
+                                                        vector_clock.clone(),
+                                                        *removing_node_id,
+                                                    ));
+                                                }
+                                                crate::ClockOrdering::Concurrent => {
+                                                    // For concurrent removals, use node_id as tiebreaker
+                                                    if removing_node_id > &existing_location.node_id
+                                                    {
+                                                        pending_removals.push((
+                                                            name.clone(),
+                                                            vector_clock.clone(),
+                                                            *removing_node_id,
+                                                        ));
+                                                    }
+                                                }
+                                                _ => {} // Ignore outdated removals (Before or Equal)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Drop read lock before acquiring write lock
+                            drop(actor_state);
+
+                            // Second pass: apply all updates under write lock with re-validation
+                            let mut actor_state = registry.actor_state.write().await;
+                            let mut applied = 0;
+
+                            // Re-validate and apply actor additions
+                            for (name, location) in &pending_updates {
+                                // Re-check if this is still valid (state may have changed)
+                                let still_valid = match actor_state.known_actors.get(name.as_str())
+                                {
+                                    Some(existing_location) => {
+                                        match location
+                                            .vector_clock
+                                            .compare(&existing_location.vector_clock)
+                                        {
+                                            crate::ClockOrdering::After => true,
+                                            crate::ClockOrdering::Concurrent => {
+                                                location.node_id > existing_location.node_id
+                                            }
+                                            _ => false,
+                                        }
+                                    }
+                                    None => !actor_state.local_actors.contains_key(name.as_str()),
+                                };
+
+                                if still_valid {
+                                    actor_state
+                                        .known_actors
+                                        .insert(name.clone(), location.clone());
+                                    applied += 1;
+
+                                    // Log the timing information for immediate priority changes
+                                    if location.priority.should_trigger_immediate_gossip() {
+                                        // Calculate time from when delta was sent (network + processing)
+                                        let network_processing_time_nanos =
+                                            received_timestamp - delta.precise_timing_nanos as u128;
+                                        let network_processing_time_ms =
+                                            network_processing_time_nanos as f64 / 1_000_000.0;
+                                        let propagation_time_ms = network_processing_time_ms; // Same as network time for now
+                                        let processing_only_time_ms = 0.0; // No additional processing time beyond network
+
+                                        // Debug: Break down where the time is spent
+                                        eprintln!("🔍 TIMING_BREAKDOWN: sent={}, received={}, delta={}ns ({}ms)",
+                                     delta.precise_timing_nanos, received_timestamp,
+                                     network_processing_time_nanos, network_processing_time_ms);
+
+                                        info!(
+                                            actor_name = %name,
+                                            priority = ?location.priority,
+                                            propagation_time_ms = propagation_time_ms,
+                                            network_processing_time_ms = network_processing_time_ms,
+                                            processing_only_time_ms = processing_only_time_ms,
+                                            "RECEIVED_ACTOR"
+                                        );
+                                    }
+                                }
+                            }
+
+                            // Re-validate and apply actor removals
+                            for (name, removal_clock, removing_node_id) in &pending_removals {
+                                // Re-check if removal is still valid (state may have changed)
+                                if let Some(existing_location) =
+                                    actor_state.known_actors.get(name.as_str())
+                                {
+                                    let still_valid = match removal_clock
+                                        .compare(&existing_location.vector_clock)
+                                    {
+                                        crate::ClockOrdering::After => true,
+                                        crate::ClockOrdering::Concurrent => {
+                                            // Use same deterministic tiebreaker for re-validation
+                                            removing_node_id > &existing_location.node_id
+                                        }
+                                        _ => false,
+                                    };
+
+                                    if still_valid
+                                        && actor_state.known_actors.remove(name.as_str()).is_some()
+                                    {
+                                        applied += 1;
+                                    }
+                                }
+                            }
+
+                            (applied, pending_updates)
+                        }
+                    };
+
+                    if applied_count > 0 {
+                        debug!(
+                            applied_count = applied_count,
+                            sender = %sender_addr,
+                            "applied delta changes in batched update"
+                        );
+                    }
+
+                    // NEW: Send ACK back for immediate registrations
+                    if !immediate_actors.is_empty() {
+                        // Send ACKs for immediate priority actor additions
+                        // Use lock-free send since we're responding on the same connection
+                        let pool = registry.connection_pool.lock().await;
+                        for actor_name in immediate_actors {
+                            // Send lightweight ACK immediately
+                            let ack = crate::registry::RegistryMessage::ImmediateAck {
+                                actor_name: actor_name.clone(),
+                                success: true,
+                            };
+
+                            // Serialize and send
+                            if let Ok(serialized) = rkyv::to_bytes::<rkyv::rancor::Error>(&ack) {
+                                // Use send_lock_free to send directly without needing a connection handle
+                                if let Err(e) = pool.send_lock_free(_peer_addr, &serialized) {
+                                    warn!("Failed to send ImmediateAck: {}", e);
+                                } else {
+                                    info!("Sent ImmediateAck for actor '{}'", actor_name);
+                                }
+                            }
+                        }
                     }
                 }
 
-                // Check if this is a previously failed peer
-                let was_failed = gossip_state
-                    .peers
-                    .get(&sender_socket_addr)
-                    .map(|info| info.failures >= registry.config.max_peer_failures)
-                    .unwrap_or(false);
+                // Note: Response will be sent during regular gossip rounds
+                Ok(())
+            }
+            RegistryMessage::FullSync {
+                local_actors,
+                known_actors,
+                sender_peer_id,
+                sequence,
+                wall_clock_time,
+            } => {
+                // We no longer have sender address - will need to handle differently
+                let sender_socket_addr = _peer_addr; // Use the actual peer address
 
-                if was_failed {
-                    info!(
-                        peer = %delta.sender_peer_id,
-                        "✅ Received delta from previously failed peer - connection restored!"
-                    );
+                // Note: sender_peer_id is now a PeerId (e.g., "node_a"), not an address
+                debug!(
+                    "Received FullSync from node '{}' at address {}",
+                    sender_peer_id, sender_socket_addr
+                );
 
-                    // Clear the pending failure record
-                    gossip_state
-                        .pending_peer_failures
-                        .remove(&sender_socket_addr);
-                }
+                // OPTIMIZATION: Do all peer management in one lock acquisition
+                {
+                    let mut gossip_state = registry.gossip_state.lock().await;
 
-                // Update peer info and check if we need to clear pending failures
-                let need_to_clear_pending =
+                    // Add the sender as a peer (inlined to avoid separate lock)
+                    if sender_socket_addr != registry.bind_addr {
+                        if let std::collections::hash_map::Entry::Vacant(e) =
+                            gossip_state.peers.entry(sender_socket_addr)
+                        {
+                            info!(peer = %sender_socket_addr, "Adding new peer from FullSync");
+                            let current_time = crate::current_timestamp();
+                            e.insert(crate::registry::PeerInfo {
+                                address: sender_socket_addr,
+                                peer_address: None,
+                                node_id: None,
+                                failures: 0,
+                                last_attempt: current_time,
+                                last_success: current_time,
+                                last_sequence: 0,
+                                last_sent_sequence: 0,
+                                consecutive_deltas: 0,
+                                last_failure_time: None,
+                            });
+                        }
+                    }
+
+                    // Update peer info and reset failure state
+                    let had_failures = gossip_state
+                        .peers
+                        .get(&sender_socket_addr)
+                        .map(|info| info.failures > 0)
+                        .unwrap_or(false);
+
+                    if had_failures {
+                        // Clear the pending failure record
+                        gossip_state
+                            .pending_peer_failures
+                            .remove(&sender_socket_addr);
+                    }
+
                     if let Some(peer_info) = gossip_state.peers.get_mut(&sender_socket_addr) {
-                        // Always reset failure state when we receive messages from the peer
+                        let prev_failures = peer_info.failures;
+                        // Always reset failure state when we receive a FullSync from the peer
                         // This proves the peer is alive and communicating
-                        let had_failures = peer_info.failures > 0;
-                        if had_failures {
-                            info!(peer = %delta.sender_peer_id,
-                              prev_failures = peer_info.failures,
-                              "🔄 Resetting failure state after receiving DeltaGossip");
+                        if peer_info.failures > 0 {
+                            info!(peer = %sender_socket_addr,
+                              prev_failures = prev_failures,
+                              "🔄 Resetting failure state after receiving FullSync");
                             peer_info.failures = 0;
                             peer_info.last_failure_time = None;
                         }
                         peer_info.last_success = crate::current_timestamp();
+                        peer_info.consecutive_deltas = 0;
+                    } else {
+                        warn!(peer = %sender_socket_addr, "Peer not found in peer list when trying to reset failure state");
+                    }
+                    gossip_state.full_sync_exchanges += 1;
+                }
 
-                        peer_info.last_sequence =
-                            std::cmp::max(peer_info.last_sequence, delta.current_sequence);
-                        peer_info.consecutive_deltas += 1;
+                debug!(
+                    sender = %sender_peer_id,
+                    sequence = sequence,
+                    local_actors = local_actors.len(),
+                    known_actors = known_actors.len(),
+                    "📨 INCOMING: Received full sync message on bidirectional connection"
+                );
 
+                // IMPORTANT: Register the incoming connection with the peer_id mapping
+                // This allows bidirectional communication to work properly
+                {
+                    let pool = registry.connection_pool.lock().await;
+                    pool.peer_id_to_addr
+                        .insert(sender_peer_id.clone(), sender_socket_addr);
+                    pool.addr_to_peer_id
+                        .insert(sender_socket_addr, sender_peer_id.clone());
+                    debug!(
+                        "BIDIRECTIONAL: Registered incoming connection - peer_id={} addr={}",
+                        sender_peer_id, sender_socket_addr
+                    );
+                }
+
+                // Only remaining async operation
+                registry
+                    .merge_full_sync(
+                        local_actors.into_iter().collect(),
+                        known_actors.into_iter().collect(),
+                        sender_socket_addr,
+                        sequence,
+                        wall_clock_time,
+                    )
+                    .await;
+
+                // Send back our state as a response so the sender can receive our actors
+                // This is critical for late-joining nodes (like Node C) to get existing state
+                {
+                    // Get our current state
+                    let (our_local_actors, our_known_actors, our_sequence) = {
+                        let actor_state = registry.actor_state.read().await;
+                        let gossip_state = registry.gossip_state.lock().await;
+                        (
+                            actor_state.local_actors.clone(),
+                            actor_state.known_actors.clone(),
+                            gossip_state.gossip_sequence,
+                        )
+                    };
+
+                    // Calculate sizes before moving
+                    let local_actors_count = our_local_actors.len();
+                    let known_actors_count = our_known_actors.len();
+
+                    // Create a FullSyncResponse message
+                    let response = RegistryMessage::FullSyncResponse {
+                        local_actors: our_local_actors.into_iter().collect(),
+                        known_actors: our_known_actors.into_iter().collect(),
+                        sender_peer_id: registry.peer_id.clone(), // Use peer ID
+                        sequence: our_sequence,
+                        wall_clock_time: crate::current_timestamp(),
+                    };
+
+                    // Send the response back through existing connection
+                    // We'll use send_lock_free which doesn't create new connections
+                    let response_data = match rkyv::to_bytes::<rkyv::rancor::Error>(&response) {
+                        Ok(data) => data,
+                        Err(e) => {
+                            warn!(error = %e, "Failed to serialize FullSync response");
+                            return Ok(());
+                        }
+                    };
+
+                    // Try to send immediately on existing connection
+                    {
+                        debug!(
+                            "FULLSYNC RESPONSE: Node {} is about to acquire connection pool lock",
+                            registry.bind_addr
+                        );
+                        let pool = registry.connection_pool.lock().await;
+                        debug!(
+                            "FULLSYNC RESPONSE: Node {} got pool lock, pool has {} total entries",
+                            registry.bind_addr,
+                            pool.connection_count()
+                        );
+                        debug!("FULLSYNC RESPONSE: Pool instance address: {:p}", &*pool);
+
+                        // Log details about each connection
+                        for entry in pool.connections.iter() {
+                            let addr = entry.key();
+                            let conn = entry.value();
+                            debug!(
+                                "FULLSYNC RESPONSE: Connection to {} - state={:?}",
+                                addr,
+                                conn.get_state()
+                            );
+                        }
+
+                        // Create message with length prefix
+                        let mut buffer = bytes::BytesMut::with_capacity(4 + response_data.len());
+                        buffer.extend_from_slice(&(response_data.len() as u32).to_be_bytes());
+                        buffer.extend_from_slice(&response_data);
+
+                        // Debug: Log what connections we have
+                        debug!(
+                            "FULLSYNC RESPONSE DEBUG: Available connections by addr: {:?}",
+                            pool.connections
+                                .iter()
+                                .map(|entry| *entry.key())
+                                .collect::<Vec<_>>()
+                        );
+                        debug!(
+                            "FULLSYNC RESPONSE DEBUG: Available node mappings: {:?}",
+                            pool.peer_id_to_addr
+                                .iter()
+                                .map(|entry| (entry.key().clone(), *entry.value()))
+                                .collect::<Vec<_>>()
+                        );
+                        debug!(
+                            "FULLSYNC RESPONSE DEBUG: Looking for connection to sender_peer_id: {}",
+                            sender_peer_id
+                        );
+                        debug!(
+                            "FULLSYNC RESPONSE DEBUG: sender_socket_addr={}",
+                            sender_socket_addr
+                        );
+
+                        // Try to send using peer ID
+                        let frozen_buffer = buffer.freeze();
+                        let send_result = match pool
+                            .send_bytes_to_node_id(&sender_peer_id.as_str(), frozen_buffer.clone())
+                        {
+                            Ok(()) => Ok(()),
+                            Err(e) => {
+                                warn!("Failed to send via peer ID {}: {}", sender_peer_id, e);
+                                // Fall back to socket address
+                                pool.send_lock_free(sender_socket_addr, &frozen_buffer)
+                            }
+                        };
+
+                        if send_result.is_err() {
+                            warn!(
+                                "Primary send failed for peer {}, no fallback available",
+                                sender_peer_id
+                            );
+                        }
+
+                        match send_result {
+                            Ok(()) => {
+                                debug!(peer = %sender_socket_addr,
+                                  peer_id = %sender_peer_id,
+                                  local_actors = local_actors_count,
+                                  known_actors = known_actors_count,
+                                  bind_addr = %registry.bind_addr,
+                                  "📤 RESPONSE: Successfully sent FullSync response with our state");
+                            }
+                            Err(e) => {
+                                // If we can't send immediately, queue it for the next gossip round
+                                warn!(peer = %sender_socket_addr,
+                                  peer_id = %sender_peer_id,
+                                  error = %e,
+                                  "Could not send FullSync response immediately - will be sent in next gossip round");
+
+                                // Store in gossip state to be sent during next gossip round
+                                drop(pool); // Release the pool lock first
+                                let mut gossip_state = registry.gossip_state.lock().await;
+
+                                // Mark that we need to send a full sync to this peer
+                                if let Some(peer_info) =
+                                    gossip_state.peers.get_mut(&sender_socket_addr)
+                                {
+                                    // Force a full sync on the next gossip round
+                                    peer_info.consecutive_deltas =
+                                        registry.config.max_delta_history as u64;
+                                    info!(peer = %sender_socket_addr,
+                                      "Marked peer for full sync in next gossip round");
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Ok(())
+            }
+            RegistryMessage::FullSyncRequest {
+                sender_peer_id,
+                sequence: _,
+                wall_clock_time: _,
+            } => {
+                debug!(
+                    sender = %sender_peer_id,
+                    "received full sync request on bidirectional connection"
+                );
+
+                {
+                    let mut gossip_state = registry.gossip_state.lock().await;
+                    gossip_state.full_sync_exchanges += 1;
+                }
+
+                // Note: Response will be sent during regular gossip rounds
+                Ok(())
+            }
+            // Handle response messages (these can arrive on incoming connections too)
+            RegistryMessage::DeltaGossipResponse { delta } => {
+                debug!(
+                    sender = %delta.sender_peer_id,
+                    changes = delta.changes.len(),
+                    "received delta gossip response on bidirectional connection"
+                );
+
+                if let Err(err) = registry.apply_delta(delta).await {
+                    warn!(error = %err, "failed to apply delta from response");
+                } else {
+                    let mut gossip_state = registry.gossip_state.lock().await;
+                    gossip_state.delta_exchanges += 1;
+                }
+                Ok(())
+            }
+            RegistryMessage::FullSyncResponse {
+                local_actors,
+                known_actors,
+                sender_peer_id,
+                sequence,
+                wall_clock_time,
+            } => {
+                debug!(
+                    sender = %sender_peer_id,
+                    local_actors = local_actors.len(),
+                    known_actors = known_actors.len(),
+                    "RECEIVED: FullSyncResponse from peer"
+                );
+
+                // Use the actual peer address we're connected to
+                let sender_socket_addr = _peer_addr;
+
+                registry
+                    .merge_full_sync(
+                        local_actors.into_iter().collect(),
+                        known_actors.into_iter().collect(),
+                        sender_socket_addr,
+                        sequence,
+                        wall_clock_time,
+                    )
+                    .await;
+
+                // Reset failure state when receiving response
+                let mut gossip_state = registry.gossip_state.lock().await;
+
+                // Reset failure state for responding peer
+                let need_to_clear_pending =
+                    if let Some(peer_info) = gossip_state.peers.get_mut(&sender_socket_addr) {
+                        let had_failures = peer_info.failures > 0;
+                        if had_failures {
+                            info!(peer = %sender_socket_addr,
+                          prev_failures = peer_info.failures,
+                          "🔄 Resetting failure state after receiving FullSyncResponse");
+                            peer_info.failures = 0;
+                            peer_info.last_failure_time = None;
+                        }
+                        peer_info.last_success = crate::current_timestamp();
                         had_failures
                     } else {
                         false
@@ -4070,954 +5282,303 @@ pub(crate) async fn handle_incoming_message(
                         .pending_peer_failures
                         .remove(&sender_socket_addr);
                 }
-                gossip_state.delta_exchanges += 1;
-            }
 
-            // CRITICAL OPTIMIZATION: Inline apply_delta to eliminate function call overhead
-            // Apply the delta directly here to minimize async scheduling delays
-            {
-                let total_changes = delta.changes.len();
-                // Use the actual peer address we received from
-                let sender_addr = _peer_addr;
-
-                // Pre-compute priority flags to avoid redundant checks
-                let has_immediate = delta.changes.iter().any(|change| match change {
-                    crate::registry::RegistryChange::ActorAdded { priority, .. } => {
-                        priority.should_trigger_immediate_gossip()
-                    }
-                    crate::registry::RegistryChange::ActorRemoved { priority, .. } => {
-                        priority.should_trigger_immediate_gossip()
-                    }
-                });
-
-                if has_immediate {
-                    info!(
-                        "🎯 RECEIVING IMMEDIATE CHANGES: {} total changes from {}",
-                        total_changes, sender_addr
-                    );
-                }
-
-                // Pre-capture timing info outside lock for better performance - use high resolution timing
-                let _received_instant = std::time::Instant::now();
-                let received_timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos();
-
-                // eprintln!("🔍 RECEIVED_TIMESTAMP: {}ns", received_timestamp);
-
-                // Collect immediate actors for ACK before consuming changes
-                let mut immediate_actors = Vec::new();
-                for change in &delta.changes {
-                    if let crate::registry::RegistryChange::ActorAdded { name, priority, .. } =
-                        change
-                    {
-                        if priority.should_trigger_immediate_gossip() {
-                            immediate_actors.push(name.clone());
-                        }
-                    }
-                }
-
-                // OPTIMIZATION: Fast-path state updates with try_lock to avoid blocking
-                let (applied_count, _pending_updates) = {
-                    // Try non-blocking access first
-                    if let Ok(mut actor_state) = registry.actor_state.try_write() {
-                        // Fast path - direct update without batching overhead
-                        let mut applied = 0;
-                        for change in delta.changes {
-                            match change {
-                                crate::registry::RegistryChange::ActorAdded {
-                                    name,
-                                    location,
-                                    priority: _,
-                                } => {
-                                    // Don't override local actors
-                                    if actor_state.local_actors.contains_key(name.as_str()) {
-                                        continue;
-                                    }
-
-                                    // Quick conflict check
-                                    let should_apply =
-                                        match actor_state.known_actors.get(name.as_str()) {
-                                            Some(existing) => {
-                                                location.wall_clock_time > existing.wall_clock_time
-                                                    || (location.wall_clock_time
-                                                        == existing.wall_clock_time
-                                                        && location.address > existing.address)
-                                            }
-                                            None => true,
-                                        };
-
-                                    if should_apply {
-                                        actor_state
-                                            .known_actors
-                                            .insert(name.clone(), location.clone());
-                                        applied += 1;
-
-                                        // Inline timing calculation for immediate priority
-                                        if location.priority.should_trigger_immediate_gossip() {
-                                            let network_time_nanos = received_timestamp
-                                                - delta.precise_timing_nanos as u128;
-                                            let network_time_ms =
-                                                network_time_nanos as f64 / 1_000_000.0;
-                                            let propagation_time_ms = network_time_ms; // Same as network time for now
-                                            let processing_only_time_ms = 0.0; // No additional processing time beyond network
-
-                                            eprintln!("🔍 FAST_PATH: Processing immediate priority actor: {} propagation_time_ms={:.3}ms", name, propagation_time_ms);
-
-                                            info!(
-                                                actor_name = %name,
-                                                priority = ?location.priority,
-                                                propagation_time_ms = propagation_time_ms,
-                                                network_processing_time_ms = network_time_ms,
-                                                processing_only_time_ms = processing_only_time_ms,
-                                                "RECEIVED_ACTOR"
-                                            );
-                                        }
-                                    }
-                                }
-                                crate::registry::RegistryChange::ActorRemoved {
-                                    name,
-                                    vector_clock,
-                                    removing_node_id,
-                                    priority: _,
-                                } => {
-                                    // Check vector clock ordering before applying removal
-                                    let should_remove =
-                                        match actor_state.known_actors.get(name.as_str()) {
-                                            Some(existing_location) => {
-                                                match vector_clock
-                                                    .compare(&existing_location.vector_clock)
-                                                {
-                                                    crate::ClockOrdering::After => true,
-                                                    crate::ClockOrdering::Concurrent => {
-                                                        // For concurrent removals, use node_id as deterministic tiebreaker
-                                                        // This ensures all nodes make the same decision
-                                                        removing_node_id > existing_location.node_id
-                                                    }
-                                                    _ => false, // Ignore outdated removals (Before or Equal)
-                                                }
-                                            }
-                                            None => false, // Actor doesn't exist
-                                        };
-
-                                    if should_remove
-                                        && actor_state.known_actors.remove(name.as_str()).is_some()
-                                    {
-                                        applied += 1;
-                                    }
-                                }
-                            }
-                        }
-                        (applied, Vec::new())
-                    } else {
-                        // Fallback to batched approach if lock is contended
-                        let actor_state = registry.actor_state.read().await;
-                        let mut pending_updates = Vec::new();
-                        let mut pending_removals = Vec::new();
-
-                        for change in &delta.changes {
-                            match change {
-                                crate::registry::RegistryChange::ActorAdded {
-                                    name,
-                                    location,
-                                    priority: _,
-                                } => {
-                                    // Don't override local actors - early exit
-                                    if actor_state.local_actors.contains_key(name.as_str()) {
-                                        debug!(
-                                            actor_name = %name,
-                                            "skipping remote actor update - actor is local"
-                                        );
-                                        continue;
-                                    }
-
-                                    // Check if we already know about this actor
-                                    let should_apply =
-                                        match actor_state.known_actors.get(name.as_str()) {
-                                            Some(existing_location) => {
-                                                // Use vector clock for causal ordering
-                                                match location
-                                                    .vector_clock
-                                                    .compare(&existing_location.vector_clock)
-                                                {
-                                                    crate::ClockOrdering::After => true,
-                                                    crate::ClockOrdering::Concurrent => {
-                                                        // For concurrent updates, use node_id as tiebreaker
-                                                        location.node_id > existing_location.node_id
-                                                    }
-                                                    _ => false, // Keep existing for Before or Equal
-                                                }
-                                            }
-                                            None => {
-                                                debug!(
-                                                    actor_name = %name,
-                                                    "applying new actor"
-                                                );
-                                                true // New actor
-                                            }
-                                        };
-
-                                    if should_apply {
-                                        pending_updates.push((name.clone(), location.clone()));
-                                    }
-                                }
-                                crate::registry::RegistryChange::ActorRemoved {
-                                    name,
-                                    vector_clock,
-                                    removing_node_id,
-                                    priority: _,
-                                } => {
-                                    // Check vector clock ordering before queueing removal
-                                    if let Some(existing_location) =
-                                        actor_state.known_actors.get(name.as_str())
-                                    {
-                                        match vector_clock.compare(&existing_location.vector_clock)
-                                        {
-                                            crate::ClockOrdering::After => {
-                                                // Queue removal if it's after
-                                                pending_removals.push((
-                                                    name.clone(),
-                                                    vector_clock.clone(),
-                                                    *removing_node_id,
-                                                ));
-                                            }
-                                            crate::ClockOrdering::Concurrent => {
-                                                // For concurrent removals, use node_id as tiebreaker
-                                                if removing_node_id > &existing_location.node_id {
-                                                    pending_removals.push((
-                                                        name.clone(),
-                                                        vector_clock.clone(),
-                                                        *removing_node_id,
-                                                    ));
-                                                }
-                                            }
-                                            _ => {} // Ignore outdated removals (Before or Equal)
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // Drop read lock before acquiring write lock
-                        drop(actor_state);
-
-                        // Second pass: apply all updates under write lock with re-validation
-                        let mut actor_state = registry.actor_state.write().await;
-                        let mut applied = 0;
-
-                        // Re-validate and apply actor additions
-                        for (name, location) in &pending_updates {
-                            // Re-check if this is still valid (state may have changed)
-                            let still_valid = match actor_state.known_actors.get(name.as_str()) {
-                                Some(existing_location) => {
-                                    match location
-                                        .vector_clock
-                                        .compare(&existing_location.vector_clock)
-                                    {
-                                        crate::ClockOrdering::After => true,
-                                        crate::ClockOrdering::Concurrent => {
-                                            location.node_id > existing_location.node_id
-                                        }
-                                        _ => false,
-                                    }
-                                }
-                                None => !actor_state.local_actors.contains_key(name.as_str()),
-                            };
-
-                            if still_valid {
-                                actor_state
-                                    .known_actors
-                                    .insert(name.clone(), location.clone());
-                                applied += 1;
-
-                                // Log the timing information for immediate priority changes
-                                if location.priority.should_trigger_immediate_gossip() {
-                                    // Calculate time from when delta was sent (network + processing)
-                                    let network_processing_time_nanos =
-                                        received_timestamp - delta.precise_timing_nanos as u128;
-                                    let network_processing_time_ms =
-                                        network_processing_time_nanos as f64 / 1_000_000.0;
-                                    let propagation_time_ms = network_processing_time_ms; // Same as network time for now
-                                    let processing_only_time_ms = 0.0; // No additional processing time beyond network
-
-                                    // Debug: Break down where the time is spent
-                                    eprintln!("🔍 TIMING_BREAKDOWN: sent={}, received={}, delta={}ns ({}ms)",
-                                     delta.precise_timing_nanos, received_timestamp,
-                                     network_processing_time_nanos, network_processing_time_ms);
-
-                                    info!(
-                                        actor_name = %name,
-                                        priority = ?location.priority,
-                                        propagation_time_ms = propagation_time_ms,
-                                        network_processing_time_ms = network_processing_time_ms,
-                                        processing_only_time_ms = processing_only_time_ms,
-                                        "RECEIVED_ACTOR"
-                                    );
-                                }
-                            }
-                        }
-
-                        // Re-validate and apply actor removals
-                        for (name, removal_clock, removing_node_id) in &pending_removals {
-                            // Re-check if removal is still valid (state may have changed)
-                            if let Some(existing_location) =
-                                actor_state.known_actors.get(name.as_str())
-                            {
-                                let still_valid =
-                                    match removal_clock.compare(&existing_location.vector_clock) {
-                                        crate::ClockOrdering::After => true,
-                                        crate::ClockOrdering::Concurrent => {
-                                            // Use same deterministic tiebreaker for re-validation
-                                            removing_node_id > &existing_location.node_id
-                                        }
-                                        _ => false,
-                                    };
-
-                                if still_valid
-                                    && actor_state.known_actors.remove(name.as_str()).is_some()
-                                {
-                                    applied += 1;
-                                }
-                            }
-                        }
-
-                        (applied, pending_updates)
-                    }
-                };
-
-                if applied_count > 0 {
-                    debug!(
-                        applied_count = applied_count,
-                        sender = %sender_addr,
-                        "applied delta changes in batched update"
-                    );
-                }
-
-                // NEW: Send ACK back for immediate registrations
-                if !immediate_actors.is_empty() {
-                    // Send ACKs for immediate priority actor additions
-                    // Use lock-free send since we're responding on the same connection
-                    let pool = registry.connection_pool.lock().await;
-                    for actor_name in immediate_actors {
-                        // Send lightweight ACK immediately
-                        let ack = crate::registry::RegistryMessage::ImmediateAck {
-                            actor_name: actor_name.clone(),
-                            success: true,
-                        };
-
-                        // Serialize and send
-                        if let Ok(serialized) = rkyv::to_bytes::<rkyv::rancor::Error>(&ack) {
-                            // Use send_lock_free to send directly without needing a connection handle
-                            if let Err(e) = pool.send_lock_free(_peer_addr, &serialized) {
-                                warn!("Failed to send ImmediateAck: {}", e);
-                            } else {
-                                info!("Sent ImmediateAck for actor '{}'", actor_name);
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Note: Response will be sent during regular gossip rounds
-            Ok(())
-        }
-        RegistryMessage::FullSync {
-            local_actors,
-            known_actors,
-            sender_peer_id,
-            sequence,
-            wall_clock_time,
-        } => {
-            // We no longer have sender address - will need to handle differently
-            let sender_socket_addr = _peer_addr; // Use the actual peer address
-
-            // Note: sender_peer_id is now a PeerId (e.g., "node_a"), not an address
-            debug!(
-                "Received FullSync from node '{}' at address {}",
-                sender_peer_id, sender_socket_addr
-            );
-
-            // OPTIMIZATION: Do all peer management in one lock acquisition
-            {
-                let mut gossip_state = registry.gossip_state.lock().await;
-
-                // Add the sender as a peer (inlined to avoid separate lock)
-                if sender_socket_addr != registry.bind_addr {
-                    if let std::collections::hash_map::Entry::Vacant(e) =
-                        gossip_state.peers.entry(sender_socket_addr)
-                    {
-                        info!(peer = %sender_socket_addr, "Adding new peer from FullSync");
-                        let current_time = crate::current_timestamp();
-                        e.insert(crate::registry::PeerInfo {
-                            address: sender_socket_addr,
-                            peer_address: None,
-                            node_id: None,
-                            failures: 0,
-                            last_attempt: current_time,
-                            last_success: current_time,
-                            last_sequence: 0,
-                            last_sent_sequence: 0,
-                            consecutive_deltas: 0,
-                            last_failure_time: None,
-                        });
-                    }
-                }
-
-                // Update peer info and reset failure state
-                let had_failures = gossip_state
-                    .peers
-                    .get(&sender_socket_addr)
-                    .map(|info| info.failures > 0)
-                    .unwrap_or(false);
-
-                if had_failures {
-                    // Clear the pending failure record
-                    gossip_state
-                        .pending_peer_failures
-                        .remove(&sender_socket_addr);
-                }
-
-                if let Some(peer_info) = gossip_state.peers.get_mut(&sender_socket_addr) {
-                    let prev_failures = peer_info.failures;
-                    // Always reset failure state when we receive a FullSync from the peer
-                    // This proves the peer is alive and communicating
-                    if peer_info.failures > 0 {
-                        info!(peer = %sender_socket_addr,
-                              prev_failures = prev_failures,
-                              "🔄 Resetting failure state after receiving FullSync");
-                        peer_info.failures = 0;
-                        peer_info.last_failure_time = None;
-                    }
-                    peer_info.last_success = crate::current_timestamp();
-                    peer_info.consecutive_deltas = 0;
-                } else {
-                    warn!(peer = %sender_socket_addr, "Peer not found in peer list when trying to reset failure state");
-                }
                 gossip_state.full_sync_exchanges += 1;
+                Ok(())
             }
-
-            debug!(
-                sender = %sender_peer_id,
-                sequence = sequence,
-                local_actors = local_actors.len(),
-                known_actors = known_actors.len(),
-                "📨 INCOMING: Received full sync message on bidirectional connection"
-            );
-
-            // IMPORTANT: Register the incoming connection with the peer_id mapping
-            // This allows bidirectional communication to work properly
-            {
-                let pool = registry.connection_pool.lock().await;
-                pool.peer_id_to_addr
-                    .insert(sender_peer_id.clone(), sender_socket_addr);
-                pool.addr_to_peer_id
-                    .insert(sender_socket_addr, sender_peer_id.clone());
+            RegistryMessage::PeerHealthQuery {
+                sender,
+                target_peer,
+                timestamp: _,
+            } => {
                 debug!(
-                    "BIDIRECTIONAL: Registered incoming connection - peer_id={} addr={}",
-                    sender_peer_id, sender_socket_addr
+                    sender = %sender,
+                    target = %target_peer,
+                    "received peer health query"
                 );
-            }
 
-            // Only remaining async operation
-            registry
-                .merge_full_sync(
-                    local_actors.into_iter().collect(),
-                    known_actors.into_iter().collect(),
-                    sender_socket_addr,
-                    sequence,
-                    wall_clock_time,
-                )
-                .await;
-
-            // Send back our state as a response so the sender can receive our actors
-            // This is critical for late-joining nodes (like Node C) to get existing state
-            {
-                // Get our current state
-                let (our_local_actors, our_known_actors, our_sequence) = {
-                    let actor_state = registry.actor_state.read().await;
-                    let gossip_state = registry.gossip_state.lock().await;
-                    (
-                        actor_state.local_actors.clone(),
-                        actor_state.known_actors.clone(),
-                        gossip_state.gossip_sequence,
-                    )
-                };
-
-                // Calculate sizes before moving
-                let local_actors_count = our_local_actors.len();
-                let known_actors_count = our_known_actors.len();
-
-                // Create a FullSyncResponse message
-                let response = RegistryMessage::FullSyncResponse {
-                    local_actors: our_local_actors.into_iter().collect(),
-                    known_actors: our_known_actors.into_iter().collect(),
-                    sender_peer_id: registry.peer_id.clone(), // Use peer ID
-                    sequence: our_sequence,
-                    wall_clock_time: crate::current_timestamp(),
-                };
-
-                // Send the response back through existing connection
-                // We'll use send_lock_free which doesn't create new connections
-                let response_data = match rkyv::to_bytes::<rkyv::rancor::Error>(&response) {
-                    Ok(data) => data,
-                    Err(e) => {
-                        warn!(error = %e, "Failed to serialize FullSync response");
+                // Check our connection status to the target peer
+                let target_addr = match target_peer.parse::<SocketAddr>() {
+                    Ok(addr) => addr,
+                    Err(_) => {
+                        warn!(
+                            "Invalid target peer address in health query: {}",
+                            target_peer
+                        );
                         return Ok(());
                     }
                 };
 
-                // Try to send immediately on existing connection
-                {
-                    debug!(
-                        "FULLSYNC RESPONSE: Node {} is about to acquire connection pool lock",
-                        registry.bind_addr
-                    );
+                let is_alive = {
                     let pool = registry.connection_pool.lock().await;
-                    debug!(
-                        "FULLSYNC RESPONSE: Node {} got pool lock, pool has {} total entries",
-                        registry.bind_addr,
-                        pool.connection_count()
-                    );
-                    debug!("FULLSYNC RESPONSE: Pool instance address: {:p}", &*pool);
-
-                    // Log details about each connection
-                    for entry in pool.connections.iter() {
-                        let addr = entry.key();
-                        let conn = entry.value();
-                        debug!(
-                            "FULLSYNC RESPONSE: Connection to {} - state={:?}",
-                            addr,
-                            conn.get_state()
-                        );
-                    }
-
-                    // Create message with length prefix
-                    let mut buffer = bytes::BytesMut::with_capacity(4 + response_data.len());
-                    buffer.extend_from_slice(&(response_data.len() as u32).to_be_bytes());
-                    buffer.extend_from_slice(&response_data);
-
-                    // Debug: Log what connections we have
-                    debug!(
-                        "FULLSYNC RESPONSE DEBUG: Available connections by addr: {:?}",
-                        pool.connections
-                            .iter()
-                            .map(|entry| *entry.key())
-                            .collect::<Vec<_>>()
-                    );
-                    debug!(
-                        "FULLSYNC RESPONSE DEBUG: Available node mappings: {:?}",
-                        pool.peer_id_to_addr
-                            .iter()
-                            .map(|entry| (entry.key().clone(), *entry.value()))
-                            .collect::<Vec<_>>()
-                    );
-                    debug!(
-                        "FULLSYNC RESPONSE DEBUG: Looking for connection to sender_peer_id: {}",
-                        sender_peer_id
-                    );
-                    debug!(
-                        "FULLSYNC RESPONSE DEBUG: sender_socket_addr={}",
-                        sender_socket_addr
-                    );
-
-                    // Try to send using peer ID
-                    let frozen_buffer = buffer.freeze();
-                    let send_result = match pool
-                        .send_bytes_to_node_id(&sender_peer_id.as_str(), frozen_buffer.clone())
-                    {
-                        Ok(()) => Ok(()),
-                        Err(e) => {
-                            warn!("Failed to send via peer ID {}: {}", sender_peer_id, e);
-                            // Fall back to socket address
-                            pool.send_lock_free(sender_socket_addr, &frozen_buffer)
-                        }
-                    };
-
-                    if send_result.is_err() {
-                        warn!(
-                            "Primary send failed for peer {}, no fallback available",
-                            sender_peer_id
-                        );
-                    }
-
-                    match send_result {
-                        Ok(()) => {
-                            debug!(peer = %sender_socket_addr,
-                                  peer_id = %sender_peer_id,
-                                  local_actors = local_actors_count,
-                                  known_actors = known_actors_count,
-                                  bind_addr = %registry.bind_addr,
-                                  "📤 RESPONSE: Successfully sent FullSync response with our state");
-                        }
-                        Err(e) => {
-                            // If we can't send immediately, queue it for the next gossip round
-                            warn!(peer = %sender_socket_addr,
-                                  peer_id = %sender_peer_id,
-                                  error = %e,
-                                  "Could not send FullSync response immediately - will be sent in next gossip round");
-
-                            // Store in gossip state to be sent during next gossip round
-                            drop(pool); // Release the pool lock first
-                            let mut gossip_state = registry.gossip_state.lock().await;
-
-                            // Mark that we need to send a full sync to this peer
-                            if let Some(peer_info) = gossip_state.peers.get_mut(&sender_socket_addr)
-                            {
-                                // Force a full sync on the next gossip round
-                                peer_info.consecutive_deltas =
-                                    registry.config.max_delta_history as u64;
-                                info!(peer = %sender_socket_addr,
-                                      "Marked peer for full sync in next gossip round");
-                            }
-                        }
-                    }
-                }
-            }
-
-            Ok(())
-        }
-        RegistryMessage::FullSyncRequest {
-            sender_peer_id,
-            sequence: _,
-            wall_clock_time: _,
-        } => {
-            debug!(
-                sender = %sender_peer_id,
-                "received full sync request on bidirectional connection"
-            );
-
-            {
-                let mut gossip_state = registry.gossip_state.lock().await;
-                gossip_state.full_sync_exchanges += 1;
-            }
-
-            // Note: Response will be sent during regular gossip rounds
-            Ok(())
-        }
-        // Handle response messages (these can arrive on incoming connections too)
-        RegistryMessage::DeltaGossipResponse { delta } => {
-            debug!(
-                sender = %delta.sender_peer_id,
-                changes = delta.changes.len(),
-                "received delta gossip response on bidirectional connection"
-            );
-
-            if let Err(err) = registry.apply_delta(delta).await {
-                warn!(error = %err, "failed to apply delta from response");
-            } else {
-                let mut gossip_state = registry.gossip_state.lock().await;
-                gossip_state.delta_exchanges += 1;
-            }
-            Ok(())
-        }
-        RegistryMessage::FullSyncResponse {
-            local_actors,
-            known_actors,
-            sender_peer_id,
-            sequence,
-            wall_clock_time,
-        } => {
-            debug!(
-                sender = %sender_peer_id,
-                local_actors = local_actors.len(),
-                known_actors = known_actors.len(),
-                "RECEIVED: FullSyncResponse from peer"
-            );
-
-            // Use the actual peer address we're connected to
-            let sender_socket_addr = _peer_addr;
-
-            registry
-                .merge_full_sync(
-                    local_actors.into_iter().collect(),
-                    known_actors.into_iter().collect(),
-                    sender_socket_addr,
-                    sequence,
-                    wall_clock_time,
-                )
-                .await;
-
-            // Reset failure state when receiving response
-            let mut gossip_state = registry.gossip_state.lock().await;
-
-            // Reset failure state for responding peer
-            let need_to_clear_pending =
-                if let Some(peer_info) = gossip_state.peers.get_mut(&sender_socket_addr) {
-                    let had_failures = peer_info.failures > 0;
-                    if had_failures {
-                        info!(peer = %sender_socket_addr,
-                          prev_failures = peer_info.failures,
-                          "🔄 Resetting failure state after receiving FullSyncResponse");
-                        peer_info.failures = 0;
-                        peer_info.last_failure_time = None;
-                    }
-                    peer_info.last_success = crate::current_timestamp();
-                    had_failures
-                } else {
-                    false
+                    pool.has_connection(&target_addr)
                 };
 
-            // Clear pending failure record if needed
-            if need_to_clear_pending {
-                gossip_state
-                    .pending_peer_failures
-                    .remove(&sender_socket_addr);
-            }
+                let last_contact = if is_alive {
+                    crate::current_timestamp()
+                } else {
+                    // Check when we last had successful contact
+                    let gossip_state = registry.gossip_state.lock().await;
+                    gossip_state
+                        .peers
+                        .get(&target_addr)
+                        .map(|info| info.last_success)
+                        .unwrap_or(0)
+                };
 
-            gossip_state.full_sync_exchanges += 1;
-            Ok(())
-        }
-        RegistryMessage::PeerHealthQuery {
-            sender,
-            target_peer,
-            timestamp: _,
-        } => {
-            debug!(
-                sender = %sender,
-                target = %target_peer,
-                "received peer health query"
-            );
+                // Send our health report back
+                let mut peer_statuses = HashMap::new();
 
-            // Check our connection status to the target peer
-            let target_addr = match target_peer.parse::<SocketAddr>() {
-                Ok(addr) => addr,
-                Err(_) => {
-                    warn!(
-                        "Invalid target peer address in health query: {}",
-                        target_peer
-                    );
-                    return Ok(());
-                }
-            };
+                // Get actual failure count from gossip state
+                let failure_count = {
+                    let gossip_state = registry.gossip_state.lock().await;
+                    gossip_state
+                        .peers
+                        .get(&target_addr)
+                        .map(|info| info.failures as u32)
+                        .unwrap_or(0)
+                };
 
-            let is_alive = {
-                let pool = registry.connection_pool.lock().await;
-                pool.has_connection(&target_addr)
-            };
+                peer_statuses.insert(
+                    target_peer,
+                    crate::registry::PeerHealthStatus {
+                        is_alive,
+                        last_contact,
+                        failure_count,
+                    },
+                );
 
-            let last_contact = if is_alive {
-                crate::current_timestamp()
-            } else {
-                // Check when we last had successful contact
-                let gossip_state = registry.gossip_state.lock().await;
-                gossip_state
-                    .peers
-                    .get(&target_addr)
-                    .map(|info| info.last_success)
-                    .unwrap_or(0)
-            };
+                let report = RegistryMessage::PeerHealthReport {
+                    reporter: registry.peer_id.clone(),
+                    peer_statuses: peer_statuses.into_iter().collect(),
+                    timestamp: crate::current_timestamp(),
+                };
 
-            // Send our health report back
-            let mut peer_statuses = HashMap::new();
+                // Send report back to the querying peer
+                if let Ok(data) = rkyv::to_bytes::<rkyv::rancor::Error>(&report) {
+                    let pool = registry.connection_pool.lock().await;
+                    // Use the actual peer address we received from
+                    let sender_addr = _peer_addr;
 
-            // Get actual failure count from gossip state
-            let failure_count = {
-                let gossip_state = registry.gossip_state.lock().await;
-                gossip_state
-                    .peers
-                    .get(&target_addr)
-                    .map(|info| info.failures as u32)
-                    .unwrap_or(0)
-            };
+                    // Create message with length prefix
+                    let mut buffer = bytes::BytesMut::with_capacity(4 + data.len());
+                    buffer.extend_from_slice(&(data.len() as u32).to_be_bytes());
+                    buffer.extend_from_slice(&data);
 
-            peer_statuses.insert(
-                target_peer,
-                crate::registry::PeerHealthStatus {
-                    is_alive,
-                    last_contact,
-                    failure_count,
-                },
-            );
-
-            let report = RegistryMessage::PeerHealthReport {
-                reporter: registry.peer_id.clone(),
-                peer_statuses: peer_statuses.into_iter().collect(),
-                timestamp: crate::current_timestamp(),
-            };
-
-            // Send report back to the querying peer
-            if let Ok(data) = rkyv::to_bytes::<rkyv::rancor::Error>(&report) {
-                let pool = registry.connection_pool.lock().await;
-                // Use the actual peer address we received from
-                let sender_addr = _peer_addr;
-
-                // Create message with length prefix
-                let mut buffer = bytes::BytesMut::with_capacity(4 + data.len());
-                buffer.extend_from_slice(&(data.len() as u32).to_be_bytes());
-                buffer.extend_from_slice(&data);
-
-                // Use send_lock_free which doesn't create new connections
-                if let Err(e) = pool.send_lock_free(sender_addr, &buffer.freeze()) {
-                    warn!(peer = %sender_addr, error = %e, "Failed to send peer health report");
-                }
-            }
-
-            Ok(())
-        }
-        RegistryMessage::PeerHealthReport {
-            reporter,
-            peer_statuses,
-            timestamp: _,
-        } => {
-            debug!(
-                reporter = %reporter,
-                peers = peer_statuses.len(),
-                "received peer health report"
-            );
-
-            // Store the health reports
-            {
-                let mut gossip_state = registry.gossip_state.lock().await;
-                for (peer, status) in peer_statuses {
-                    if let Ok(peer_addr) = peer.parse::<SocketAddr>() {
-                        // For now, use the reporter's peer address from the connection
-                        gossip_state
-                            .peer_health_reports
-                            .entry(peer_addr)
-                            .or_insert_with(HashMap::new)
-                            .insert(_peer_addr, status);
+                    // Use send_lock_free which doesn't create new connections
+                    if let Err(e) = pool.send_lock_free(sender_addr, &buffer.freeze()) {
+                        warn!(peer = %sender_addr, error = %e, "Failed to send peer health report");
                     }
                 }
+
+                Ok(())
             }
+            RegistryMessage::PeerHealthReport {
+                reporter,
+                peer_statuses,
+                timestamp: _,
+            } => {
+                debug!(
+                    reporter = %reporter,
+                    peers = peer_statuses.len(),
+                    "received peer health report"
+                );
 
-            // Check if we have enough reports to make a decision
-            registry.check_peer_consensus().await;
+                // Store the health reports
+                {
+                    let mut gossip_state = registry.gossip_state.lock().await;
+                    for (peer, status) in peer_statuses {
+                        if let Ok(peer_addr) = peer.parse::<SocketAddr>() {
+                            // For now, use the reporter's peer address from the connection
+                            gossip_state
+                                .peer_health_reports
+                                .entry(peer_addr)
+                                .or_insert_with(HashMap::new)
+                                .insert(_peer_addr, status);
+                        }
+                    }
+                }
 
-            Ok(())
-        }
-        RegistryMessage::ActorMessage {
-            actor_id,
-            type_hash,
-            payload,
-            correlation_id,
-        } => {
-            debug!(
-                actor_id = %actor_id,
-                type_hash = %format!("{:08x}", type_hash),
-                payload_len = payload.len(),
-                correlation_id = ?correlation_id,
-                "received actor message"
-            );
+                // Check if we have enough reports to make a decision
+                registry.check_peer_consensus().await;
 
-            // Forward to the registry's actor message handler
-            match registry
-                .handle_actor_message(&actor_id, type_hash, &payload, correlation_id)
-                .await
-            {
-                Ok(Some(reply_payload)) => {
-                    // If there's a correlation_id, this is an ask message and we need to send the reply back
-                    if let Some(corr_id) = correlation_id {
+                Ok(())
+            }
+            RegistryMessage::ActorMessage {
+                actor_id,
+                type_hash,
+                payload,
+                correlation_id,
+            } => {
+                debug!(
+                    actor_id = %actor_id,
+                    type_hash = %format!("{:08x}", type_hash),
+                    payload_len = payload.len(),
+                    correlation_id = ?correlation_id,
+                    "received actor message"
+                );
+
+                // Forward to the registry's actor message handler
+                match registry
+                    .handle_actor_message(&actor_id, type_hash, &payload, correlation_id)
+                    .await
+                {
+                    Ok(Some(reply_payload)) => {
+                        // If there's a correlation_id, this is an ask message and we need to send the reply back
+                        if let Some(corr_id) = correlation_id {
+                            debug!(
+                                actor_id = %actor_id,
+                                type_hash = %format!("{:08x}", type_hash),
+                                correlation_id = corr_id,
+                                reply_len = reply_payload.len(),
+                                "sending ask reply back to sender"
+                            );
+
+                            // Create response message with the correlation_id
+                            let mut response =
+                                bytes::BytesMut::with_capacity(4 + 8 + reply_payload.len());
+
+                            // Length prefix (4 bytes)
+                            let total_len = 8 + reply_payload.len() as u32;
+                            response.extend_from_slice(&total_len.to_be_bytes());
+
+                            // 8-byte header: msg_type(1) + correlation_id(2) + reserved(5)
+                            response.put_u8(crate::MessageType::Response as u8); // 0x02 for Response
+                            response.extend_from_slice(&corr_id.to_be_bytes());
+                            response.extend_from_slice(&[0u8; 5]); // reserved bytes
+
+                            // Payload
+                            response.extend_from_slice(&reply_payload);
+
+                            // Send response back through the same connection
+                            let pool = registry.connection_pool.lock().await;
+                            if let Err(e) = pool.send_lock_free(_peer_addr, &response.freeze()) {
+                                warn!(peer = %_peer_addr, error = %e, "Failed to send ask reply");
+                            }
+                        }
+
                         debug!(
                             actor_id = %actor_id,
                             type_hash = %format!("{:08x}", type_hash),
-                            correlation_id = corr_id,
-                            reply_len = reply_payload.len(),
-                            "sending ask reply back to sender"
+                            "actor message processed successfully with reply"
                         );
-
-                        // Create response message with the correlation_id
-                        let mut response =
-                            bytes::BytesMut::with_capacity(4 + 8 + reply_payload.len());
-
-                        // Length prefix (4 bytes)
-                        let total_len = 8 + reply_payload.len() as u32;
-                        response.extend_from_slice(&total_len.to_be_bytes());
-
-                        // 8-byte header: msg_type(1) + correlation_id(2) + reserved(5)
-                        response.put_u8(crate::MessageType::Response as u8); // 0x02 for Response
-                        response.extend_from_slice(&corr_id.to_be_bytes());
-                        response.extend_from_slice(&[0u8; 5]); // reserved bytes
-
-                        // Payload
-                        response.extend_from_slice(&reply_payload);
-
-                        // Send response back through the same connection
-                        let pool = registry.connection_pool.lock().await;
-                        if let Err(e) = pool.send_lock_free(_peer_addr, &response.freeze()) {
-                            warn!(peer = %_peer_addr, error = %e, "Failed to send ask reply");
-                        }
                     }
+                    Ok(None) => {
+                        debug!(
+                            actor_id = %actor_id,
+                            type_hash = %format!("{:08x}", type_hash),
+                            "actor message processed successfully"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            actor_id = %actor_id,
+                            type_hash = %format!("{:08x}", type_hash),
+                            error = %e,
+                            "failed to process actor message"
+                        );
+                    }
+                }
 
-                    debug!(
-                        actor_id = %actor_id,
-                        type_hash = %format!("{:08x}", type_hash),
-                        "actor message processed successfully with reply"
-                    );
-                }
-                Ok(None) => {
-                    debug!(
-                        actor_id = %actor_id,
-                        type_hash = %format!("{:08x}", type_hash),
-                        "actor message processed successfully"
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        actor_id = %actor_id,
-                        type_hash = %format!("{:08x}", type_hash),
-                        error = %e,
-                        "failed to process actor message"
-                    );
-                }
+                Ok(())
             }
 
-            Ok(())
-        }
-
-        RegistryMessage::ImmediateAck {
-            actor_name,
-            success,
-        } => {
-            debug!(
-                actor_name = %actor_name,
-                success = success,
-                "received immediate ACK for synchronous registration"
-            );
-
-            // Look up the pending ACK sender for this actor
-            let mut pending_acks = registry.pending_acks.lock().await;
-            if let Some(sender) = pending_acks.remove(&actor_name) {
-                // Send the success status through the oneshot channel
-                if sender.send(success).is_err() {
-                    warn!(
-                        actor_name = %actor_name,
-                        "Failed to send ACK to waiting registration - receiver dropped"
-                    );
-                } else {
-                    info!(
-                        actor_name = %actor_name,
-                        success = success,
-                        "✅ Sent ACK to waiting synchronous registration"
-                    );
-                }
-            } else {
+            RegistryMessage::ImmediateAck {
+                actor_name,
+                success,
+            } => {
                 debug!(
                     actor_name = %actor_name,
-                    "Received ACK but no pending registration found (may have timed out)"
+                    success = success,
+                    "received immediate ACK for synchronous registration"
                 );
+
+                // Look up the pending ACK sender for this actor
+                let mut pending_acks = registry.pending_acks.lock().await;
+                if let Some(sender) = pending_acks.remove(&actor_name) {
+                    // Send the success status through the oneshot channel
+                    if sender.send(success).is_err() {
+                        warn!(
+                            actor_name = %actor_name,
+                            "Failed to send ACK to waiting registration - receiver dropped"
+                        );
+                    } else {
+                        info!(
+                            actor_name = %actor_name,
+                            success = success,
+                            "✅ Sent ACK to waiting synchronous registration"
+                        );
+                    }
+                } else {
+                    debug!(
+                        actor_name = %actor_name,
+                        "Received ACK but no pending registration found (may have timed out)"
+                    );
+                }
+
+                Ok(())
             }
 
-            Ok(())
-        }
+            RegistryMessage::PeerListGossip {
+                peers,
+                timestamp,
+                sender_addr,
+            } => {
+                debug!(
+                    peer_count = peers.len(),
+                    timestamp = timestamp,
+                    sender = %sender_addr,
+                    "received peer list gossip message"
+                );
 
-        RegistryMessage::PeerListGossip {
-            peers,
-            timestamp,
-            sender_addr,
-        } => {
-            debug!(
-                peer_count = peers.len(),
-                timestamp = timestamp,
-                sender = %sender_addr,
-                "received peer list gossip message"
-            );
+                // Accept peer list only from connected peers
+                if !registry.has_active_connection(&_peer_addr).await {
+                    debug!(
+                        peer = %_peer_addr,
+                        "ignoring peer list gossip from non-connected peer"
+                    );
+                    return Ok(());
+                }
 
-            // TODO: Phase 3 will implement full peer list handling
-            // For now, just log that we received it - actual processing happens in registry
-            Ok(())
+                if !registry.peer_supports_peer_list(&_peer_addr).await {
+                    debug!(
+                        peer = %_peer_addr,
+                        "ignoring peer list gossip from peer without capability"
+                    );
+                    return Ok(());
+                }
+
+                let candidates = registry
+                    .on_peer_list_gossip(peers, &sender_addr, timestamp)
+                    .await;
+
+                if candidates.is_empty() {
+                    return Ok(());
+                }
+
+                let registry_clone = registry.clone();
+                tokio::spawn(async move {
+                    for addr in candidates {
+                        let node_id = registry_clone.lookup_node_id(&addr).await;
+                        registry_clone.add_peer_with_node_id(addr, node_id).await;
+
+                        match registry_clone.get_connection(addr).await {
+                            Ok(_) => {
+                                registry_clone.mark_peer_connected(addr).await;
+                                debug!(peer = %addr, "connected to discovered peer");
+                            }
+                            Err(e) => {
+                                registry_clone.mark_peer_failed(addr).await;
+                                warn!(peer = %addr, error = %e, "failed to connect to discovered peer");
+                            }
+                        }
+                    }
+                });
+
+                Ok(())
+            }
         }
-    }
+    })
 }
 
 #[cfg(test)]

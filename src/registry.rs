@@ -3,9 +3,10 @@ use std::{
     io,
     net::SocketAddr,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
+use dashmap::DashMap;
 use lru::LruCache;
 use std::num::NonZeroUsize;
 use tokio::sync::{Mutex, RwLock};
@@ -17,8 +18,9 @@ use tracing::{debug, error, info, warn};
 use crate::{
     connection_pool::ConnectionPool,
     current_timestamp,
+    handshake::PeerCapabilities,
     peer_discovery::{PeerDiscovery, PeerDiscoveryConfig},
-    GossipConfig, GossipError, RegistrationPriority, RemoteActorLocation, Result,
+    GossipConfig, GossipError, NodeId, RegistrationPriority, RemoteActorLocation, Result,
 };
 
 /// Future type for actor message handling responses
@@ -319,6 +321,8 @@ pub struct GossipState {
     pub peer_discovery: Option<PeerDiscovery>,
     /// LRU cache of known peers discovered via gossip
     pub known_peers: LruCache<SocketAddr, PeerInfo>,
+    /// Timestamp (in millis since start_time) when mesh formation completed
+    pub mesh_formation_time_ms: Option<u64>,
 }
 
 /// Core gossip registry implementation with separated locks
@@ -329,6 +333,7 @@ pub struct GossipRegistry {
     pub peer_id: crate::PeerId, // Unique peer identifier (public key)
     pub config: GossipConfig,
     pub start_time: u64,
+    pub start_instant: Instant,
 
     // Optional TLS configuration for encrypted connections
     pub tls_config: Option<Arc<crate::tls::TlsConfig>>,
@@ -337,6 +342,9 @@ pub struct GossipRegistry {
     pub actor_state: Arc<RwLock<ActorState>>,
     pub gossip_state: Arc<Mutex<GossipState>>,
     pub connection_pool: Arc<Mutex<ConnectionPool>>,
+    pub peer_capabilities: Arc<DashMap<SocketAddr, crate::handshake::PeerCapabilities>>,
+    pub peer_capabilities_by_node: Arc<DashMap<crate::NodeId, crate::handshake::PeerCapabilities>>,
+    pub peer_capability_addr_to_node: Arc<DashMap<SocketAddr, crate::NodeId>>,
 
     // Actor message handler callback
     pub actor_message_handler: Arc<Mutex<Option<Arc<dyn ActorMessageHandler>>>>,
@@ -347,6 +355,9 @@ pub struct GossipRegistry {
     // Pending ACKs for synchronous registrations
     pub pending_acks: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>>,
 }
+
+unsafe impl Send for GossipRegistry {}
+unsafe impl Sync for GossipRegistry {}
 
 /// State for assembling streamed messages
 #[derive(Debug)]
@@ -397,12 +408,14 @@ impl GossipRegistry {
 
         let connection_pool =
             ConnectionPool::new(config.max_pooled_connections, config.connection_timeout);
+        let peer_capabilities = Arc::new(DashMap::new());
 
         Self {
             bind_addr,
             peer_id,
             config: config.clone(),
             start_time: current_timestamp(),
+            start_instant: crate::current_instant(),
             tls_config: None, // TLS disabled by default for backward compatibility
             actor_state: Arc::new(RwLock::new(ActorState {
                 local_actors: HashMap::new(),
@@ -430,6 +443,8 @@ impl GossipRegistry {
                             allow_private_discovery: config.allow_private_discovery,
                             allow_loopback_discovery: config.allow_loopback_discovery,
                             allow_link_local_discovery: config.allow_link_local_discovery,
+                            fail_ttl: config.fail_ttl,
+                            pending_ttl: config.pending_ttl,
                         },
                     ))
                 } else {
@@ -439,8 +454,12 @@ impl GossipRegistry {
                     NonZeroUsize::new(config.known_peers_capacity)
                         .unwrap_or(NonZeroUsize::new(10_000).unwrap()),
                 ),
+                mesh_formation_time_ms: None,
             })),
             connection_pool: Arc::new(Mutex::new(connection_pool)),
+            peer_capabilities: peer_capabilities.clone(),
+            peer_capabilities_by_node: Arc::new(DashMap::new()),
+            peer_capability_addr_to_node: Arc::new(DashMap::new()),
             actor_message_handler: Arc::new(Mutex::new(None)),
             stream_assemblies: Arc::new(Mutex::new(HashMap::new())),
             pending_acks: Arc::new(Mutex::new(HashMap::new())),
@@ -450,12 +469,114 @@ impl GossipRegistry {
     /// Enable TLS for secure connections
     /// This must be called before starting the registry to enable TLS
     pub fn enable_tls(&mut self, secret_key: crate::SecretKey) -> Result<()> {
-        let tls_config = crate::tls::TlsConfig::new(secret_key).map_err(|e| {
-            GossipError::TlsConfigError(format!("Failed to create TLS config: {}", e))
-        })?;
+        let tls_config = crate::tls::TlsConfig::with_peer_discovery(
+            secret_key,
+            self.config.enable_peer_discovery,
+        )
+        .map_err(|e| GossipError::TlsConfigError(format!("Failed to create TLS config: {}", e)))?;
         self.tls_config = Some(Arc::new(tls_config));
         info!("TLS enabled for gossip registry");
         Ok(())
+    }
+
+    /// Track negotiated peer capabilities for a peer connection
+    pub fn set_peer_capabilities(&self, addr: SocketAddr, caps: PeerCapabilities) {
+        eprintln!("set_peer_capabilities addr {}", addr);
+        self.peer_capabilities.insert(addr, caps);
+    }
+
+    /// Attach capabilities recorded for an address to a specific NodeId (once known)
+    pub async fn associate_peer_capabilities_with_node(&self, addr: SocketAddr, node_id: NodeId) {
+        if let Some(entry) = self.peer_capabilities.get(&addr) {
+            let caps = entry.value().clone();
+            self.peer_capabilities_by_node.insert(node_id, caps);
+        }
+        self.peer_capability_addr_to_node.insert(addr, node_id);
+        self.propagate_node_id_to_known_addresses(addr, node_id)
+            .await;
+    }
+
+    /// Remove stored capabilities for a peer (e.g., when connection closes)
+    pub fn clear_peer_capabilities(&self, addr: &SocketAddr) {
+        eprintln!("clear_peer_capabilities addr {}", addr);
+        self.peer_capabilities.remove(addr);
+        if let Some((_, node_id)) = self.peer_capability_addr_to_node.remove(addr) {
+            self.peer_capabilities_by_node.remove(&node_id);
+
+            let stale_addrs: Vec<_> = self
+                .peer_capability_addr_to_node
+                .iter()
+                .filter(|entry| *entry.value() == node_id)
+                .map(|entry| *entry.key())
+                .collect();
+            for stale_addr in stale_addrs {
+                self.peer_capability_addr_to_node.remove(&stale_addr);
+            }
+        }
+    }
+
+    /// Determine whether a peer supports receiving PeerListGossip
+    pub async fn peer_supports_peer_list(&self, addr: &SocketAddr) -> bool {
+        eprintln!(
+            "peer_supports called for {} entries {}",
+            addr,
+            self.peer_capabilities.len()
+        );
+        for entry in self.peer_capabilities.iter() {
+            eprintln!(
+                " capability entry addr {} can {}",
+                entry.key(),
+                entry.value().can_send_peer_list()
+            );
+        }
+
+        if let Some(entry) = self.peer_capabilities.get(addr) {
+            return entry.value().can_send_peer_list();
+        }
+
+        if let Some(entry) = self.peer_capability_addr_to_node.get(addr) {
+            if let Some(cap_entry) = self.peer_capabilities_by_node.get(entry.value()) {
+                return cap_entry.value().can_send_peer_list();
+            }
+        }
+
+        if let Some(node_id) = self.lookup_node_id(addr).await {
+            self.peer_capability_addr_to_node.insert(*addr, node_id);
+            if let Some(entry) = self.peer_capabilities_by_node.get(&node_id) {
+                return entry.value().can_send_peer_list();
+            }
+        }
+
+        for entry in self.peer_capabilities.iter() {
+            if entry.key().ip() == addr.ip() && entry.value().can_send_peer_list() {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    async fn propagate_node_id_to_known_addresses(&self, addr: SocketAddr, node_id: NodeId) {
+        let mut gossip_state = self.gossip_state.lock().await;
+        if let Some(peer_info) = gossip_state.peers.get_mut(&addr) {
+            peer_info.node_id = Some(node_id);
+        } else {
+            gossip_state.known_peers.put(
+                addr,
+                PeerInfo {
+                    address: addr,
+                    peer_address: None,
+                    node_id: Some(node_id),
+                    failures: 0,
+                    last_attempt: current_timestamp(),
+                    last_success: current_timestamp(),
+                    last_sequence: 0,
+                    last_sent_sequence: 0,
+                    consecutive_deltas: 0,
+                    last_failure_time: None,
+                },
+            );
+        }
     }
 
     /// Register an actor message handler callback
@@ -611,6 +732,13 @@ impl GossipRegistry {
                     consecutive_deltas: 0,
                     last_failure_time: None,
                 });
+                if let Some(node_id) = node_id {
+                    self.peer_capability_addr_to_node.insert(peer_addr, node_id);
+                    if let Some(entry) = self.peer_capabilities.get(&peer_addr) {
+                        self.peer_capabilities_by_node
+                            .insert(node_id, entry.value().clone());
+                    }
+                }
                 debug!(
                     peer = %peer_addr,
                     peers_count = gossip_state.peers.len(),
@@ -917,6 +1045,7 @@ impl GossipRegistry {
             discovered_peers,
             failed_discovery_attempts,
             avg_mesh_connectivity,
+            mesh_formation_time_ms,
         ) = {
             let gossip_state = self.gossip_state.lock().await;
             let active_peers = gossip_state
@@ -951,6 +1080,7 @@ impl GossipRegistry {
                 discovered_peers,
                 failed_discovery_attempts,
                 avg_mesh_connectivity,
+                gossip_state.mesh_formation_time_ms,
             )
         };
 
@@ -978,7 +1108,7 @@ impl GossipRegistry {
             discovered_peers,
             failed_discovery_attempts,
             avg_mesh_connectivity,
-            mesh_formation_time_ms: None, // TODO: Track in gossip_state when mesh forms
+            mesh_formation_time_ms,
         }
     }
 
@@ -1004,7 +1134,8 @@ impl GossipRegistry {
             );
         }
 
-        let mut peer_actors = std::collections::HashSet::new();
+        let mut peer_actors_added = std::collections::HashSet::new();
+        let mut peer_actors_removed = std::collections::HashSet::new();
 
         // Pre-capture timing info outside lock for better performance
         let received_timestamp = std::time::SystemTime::now()
@@ -1092,7 +1223,7 @@ impl GossipRegistry {
                             applied += 1;
 
                             // Track this actor as belonging to the sender
-                            peer_actors.insert(actor_name);
+                            peer_actors_added.insert(actor_name);
 
                             // Move timing calculations outside critical section for logging
                             if tracing::enabled!(tracing::Level::INFO) {
@@ -1199,6 +1330,7 @@ impl GossipRegistry {
                         if should_remove && actor_state.known_actors.remove(name.as_str()).is_some()
                         {
                             applied += 1;
+                            peer_actors_removed.insert(name.clone());
                             debug!(actor_name = %name, "applied actor removal");
                         }
                     }
@@ -1208,15 +1340,38 @@ impl GossipRegistry {
             applied
         };
 
-        // TODO: Update peer-to-actors mapping for failure tracking
-        // Currently we don't have the socket address, only the node ID
-        // This will need to be refactored to use node IDs instead of socket addresses
+        let peer_actor_changes = peer_actors_added.len() + peer_actors_removed.len();
+
+        if let Some(sender_addr) = {
+            let pool = self.connection_pool.lock().await;
+            pool.peer_id_to_addr
+                .get(&sender_peer_id)
+                .map(|entry| *entry)
+        } {
+            let mut gossip_state = self.gossip_state.lock().await;
+            let entry = gossip_state
+                .peer_to_actors
+                .entry(sender_addr)
+                .or_insert_with(std::collections::HashSet::new);
+
+            for name in peer_actors_removed {
+                entry.remove(&name);
+            }
+            for name in peer_actors_added {
+                entry.insert(name);
+            }
+        } else {
+            debug!(
+                sender = %sender_peer_id,
+                "no address mapping for sender; skipping peer_to_actors update"
+            );
+        }
 
         debug!(
             sender = %sender_peer_id,
             total_changes,
             applied_changes = applied_count,
-            peer_actor_count = peer_actors.len(),
+            peer_actor_changes = peer_actor_changes,
             "completed delta application with vector clock conflict resolution"
         );
 
@@ -2179,12 +2334,13 @@ impl GossipRegistry {
     /// Only works for already established connections
     pub fn get_connection_direct(
         &self,
-        _addr: SocketAddr,
+        addr: SocketAddr,
     ) -> Option<crate::connection_pool::ConnectionHandle> {
-        // Access the internal DashMap directly without locking
-        // This is safe because DashMap is lock-free
-        // We need to access the pool's connections field directly
-        None // TODO: This needs access to the pool's internal structure
+        // Best-effort: avoid await by using try_lock; return None if busy or not connected.
+        self.connection_pool
+            .try_lock()
+            .ok()
+            .and_then(|mut pool| pool.get_existing_connection(addr))
     }
 
     pub async fn is_shutdown(&self) -> bool {
@@ -2798,26 +2954,75 @@ impl GossipRegistry {
         // Store count before moving
         let urgent_changes_count = urgent_changes.len();
 
-        // Create delta once and reuse
-        let delta = RegistryDelta {
-            sender_peer_id: self.peer_id.clone(),
-            since_sequence: 0,   // Not used for immediate gossip
-            current_sequence: 0, // Not used for immediate gossip
-            changes: urgent_changes,
-            wall_clock_time: current_timestamp(), // For debugging/monitoring only
-            precise_timing_nanos: crate::current_timestamp_nanos(), // High precision timing
-        };
+        let wall_clock_time = current_timestamp(); // For debugging/monitoring only
+        let precise_timing_nanos = crate::current_timestamp_nanos(); // High precision timing
 
-        // Serialize message once
+        // Serialize message(s), chunking if we exceed max_message_size
         let serialization_start = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
 
-        let message = RegistryMessage::DeltaGossip {
-            delta: delta.clone(),
-        };
-        let serialized_data = Arc::new(rkyv::to_bytes::<rkyv::rancor::Error>(&message)?);
+        let mut serialized_messages: Vec<Arc<rkyv::util::AlignedVec>> = Vec::new();
+        let mut current_changes: Vec<RegistryChange> = Vec::new();
+
+        for change in urgent_changes {
+            current_changes.push(change);
+
+            let message = RegistryMessage::DeltaGossip {
+                delta: RegistryDelta {
+                    sender_peer_id: self.peer_id.clone(),
+                    since_sequence: 0,   // Not used for immediate gossip
+                    current_sequence: 0, // Not used for immediate gossip
+                    changes: current_changes.clone(),
+                    wall_clock_time,
+                    precise_timing_nanos,
+                },
+            };
+            let serialized = rkyv::to_bytes::<rkyv::rancor::Error>(&message)?;
+
+            if serialized.len() > self.config.max_message_size && current_changes.len() > 1 {
+                let last = current_changes.pop().unwrap();
+                let chunk_message = RegistryMessage::DeltaGossip {
+                    delta: RegistryDelta {
+                        sender_peer_id: self.peer_id.clone(),
+                        since_sequence: 0,
+                        current_sequence: 0,
+                        changes: current_changes.clone(),
+                        wall_clock_time,
+                        precise_timing_nanos,
+                    },
+                };
+                let chunk_serialized =
+                    rkyv::to_bytes::<rkyv::rancor::Error>(&chunk_message)?;
+                serialized_messages.push(Arc::new(chunk_serialized));
+                current_changes.clear();
+                current_changes.push(last);
+            } else if serialized.len() > self.config.max_message_size {
+                warn!(
+                    size = serialized.len(),
+                    max = self.config.max_message_size,
+                    "Immediate gossip change exceeds max message size; sending as single chunk"
+                );
+                serialized_messages.push(Arc::new(serialized));
+                current_changes.clear();
+            }
+        }
+
+        if !current_changes.is_empty() {
+            let message = RegistryMessage::DeltaGossip {
+                delta: RegistryDelta {
+                    sender_peer_id: self.peer_id.clone(),
+                    since_sequence: 0,
+                    current_sequence: 0,
+                    changes: current_changes,
+                    wall_clock_time,
+                    precise_timing_nanos,
+                },
+            };
+            let serialized = rkyv::to_bytes::<rkyv::rancor::Error>(&message)?;
+            serialized_messages.push(Arc::new(serialized));
+        }
 
         let serialization_end = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2826,38 +3031,41 @@ impl GossipRegistry {
         let serialization_duration_ms =
             (serialization_end - serialization_start) as f64 / 1_000_000.0;
 
-        // Log immediate propagation with timing
-        error!(
-            "🚀 IMMEDIATE GOSSIP: Broadcasting {} urgent changes to {} peers (serialization: {:.3}ms)",
-            urgent_changes_count,
-            critical_peers.len(),
-            serialization_duration_ms
-        );
-
-        // TEMPORARY: Skip message size check to allow large messages
-        // TODO: Implement streaming or chunking for very large messages
-        if serialized_data.len() > self.config.max_message_size {
+        if serialized_messages.len() > 1 {
             warn!(
-                "Message size {} exceeds max size {}, but allowing it temporarily",
-                serialized_data.len(),
-                self.config.max_message_size
+                chunks = serialized_messages.len(),
+                max = self.config.max_message_size,
+                "Immediate gossip split into multiple chunks to honor max message size"
             );
         }
+
+        // Log immediate propagation with timing
+        error!(
+            "🚀 IMMEDIATE GOSSIP: Broadcasting {} urgent changes to {} peers (serialization: {:.3}ms, chunks: {})",
+            urgent_changes_count,
+            critical_peers.len(),
+            serialization_duration_ms,
+            serialized_messages.len()
+        );
 
         // Pre-establish all connections and pre-create buffers (single lock acquisition)
         let peer_connections_buffers: Vec<(
             SocketAddr,
             crate::connection_pool::ConnectionHandle,
-            Vec<u8>,
+            Vec<Vec<u8>>,
         )> = {
             let mut pool_guard = self.connection_pool.lock().await;
             let mut connections_buffers = Vec::new();
 
             for peer_addr in &critical_peers {
                 if let Ok(conn) = pool_guard.get_connection(*peer_addr).await {
-                    // Create message buffer with length header using buffer pool
-                    let buffer = pool_guard.create_message_buffer(&serialized_data);
-                    connections_buffers.push((*peer_addr, conn, buffer));
+                    let mut buffers = Vec::new();
+                    for serialized_data in &serialized_messages {
+                        // Create message buffer with length header using buffer pool
+                        let buffer = pool_guard.create_message_buffer(serialized_data);
+                        buffers.push(buffer);
+                    }
+                    connections_buffers.push((*peer_addr, conn, buffers));
                 }
             }
 
@@ -2867,7 +3075,7 @@ impl GossipRegistry {
         // Send to all peers concurrently with pre-established connections and buffers
         let mut join_handles = Vec::new();
 
-        for (peer_addr, conn, buffer) in peer_connections_buffers {
+        for (peer_addr, conn, buffers) in peer_connections_buffers {
             let handle: tokio::task::JoinHandle<Result<()>> = tokio::spawn(async move {
                 // Measure pure network send time
                 let send_start = std::time::SystemTime::now()
@@ -2875,7 +3083,9 @@ impl GossipRegistry {
                     .unwrap()
                     .as_nanos();
 
-                conn.send_data(buffer).await?;
+                for buffer in buffers {
+                    conn.send_data(buffer).await?;
+                }
 
                 let send_end = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -3129,15 +3339,16 @@ impl GossipRegistry {
     }
 
     /// Periodic gossip of peer list to random subset of peers
-    pub async fn gossip_peer_list(&self) {
+    /// Returns gossip tasks for the caller to send.
+    pub async fn gossip_peer_list(&self) -> Vec<GossipTask> {
         // Check if peer discovery is enabled
         if !self.config.enable_peer_discovery {
-            return;
+            return Vec::new();
         }
 
         // Check gossip interval
         let now = current_timestamp();
-        {
+        let current_sequence = {
             let gossip_state = self.gossip_state.lock().await;
             if let Some(interval) = self.config.peer_gossip_interval {
                 let interval_secs = interval.as_secs();
@@ -3146,15 +3357,16 @@ impl GossipRegistry {
                         .last_peer_gossip_time
                         .saturating_add(interval_secs)
                 {
-                    return; // Not time yet
+                    return Vec::new(); // Not time yet
                 }
             }
-        }
+            gossip_state.gossip_sequence
+        };
 
         // Get peer snapshot
         let peers = self.peers_snapshot().await;
         if peers.is_empty() {
-            return;
+            return Vec::new();
         }
 
         // Get active peers to gossip to
@@ -3174,7 +3386,7 @@ impl GossipRegistry {
         };
 
         if targets.is_empty() {
-            return;
+            return Vec::new();
         }
 
         // Update last gossip time
@@ -3191,12 +3403,16 @@ impl GossipRegistry {
             sender_addr: self_addr.to_string(),
         };
 
-        // Send to targets
-        // Note: Actual network sending is integrated in Phase 4 via handle.rs gossip_loop
+        // Prepare tasks for caller to send
         let target_count = targets.len();
-        for target in targets {
-            debug!(target = %target, "queued peer list gossip for target");
-        }
+        let tasks: Vec<GossipTask> = targets
+            .into_iter()
+            .map(|peer_addr| GossipTask {
+                peer_addr,
+                message: msg.clone(),
+                current_sequence,
+            })
+            .collect();
 
         let peer_count = if let RegistryMessage::PeerListGossip { ref peers, .. } = msg {
             peers.len()
@@ -3208,6 +3424,8 @@ impl GossipRegistry {
             peer_count = peer_count,
             "peer list gossip round completed"
         );
+
+        tasks
     }
 
     /// Handle incoming peer list gossip
@@ -3364,11 +3582,15 @@ impl GossipRegistry {
         }
 
         // Also prune from peer_discovery if enabled
-        if let Some(ref mut _discovery) = gossip_state.peer_discovery {
-            // Clear pending peers that have exceeded pending_ttl
-            let pending_ttl_secs = self.config.pending_ttl.as_secs();
-            // Note: PeerDiscovery handles its own pending cleanup via connection lifecycle
-            let _ = pending_ttl_secs; // Suppress unused warning
+        if let Some(ref mut discovery) = gossip_state.peer_discovery {
+            let stats = discovery.cleanup_expired(now);
+            if stats.pending_removed > 0 || stats.failed_removed > 0 {
+                debug!(
+                    pending_removed = stats.pending_removed,
+                    failed_removed = stats.failed_removed,
+                    "peer discovery cleanup removed expired entries"
+                );
+            }
         }
     }
 
@@ -3388,6 +3610,25 @@ impl GossipRegistry {
         for (addr, peer_info) in gossip_state.known_peers.iter() {
             if peer_info.node_id.as_ref() == Some(node_id) {
                 return Some(*addr);
+            }
+        }
+
+        None
+    }
+
+    /// Lookup NodeId for a given address (active peers first, then known_peers)
+    pub async fn lookup_node_id(&self, addr: &SocketAddr) -> Option<crate::NodeId> {
+        let mut gossip_state = self.gossip_state.lock().await;
+
+        if let Some(peer_info) = gossip_state.peers.get(addr) {
+            if let Some(node_id) = peer_info.node_id {
+                return Some(node_id);
+            }
+        }
+
+        if let Some(peer_info) = gossip_state.known_peers.get(addr) {
+            if let Some(node_id) = peer_info.node_id {
+                return Some(node_id);
             }
         }
 
@@ -3444,11 +3685,28 @@ impl GossipRegistry {
             peer_info.failures = 0;
             peer_info.last_failure_time = None;
             peer_info.last_success = current_timestamp();
+            if let Some(node_id) = peer_info.node_id {
+                self.peer_capability_addr_to_node.insert(addr, node_id);
+                if let Some(entry) = self.peer_capabilities_by_node.get(&node_id) {
+                    self.peer_capabilities.insert(addr, entry.value().clone());
+                }
+            }
         }
 
         // Update peer_discovery
+        let should_track_mesh_time =
+            self.config.mesh_formation_target > 0 && gossip_state.mesh_formation_time_ms.is_none();
+
         if let Some(ref mut discovery) = gossip_state.peer_discovery {
             discovery.on_peer_connected(addr);
+
+            if should_track_mesh_time {
+                let target = self.config.mesh_formation_target;
+                if discovery.connected_peer_count() >= target {
+                    let elapsed_ms = self.start_instant.elapsed().as_millis() as u64;
+                    gossip_state.mesh_formation_time_ms = Some(elapsed_ms);
+                }
+            }
         }
 
         debug!(addr = %addr, "marked peer as connected");
@@ -3542,6 +3800,10 @@ mod tests {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port)
     }
 
+    fn test_location(addr: SocketAddr) -> RemoteActorLocation {
+        RemoteActorLocation::new_with_peer(addr, PeerId::new("test_peer"))
+    }
+
     fn test_config() -> GossipConfig {
         GossipConfig {
             gossip_interval: Duration::from_millis(100),
@@ -3554,7 +3816,7 @@ mod tests {
 
     #[test]
     fn test_registry_change_serialization() {
-        let location = RemoteActorLocation::new(test_addr(8080));
+        let location = test_location(test_addr(8080));
         let change = RegistryChange::ActorAdded {
             name: "test".to_string(),
             location,
@@ -3581,7 +3843,7 @@ mod tests {
             changes: vec![],
             sender_peer_id: PeerId::new("test_peer"),
             wall_clock_time: 1000,
-            precise_timing_nanos: 1000_000_000_000, // 1000 seconds in nanoseconds
+            precise_timing_nanos: 1_000_000_000_000, // 1000 seconds in nanoseconds
         };
 
         let serialized = rkyv::to_bytes::<rkyv::rancor::Error>(&delta).unwrap();
@@ -3615,7 +3877,7 @@ mod tests {
             changes: vec![],
             sender_peer_id: PeerId::new("test_peer"),
             wall_clock_time: 1000,
-            precise_timing_nanos: 1000_000_000_000, // 1000 seconds in nanoseconds
+            precise_timing_nanos: 1_000_000_000_000, // 1000 seconds in nanoseconds
         };
         let msg = RegistryMessage::DeltaGossip { delta };
         let serialized = rkyv::to_bytes::<rkyv::rancor::Error>(&msg).unwrap();
@@ -3699,8 +3961,8 @@ mod tests {
 
     #[test]
     fn test_deduplicate_changes() {
-        let location1 = RemoteActorLocation::new(test_addr(8080));
-        let location2 = RemoteActorLocation::new(test_addr(8081));
+        let location1 = test_location(test_addr(8080));
+        let location2 = test_location(test_addr(8081));
 
         let changes = vec![
             RegistryChange::ActorAdded {
@@ -3737,7 +3999,7 @@ mod tests {
 
     #[test]
     fn test_get_change_actor_name() {
-        let location = RemoteActorLocation::new(test_addr(8080));
+        let location = test_location(test_addr(8080));
         let add_change = RegistryChange::ActorAdded {
             name: "test_actor".to_string(),
             location,
@@ -3798,7 +4060,7 @@ mod tests {
     async fn test_register_actor() {
         let registry = GossipRegistry::new(test_addr(8080), test_config());
 
-        let location = RemoteActorLocation::new(test_addr(9001));
+        let location = test_location(test_addr(9001));
         let result = registry
             .register_actor("test_actor".to_string(), location)
             .await;
@@ -3817,7 +4079,7 @@ mod tests {
     async fn test_register_actor_duplicate() {
         let registry = GossipRegistry::new(test_addr(8080), test_config());
 
-        let location = RemoteActorLocation::new(test_addr(9001));
+        let location = test_location(test_addr(9001));
         registry
             .register_actor("test_actor".to_string(), location.clone())
             .await
@@ -3836,7 +4098,7 @@ mod tests {
         config.immediate_propagation_enabled = false; // Disable to test queuing
         let registry = GossipRegistry::new(test_addr(8080), config);
 
-        let location = RemoteActorLocation::new(test_addr(9001));
+        let location = test_location(test_addr(9001));
         let result = registry
             .register_actor_with_priority(
                 "urgent_actor".to_string(),
@@ -3856,7 +4118,7 @@ mod tests {
     async fn test_unregister_actor() {
         let registry = GossipRegistry::new(test_addr(8080), test_config());
 
-        let location = RemoteActorLocation::new(test_addr(9001));
+        let location = test_location(test_addr(9001));
         registry
             .register_actor("test_actor".to_string(), location)
             .await
@@ -3879,7 +4141,7 @@ mod tests {
         let registry = GossipRegistry::new(test_addr(8080), test_config());
 
         // Test local actor
-        let location = RemoteActorLocation::new(test_addr(9001));
+        let location = test_location(test_addr(9001));
         registry
             .register_actor("local_actor".to_string(), location.clone())
             .await
@@ -3901,7 +4163,7 @@ mod tests {
         let registry = GossipRegistry::new(test_addr(8080), config);
 
         // Add a known actor with old timestamp
-        let mut location = RemoteActorLocation::new(test_addr(9001));
+        let mut location = test_location(test_addr(9001));
         location.wall_clock_time = current_timestamp() - 100; // Old timestamp
 
         {
@@ -3922,10 +4184,7 @@ mod tests {
 
         // Add some data
         registry
-            .register_actor(
-                "actor1".to_string(),
-                RemoteActorLocation::new(test_addr(9001)),
-            )
+            .register_actor("actor1".to_string(), test_location(test_addr(9001)))
             .await
             .unwrap();
         registry.add_peer(test_addr(8081)).await;
@@ -3938,10 +4197,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_mesh_formation_metric_records_when_threshold_met() {
+        let mut config = test_config();
+        config.enable_peer_discovery = true;
+        config.mesh_formation_target = 1;
+
+        let registry = GossipRegistry::new(test_addr(8080), config);
+        registry.mark_peer_connected(test_addr(8082)).await;
+
+        let stats = registry.get_stats().await;
+        assert!(
+            stats.mesh_formation_time_ms.is_some(),
+            "mesh formation metric should be recorded when threshold met"
+        );
+    }
+
+    #[tokio::test]
     async fn test_apply_delta() {
         let registry = GossipRegistry::new(test_addr(8080), test_config());
 
-        let location = RemoteActorLocation::new(test_addr(9001));
+        let location = test_location(test_addr(9001));
         let delta = RegistryDelta {
             since_sequence: 0,
             current_sequence: 1,
@@ -3967,14 +4242,14 @@ mod tests {
         let registry = GossipRegistry::new(test_addr(8080), test_config());
 
         // Register local actor
-        let local_location = RemoteActorLocation::new(test_addr(9001));
+        let local_location = test_location(test_addr(9001));
         registry
             .register_actor("local_actor".to_string(), local_location)
             .await
             .unwrap();
 
         // Try to override with remote update
-        let remote_location = RemoteActorLocation::new(test_addr(9002));
+        let remote_location = test_location(test_addr(9002));
         let delta = RegistryDelta {
             since_sequence: 0,
             current_sequence: 1,
@@ -4057,10 +4332,7 @@ mod tests {
 
         // Add some changes
         registry
-            .register_actor(
-                "actor1".to_string(),
-                RemoteActorLocation::new(test_addr(9001)),
-            )
+            .register_actor("actor1".to_string(), test_location(test_addr(9001)))
             .await
             .unwrap();
 
@@ -4075,10 +4347,7 @@ mod tests {
 
         // Add some data
         registry
-            .register_actor(
-                "actor1".to_string(),
-                RemoteActorLocation::new(test_addr(9001)),
-            )
+            .register_actor("actor1".to_string(), test_location(test_addr(9001)))
             .await
             .unwrap();
         registry.add_peer(test_addr(8081)).await;
@@ -4125,7 +4394,7 @@ mod tests {
         let registry = GossipRegistry::new(test_addr(8080), config);
 
         // Add old actor
-        let mut old_location = RemoteActorLocation::new(test_addr(9001));
+        let mut old_location = test_location(test_addr(9001));
         old_location.wall_clock_time = current_timestamp() - 100;
 
         {
@@ -4172,10 +4441,9 @@ mod tests {
         // Add some actors from the failed peer
         {
             let mut actor_state = registry.actor_state.write().await;
-            actor_state.known_actors.insert(
-                "peer_actor".to_string(),
-                RemoteActorLocation::new(test_addr(9001)),
-            );
+            actor_state
+                .known_actors
+                .insert("peer_actor".to_string(), test_location(test_addr(9001)));
 
             let mut gossip_state = registry.gossip_state.lock().await;
             let mut actors = HashSet::new();
@@ -4200,16 +4468,10 @@ mod tests {
         let registry = GossipRegistry::new(test_addr(8080), test_config());
 
         let mut remote_local = HashMap::new();
-        remote_local.insert(
-            "remote_actor1".to_string(),
-            RemoteActorLocation::new(test_addr(9001)),
-        );
+        remote_local.insert("remote_actor1".to_string(), test_location(test_addr(9001)));
 
         let mut remote_known = HashMap::new();
-        remote_known.insert(
-            "remote_actor2".to_string(),
-            RemoteActorLocation::new(test_addr(9002)),
-        );
+        remote_known.insert("remote_actor2".to_string(), test_location(test_addr(9002)));
 
         registry
             .merge_full_sync(
@@ -4298,7 +4560,7 @@ mod tests {
                 .urgent_changes
                 .push(RegistryChange::ActorAdded {
                     name: "urgent".to_string(),
-                    location: RemoteActorLocation::new(test_addr(9001)),
+                    location: test_location(test_addr(9001)),
                     priority: RegistrationPriority::Immediate,
                 });
         }
@@ -4325,7 +4587,7 @@ mod tests {
                     .pending_changes
                     .push(RegistryChange::ActorAdded {
                         name: format!("actor{}", i),
-                        location: RemoteActorLocation::new(test_addr(9000 + i as u16)),
+                        location: test_location(test_addr(9000 + i as u16)),
                         priority: RegistrationPriority::Normal,
                     });
             }
@@ -4435,6 +4697,73 @@ mod tests {
             }
             _ => panic!("Expected PeerListGossip message"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_peer_list_gossip_tasks_created() {
+        let config = GossipConfig {
+            enable_peer_discovery: true,
+            peer_gossip_interval: None,
+            max_peer_gossip_targets: 1,
+            allow_loopback_discovery: true,
+            ..Default::default()
+        };
+
+        let registry = GossipRegistry::new("127.0.0.1:9000".parse().unwrap(), config);
+        registry.add_peer(test_addr(9001)).await;
+        registry.add_peer(test_addr(9002)).await;
+
+        let tasks = registry.gossip_peer_list().await;
+        assert_eq!(tasks.len(), 1);
+
+        match &tasks[0].message {
+            RegistryMessage::PeerListGossip { sender_addr, .. } => {
+                assert_eq!(sender_addr, "127.0.0.1:9000");
+            }
+            _ => panic!("Expected PeerListGossip message"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_on_peer_list_gossip_ingests_known_peers_and_candidates() {
+        let config = GossipConfig {
+            enable_peer_discovery: true,
+            allow_loopback_discovery: true,
+            max_peers: 1,
+            ..Default::default()
+        };
+
+        let registry = GossipRegistry::new("127.0.0.1:9000".parse().unwrap(), config);
+
+        let node_id = crate::SecretKey::generate().public();
+        let peers = vec![
+            PeerInfoGossip {
+                address: "127.0.0.1:9001".to_string(),
+                peer_address: None,
+                node_id: Some(node_id),
+                failures: 0,
+                last_attempt: 1,
+                last_success: 1,
+            },
+            PeerInfoGossip {
+                address: "127.0.0.1:9002".to_string(),
+                peer_address: None,
+                node_id: None,
+                failures: 0,
+                last_attempt: 1,
+                last_success: 1,
+            },
+        ];
+
+        let candidates = registry
+            .on_peer_list_gossip(peers, "127.0.0.1:9003", 1)
+            .await;
+
+        assert!(candidates.len() <= 1);
+
+        let mut gossip_state = registry.gossip_state.lock().await;
+        let addr_9001: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        assert!(gossip_state.known_peers.get(&addr_9001).is_some());
     }
 
     #[test]

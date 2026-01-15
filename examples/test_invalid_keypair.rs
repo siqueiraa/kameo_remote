@@ -61,8 +61,8 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Add the expected client as a configured peer
-    let expected_client_addr: SocketAddr = "127.0.0.1:28103".parse()?;
-    let peer = registry.add_peer(&expected_client_peer_id).await;
+    let _expected_client_addr: SocketAddr = "127.0.0.1:28103".parse()?;
+    let _peer = registry.add_peer(&expected_client_peer_id).await;
     // Note: We don't connect TO the client, we just configure it as an expected peer
 
     println!("⏳ Waiting for client connections...");

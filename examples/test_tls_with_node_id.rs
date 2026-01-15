@@ -1,4 +1,4 @@
-use kameo_remote::{GossipConfig, GossipRegistryHandle, NodeId, SecretKey};
+use kameo_remote::{GossipConfig, GossipRegistryHandle, SecretKey};
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -28,8 +28,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Node B ID: {}", node_id_b.fmt_short());
 
     // Create config with shorter gossip interval for testing
-    let mut config = GossipConfig::default();
-    config.gossip_interval = Duration::from_secs(2);
+    let config = GossipConfig {
+        gossip_interval: Duration::from_secs(2),
+        ..Default::default()
+    };
 
     // Start Node A with TLS
     let addr_a: SocketAddr = "127.0.0.1:7001".parse()?;
@@ -114,7 +116,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let secret_key_c = SecretKey::generate();
     let node_id_c = secret_key_c.public();
     let addr_c: SocketAddr = "127.0.0.1:7003".parse()?;
-    let registry_c = GossipRegistryHandle::new_with_tls(addr_c, secret_key_c, Some(config)).await?;
+    let _registry_c =
+        GossipRegistryHandle::new_with_tls(addr_c, secret_key_c, Some(config)).await?;
     info!("Node C started with ID: {}", node_id_c.fmt_short());
 
     // Node A tries to connect to Node C but with wrong NodeId (Node B's ID)

@@ -1,7 +1,5 @@
-use kameo_remote::{GossipConfig, GossipRegistryHandle, NodeId, SecretKey};
-use std::net::SocketAddr;
+use kameo_remote::{GossipRegistryHandle, SecretKey};
 use std::time::Duration;
-use tokio::time::timeout;
 
 /// Test mutual authentication between two TLS-enabled nodes
 #[tokio::test]
@@ -168,7 +166,7 @@ async fn test_bidirectional_tls_communication() {
         .ok();
 
     let secret_key_a = SecretKey::generate();
-    let node_id_a = secret_key_a.public();
+    let _node_id_a = secret_key_a.public();
 
     let secret_key_b = SecretKey::generate();
     let node_id_b = secret_key_b.public();
@@ -184,7 +182,7 @@ async fn test_bidirectional_tls_communication() {
             .await
             .expect("Failed to create registry B");
 
-    let addr_a = registry_a.registry.bind_addr;
+    let _addr_a = registry_a.registry.bind_addr;
     let addr_b = registry_b.registry.bind_addr;
 
     // Only A knows about B initially
@@ -230,7 +228,7 @@ async fn test_multi_node_tls_chain() {
 
     // Create 3 nodes in a chain: A -> B -> C
     let secret_key_a = SecretKey::generate();
-    let node_id_a = secret_key_a.public();
+    let _node_id_a = secret_key_a.public();
 
     let secret_key_b = SecretKey::generate();
     let node_id_b = secret_key_b.public();
@@ -253,7 +251,7 @@ async fn test_multi_node_tls_chain() {
             .await
             .expect("Failed to create registry C");
 
-    let addr_a = registry_a.registry.bind_addr;
+    let _addr_a = registry_a.registry.bind_addr;
     let addr_b = registry_b.registry.bind_addr;
     let addr_c = registry_c.registry.bind_addr;
 

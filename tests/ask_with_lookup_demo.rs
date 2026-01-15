@@ -194,7 +194,7 @@ async fn test_ask_with_lookup_and_performance() {
     println!("============================================");
 
     // Test queries
-    let queries = vec![
+    let queries = [
         ("database_service", "SELECT * FROM users WHERE id = 123"),
         ("compute_service", "CALCULATE fibonacci(40)"),
         ("cache_service", "GET user:123:profile"),
@@ -270,7 +270,7 @@ async fn test_ask_with_lookup_and_performance() {
     );
 
     // Verify all responses
-    let responses = vec![r1, r2, r3, r4, r5, r6];
+    let responses = [r1, r2, r3, r4, r5, r6];
     for (i, response) in responses.iter().enumerate() {
         match response {
             Ok(data) => {
@@ -511,7 +511,7 @@ async fn test_ask_high_throughput() {
     sleep(Duration::from_millis(50)).await;
 
     // Lookup and create connection
-    let api_location = node1.lookup("api_service").await.unwrap();
+    let _api_location = node1.lookup("api_service").await.unwrap();
     let api_conn = node1.get_connection(node2_addr).await.unwrap();
 
     // Test parameters
@@ -535,7 +535,7 @@ async fn test_ask_high_throughput() {
 
     // Process requests in batches
     for batch in 0..(request_count / concurrent_requests) {
-        let batch_start = Instant::now();
+        let _batch_start = Instant::now();
 
         // Send concurrent requests
         let mut handles = Vec::new();

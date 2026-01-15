@@ -1181,7 +1181,7 @@ mod tests {
 
     #[test]
     fn test_gossip_error_display() {
-        let err = GossipError::Network(io::Error::new(io::ErrorKind::Other, "test error"));
+        let err = GossipError::Network(io::Error::other("test error"));
         assert_eq!(err.to_string(), "network error: test error");
 
         let err = GossipError::MessageTooLarge {
@@ -1224,7 +1224,7 @@ mod tests {
     #[test]
     fn test_error_conversions() {
         // Test From<io::Error>
-        let io_err = io::Error::new(io::ErrorKind::Other, "io error");
+        let io_err = io::Error::other("io error");
         let gossip_err: GossipError = io_err.into();
         match gossip_err {
             GossipError::Network(_) => (),
@@ -1242,7 +1242,10 @@ mod tests {
     #[test]
     fn test_result_type() {
         let ok_result: Result<i32> = Ok(42);
-        assert_eq!(ok_result.unwrap(), 42);
+        match ok_result {
+            Ok(value) => assert_eq!(value, 42),
+            Err(_) => panic!("Expected Ok result"),
+        }
 
         let err_result: Result<i32> = Err(GossipError::Timeout);
         assert!(err_result.is_err());

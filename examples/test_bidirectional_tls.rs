@@ -1,8 +1,8 @@
-use kameo_remote::{GossipConfig, GossipRegistryHandle, NodeId, SecretKey};
+use kameo_remote::{GossipConfig, GossipRegistryHandle, SecretKey};
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::time::sleep;
-use tracing::{debug, error, info};
+use tracing::{error, info};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -28,8 +28,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Node B ID: {}", node_id_b.fmt_short());
 
     // Create config with shorter gossip interval for testing
-    let mut config = GossipConfig::default();
-    config.gossip_interval = Duration::from_secs(2);
+    let config = GossipConfig {
+        gossip_interval: Duration::from_secs(2),
+        ..Default::default()
+    };
 
     // Start Node A with TLS
     let addr_a: SocketAddr = "127.0.0.1:7011".parse()?;

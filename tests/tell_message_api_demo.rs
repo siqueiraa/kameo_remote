@@ -36,7 +36,7 @@ async fn test_tell_message_api_comprehensive() {
 
     // Test 1: Single application messages (like chat messages, API requests, etc.)
     println!("\n🔸 Test 1A: Single Application Messages");
-    let chat_messages = vec![
+    let chat_messages = [
         "Hello, how are you?",
         "I'm working on a distributed system",
         "The TellMessage API is really cool!",
@@ -284,7 +284,7 @@ async fn test_tell_message_api_comprehensive() {
 
     // Test 4A: Simple ask() requests
     println!("\n🔸 Test 4A: Simple ask() Requests");
-    let api_requests = vec![
+    let api_requests = [
         "GET /api/users",
         "POST /api/messages",
         "PUT /api/settings",

@@ -1,8 +1,6 @@
-use anyhow::Result;
 use kameo_remote::{GossipConfig, GossipRegistryHandle, KeyPair, PeerId};
 use std::time::Duration;
 use tokio::time::timeout;
-use tracing::info;
 
 /// Test cryptographic security features
 ///
@@ -258,24 +256,21 @@ async fn test_invalid_key_edge_cases() {
 
     // Test invalid hex strings
     let invalid_hex_cases: Vec<String> = vec![
-        "".to_string(),             // Empty
-        "invalid".to_string(),      // Not hex
-        "abc".to_string(),          // Too short
-        "a".repeat(63), // One character too short
-        "a".repeat(65), // One character too long
-        "g".repeat(64), // Invalid hex characters
+        "".to_string(),        // Empty
+        "invalid".to_string(), // Not hex
+        "abc".to_string(),     // Too short
+        "a".repeat(63),        // One character too short
+        "a".repeat(65),        // One character too long
+        "g".repeat(64),        // Invalid hex characters
     ];
 
     for (i, invalid_hex) in invalid_hex_cases.iter().enumerate() {
-        println!(
-            "   Test case {}: '{}'",
-            i + 1,
-            if invalid_hex.len() > 20 {
-                &format!("{}...", &invalid_hex[..20])
-            } else {
-                invalid_hex
-            }
-        );
+        let display_hex = if invalid_hex.len() > 20 {
+            format!("{}...", &invalid_hex[..20])
+        } else {
+            invalid_hex.clone()
+        };
+        println!("   Test case {}: '{}'", i + 1, display_hex);
         match PeerId::from_hex(invalid_hex) {
             Ok(_) => println!("      ❌ ERROR: Should have failed to parse invalid hex"),
             Err(_) => println!("      ✅ Correctly rejected invalid hex"),
@@ -283,7 +278,7 @@ async fn test_invalid_key_edge_cases() {
     }
 
     // Test invalid byte arrays
-    let invalid_byte_cases = vec![
+    let invalid_byte_cases = [
         vec![],        // Empty
         vec![0u8; 31], // Too short
         vec![0u8; 33], // Too long
@@ -299,7 +294,7 @@ async fn test_invalid_key_edge_cases() {
     }
 
     // Test invalid private key for KeyPair
-    let invalid_private_key_cases = vec![
+    let invalid_private_key_cases = [
         vec![],        // Empty
         vec![0u8; 31], // Too short
         vec![0u8; 33], // Too long

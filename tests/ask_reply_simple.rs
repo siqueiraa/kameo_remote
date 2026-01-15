@@ -117,7 +117,7 @@ async fn test_basic_ask_correlation() {
         let mut futures = Vec::new();
 
         // Mix different types of requests
-        let requests = vec![
+        let requests = [
             ("ECHO:Request 0", "ECHOED:Request 0"),
             ("REVERSE:Request 1", "REVERSED:1 tseuqeR"),
             ("COUNT:Request 2", "COUNTED:9 chars"),

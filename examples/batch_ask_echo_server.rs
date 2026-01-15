@@ -1,7 +1,7 @@
 use kameo_remote::{GossipConfig, GossipRegistryHandle, MessageType, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info};
@@ -145,9 +145,9 @@ async fn main() -> Result<()> {
         let start = Instant::now();
         let mut success_count = 0;
 
-        for i in 0..NUM_REQUESTS.min(100) {
+        for (i, request) in all_requests.iter().enumerate().take(NUM_REQUESTS.min(100)) {
             // Limit individual test to 100 for speed
-            match connection.ask(&all_requests[i]).await {
+            match connection.ask(request).await {
                 Ok(response) => {
                     if response.len() >= 4 {
                         let value = u32::from_be_bytes([

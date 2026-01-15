@@ -107,6 +107,9 @@ pub struct GossipConfig {
     pub stale_ttl: Duration,
     /// Maximum capacity for known_peers LRU cache (default: 10_000)
     pub known_peers_capacity: usize,
+    /// Number of connected peers required before recording mesh_formation_time_ms
+    /// Set to 0 to disable metric tracking.
+    pub mesh_formation_target: usize,
 }
 
 impl Default for GossipConfig {
@@ -157,6 +160,7 @@ impl Default for GossipConfig {
             pending_ttl: Duration::from_secs(60 * 60),  // 1 hour
             stale_ttl: Duration::from_secs(24 * 60 * 60), // 24 hours
             known_peers_capacity: 10_000,
+            mesh_formation_target: 2,
         }
     }
 }
@@ -221,6 +225,7 @@ mod tests {
         assert_eq!(config.pending_ttl, Duration::from_secs(60 * 60));
         assert_eq!(config.stale_ttl, Duration::from_secs(24 * 60 * 60));
         assert_eq!(config.known_peers_capacity, 10_000);
+        assert_eq!(config.mesh_formation_target, 2);
     }
 
     #[test]

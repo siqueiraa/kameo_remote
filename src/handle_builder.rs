@@ -58,7 +58,7 @@ mod tests {
     use tokio::time::sleep;
 
     #[tokio::test]
-    #[ignore] // TODO: Fix gossip propagation timing issues
+    #[ignore = "gossip propagation timing variance in CI"]
     async fn test_builder_pattern() {
         let node1_addr = "127.0.0.1:36001".parse().unwrap();
         let node2_addr = "127.0.0.1:36002".parse().unwrap();

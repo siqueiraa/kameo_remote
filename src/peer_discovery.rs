@@ -6,7 +6,8 @@
 //! - Soft cap enforcement for connection limits
 
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::time::Duration;
 
 use tracing::{debug, warn};
 
@@ -68,6 +69,10 @@ pub struct PeerDiscoveryConfig {
     pub allow_loopback_discovery: bool,
     /// Allow discovery of link-local addresses (169.254.x.x)
     pub allow_link_local_discovery: bool,
+    /// Time-to-live for failed peers before eviction
+    pub fail_ttl: Duration,
+    /// Time-to-live for pending peers before eviction
+    pub pending_ttl: Duration,
 }
 
 impl Default for PeerDiscoveryConfig {
@@ -77,8 +82,17 @@ impl Default for PeerDiscoveryConfig {
             allow_private_discovery: true, // Allow private IPs by default
             allow_loopback_discovery: false, // Block loopback by default
             allow_link_local_discovery: false, // Block link-local by default
+            fail_ttl: Duration::from_secs(6 * 60 * 60), // 6h matches GossipConfig default
+            pending_ttl: Duration::from_secs(60 * 60), // 1h matches GossipConfig default
         }
     }
+}
+
+/// Summary of expired entries removed during cleanup
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PeerDiscoveryCleanupStats {
+    pub pending_removed: usize,
+    pub failed_removed: usize,
 }
 
 /// Peer Discovery Manager
@@ -243,20 +257,28 @@ impl PeerDiscovery {
 
                 true
             }
-            IpAddr::V6(ipv6) => {
-                // Check loopback (::1)
-                if ipv6.is_loopback() && !self.config.allow_loopback_discovery {
-                    return false;
-                }
-
-                // Check unspecified (::)
-                if ipv6.is_unspecified() {
-                    return false;
-                }
-
-                true
-            }
+            IpAddr::V6(ipv6) => self.is_safe_ipv6(&ipv6),
         }
+    }
+
+    fn is_safe_ipv6(&self, ipv6: &Ipv6Addr) -> bool {
+        if ipv6.is_loopback() && !self.config.allow_loopback_discovery {
+            return false;
+        }
+
+        if ipv6.is_unspecified() {
+            return false;
+        }
+
+        if ipv6.is_unicast_link_local() && !self.config.allow_link_local_discovery {
+            return false;
+        }
+
+        if ipv6.is_unique_local() && !self.config.allow_private_discovery {
+            return false;
+        }
+
+        true
     }
 
     /// Calculate if we should retry connecting to a peer based on backoff
@@ -382,12 +404,46 @@ impl PeerDiscovery {
     pub fn pending_peer_count(&self) -> usize {
         self.pending_peers.len()
     }
+
+    /// Remove expired pending/failed peers based on configured TTLs
+    pub fn cleanup_expired(&mut self, now: u64) -> PeerDiscoveryCleanupStats {
+        let mut stats = PeerDiscoveryCleanupStats::default();
+
+        // Remove pending peers that exceeded pending_ttl
+        let pending_ttl = self.config.pending_ttl.as_secs();
+        if pending_ttl > 0 {
+            self.pending_peers.retain(|_, added_at| {
+                if now.saturating_sub(*added_at) > pending_ttl {
+                    stats.pending_removed += 1;
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+
+        // Remove failed peers that exceeded fail_ttl
+        let fail_ttl = self.config.fail_ttl.as_secs();
+        if fail_ttl > 0 {
+            self.failed_peers.retain(|_, state| {
+                if now.saturating_sub(state.last_failure) > fail_ttl {
+                    stats.failed_removed += 1;
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+
+        stats
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::time::Duration;
 
     fn test_addr(port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), port)
@@ -407,6 +463,18 @@ mod tests {
 
     fn public_addr(port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), port)
+    }
+
+    fn ipv6_loopback_addr(port: u16) -> SocketAddr {
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port)
+    }
+
+    fn ipv6_link_local_addr(port: u16) -> SocketAddr {
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)), port)
+    }
+
+    fn ipv6_unique_local_addr(port: u16) -> SocketAddr {
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1)), port)
     }
 
     fn create_peer_gossip(addr: &str) -> PeerInfoGossip {
@@ -552,6 +620,48 @@ mod tests {
         };
         let discovery = PeerDiscovery::new(local, config);
         assert!(!discovery.is_safe_to_dial(&private_addr(8080)));
+    }
+
+    #[test]
+    fn test_ipv6_loopback_blocked_by_default() {
+        let local = public_addr(8080);
+        let discovery = PeerDiscovery::with_defaults(local);
+        assert!(!discovery.is_safe_to_dial(&ipv6_loopback_addr(8080)));
+
+        let config = PeerDiscoveryConfig {
+            allow_loopback_discovery: true,
+            ..Default::default()
+        };
+        let discovery = PeerDiscovery::new(local, config);
+        assert!(discovery.is_safe_to_dial(&ipv6_loopback_addr(8080)));
+    }
+
+    #[test]
+    fn test_ipv6_link_local_blocked_by_default() {
+        let local = public_addr(8080);
+        let discovery = PeerDiscovery::with_defaults(local);
+        assert!(!discovery.is_safe_to_dial(&ipv6_link_local_addr(8080)));
+
+        let config = PeerDiscoveryConfig {
+            allow_link_local_discovery: true,
+            ..Default::default()
+        };
+        let discovery = PeerDiscovery::new(local, config);
+        assert!(discovery.is_safe_to_dial(&ipv6_link_local_addr(8080)));
+    }
+
+    #[test]
+    fn test_ipv6_unique_local_respects_private_flag() {
+        let local = public_addr(8080);
+        let discovery = PeerDiscovery::with_defaults(local);
+        assert!(discovery.is_safe_to_dial(&ipv6_unique_local_addr(8080)));
+
+        let config = PeerDiscoveryConfig {
+            allow_private_discovery: false,
+            ..Default::default()
+        };
+        let discovery = PeerDiscovery::new(local, config);
+        assert!(!discovery.is_safe_to_dial(&ipv6_unique_local_addr(8080)));
     }
 
     #[test]
@@ -708,5 +818,44 @@ mod tests {
         // Failure state should be cleared
         assert!(!discovery.failed_peers.contains_key(&peer));
         assert!(discovery.connected_peers.contains(&peer));
+    }
+
+    #[test]
+    fn test_cleanup_expired_entries() {
+        let local = test_addr(8080);
+        let mut discovery = PeerDiscovery::new(
+            local,
+            PeerDiscoveryConfig {
+                pending_ttl: Duration::from_secs(1),
+                fail_ttl: Duration::from_secs(2),
+                ..Default::default()
+            },
+        );
+
+        let pending_peer = test_addr(9000);
+        let failed_peer = test_addr(9001);
+
+        discovery.pending_peers.insert(pending_peer, 0);
+        discovery.failed_peers.insert(
+            failed_peer,
+            FailureState {
+                consecutive_failures: 1,
+                last_failure: 1,
+            },
+        );
+
+        // Advance time beyond pending TTL but within failed TTL
+        let now = 3;
+
+        let stats = discovery.cleanup_expired(now);
+        assert_eq!(stats.pending_removed, 1);
+        assert_eq!(stats.failed_removed, 0);
+        assert!(!discovery.pending_peers.contains_key(&pending_peer));
+        assert!(discovery.failed_peers.contains_key(&failed_peer));
+
+        // Advance past fail_ttl as well
+        let stats = discovery.cleanup_expired(now + 2);
+        assert_eq!(stats.failed_removed, 1);
+        assert!(!discovery.failed_peers.contains_key(&failed_peer));
     }
 }

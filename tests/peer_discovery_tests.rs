@@ -3,7 +3,7 @@
 //! Multi-node test scenarios for gossip-based peer discovery.
 //! These tests verify the peer discovery functionality implemented in Phases 1-5.
 
-use kameo_remote::{GossipConfig, GossipRegistryHandle, SecretKey};
+use kameo_remote::{registry::PeerInfoGossip, GossipConfig, GossipRegistryHandle, SecretKey};
 use std::net::SocketAddr;
 use std::sync::Once;
 use std::time::Duration;
@@ -22,14 +22,16 @@ fn init_crypto() {
 
 /// Test helper: Create a GossipConfig with peer discovery enabled
 fn peer_discovery_config() -> GossipConfig {
-    let mut config = GossipConfig::default();
-    config.enable_peer_discovery = true;
-    config.max_peers = 10;
-    config.peer_gossip_interval = Some(Duration::from_millis(500));
-    config.gossip_interval = Duration::from_millis(200);
-    config.cleanup_interval = Duration::from_millis(500);
-    config.allow_loopback_discovery = true; // Allow loopback for tests
-    config
+    GossipConfig {
+        enable_peer_discovery: true,
+        max_peers: 10,
+        mesh_formation_target: 2,
+        peer_gossip_interval: Some(Duration::from_millis(500)),
+        gossip_interval: Duration::from_millis(200),
+        cleanup_interval: Duration::from_millis(500),
+        allow_loopback_discovery: true, // Allow loopback for tests
+        ..Default::default()
+    }
 }
 
 /// Test helper: Create a TLS-enabled node
@@ -50,18 +52,15 @@ async fn test_mesh_formation_3_nodes() -> Result<(), Box<dyn std::error::Error>>
     let config = peer_discovery_config();
 
     // Node A (bootstrap node)
-    let node_a =
-        create_tls_node(config.clone()).await?;
+    let node_a = create_tls_node(config.clone()).await?;
     let addr_a = node_a.registry.bind_addr;
 
     // Node B - creates without seeds, then bootstraps
-    let node_b =
-        create_tls_node(config.clone()).await?;
+    let node_b = create_tls_node(config.clone()).await?;
     let addr_b = node_b.registry.bind_addr;
 
     // Node C - creates without seeds, then bootstraps
-    let node_c =
-        create_tls_node(config.clone()).await?;
+    let node_c = create_tls_node(config.clone()).await?;
     let addr_c = node_c.registry.bind_addr;
 
     // Add peers manually to track them
@@ -99,6 +98,11 @@ async fn test_mesh_formation_3_nodes() -> Result<(), Box<dyn std::error::Error>>
         stats_c.active_peers
     );
 
+    assert!(
+        stats_a.mesh_formation_time_ms.is_some(),
+        "Node A should record mesh formation timing"
+    );
+
     // Clean shutdown
     node_a.shutdown().await;
     node_b.shutdown().await;
@@ -114,13 +118,11 @@ async fn test_local_connection_wins() -> Result<(), Box<dyn std::error::Error>> 
     let config = peer_discovery_config();
 
     // Node A
-    let node_a =
-        create_tls_node(config.clone()).await?;
+    let node_a = create_tls_node(config.clone()).await?;
     let addr_a = node_a.registry.bind_addr;
 
     // Node B
-    let node_b =
-        create_tls_node(config.clone()).await?;
+    let node_b = create_tls_node(config.clone()).await?;
     let addr_b = node_b.registry.bind_addr;
 
     // Add peers and bootstrap
@@ -158,18 +160,18 @@ async fn test_local_connection_wins() -> Result<(), Box<dyn std::error::Error>> 
 /// V2 binary with enable_peer_discovery = false should behave like V1
 #[tokio::test]
 async fn test_feature_flag_disabled_legacy_behavior() -> Result<(), Box<dyn std::error::Error>> {
-    let mut config = GossipConfig::default();
-    config.enable_peer_discovery = false; // Disabled
-    config.gossip_interval = Duration::from_millis(200);
+    let config = GossipConfig {
+        enable_peer_discovery: false, // Disabled
+        gossip_interval: Duration::from_millis(200),
+        ..Default::default()
+    };
 
     // Node A
-    let node_a =
-        create_tls_node(config.clone()).await?;
+    let node_a = create_tls_node(config.clone()).await?;
     let addr_a = node_a.registry.bind_addr;
 
     // Node B connects to A
-    let node_b =
-        create_tls_node(config.clone()).await?;
+    let node_b = create_tls_node(config.clone()).await?;
     let addr_b = node_b.registry.bind_addr;
 
     // Add peers and bootstrap
@@ -210,8 +212,7 @@ async fn test_stale_peer_eviction_ttl() -> Result<(), Box<dyn std::error::Error>
     config.cleanup_interval = Duration::from_millis(200);
 
     // Node A
-    let node_a =
-        create_tls_node(config.clone()).await?;
+    let node_a = create_tls_node(config.clone()).await?;
 
     // Manually add a peer that will become stale (simulating discovery)
     let fake_peer_addr: SocketAddr = "127.0.0.1:59999".parse()?;
@@ -233,6 +234,47 @@ async fn test_stale_peer_eviction_ttl() -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
+/// Scenario 5b: Peer list TTL cleanup removes stale known peers
+#[tokio::test]
+async fn test_peer_list_ttl_cleanup() -> Result<(), Box<dyn std::error::Error>> {
+    let mut config = peer_discovery_config();
+    config.fail_ttl = Duration::from_secs(1);
+    config.stale_ttl = Duration::from_secs(1);
+
+    let node = create_tls_node(config.clone()).await?;
+    let now = kameo_remote::current_timestamp();
+
+    let stale_peer = kameo_remote::registry::PeerInfoGossip {
+        address: "127.0.0.1:6100".to_string(),
+        peer_address: None,
+        node_id: None,
+        failures: 0,
+        last_attempt: now.saturating_sub(5),
+        last_success: now.saturating_sub(5),
+    };
+
+    node.registry
+        .on_peer_list_gossip(vec![stale_peer], "127.0.0.1:5000", now)
+        .await;
+
+    let stats_before = node.stats().await;
+    assert_eq!(
+        stats_before.discovered_peers, 1,
+        "stale peer should be tracked initially"
+    );
+
+    sleep(Duration::from_secs(2)).await;
+    node.registry.prune_stale_peers().await;
+    let stats_after = node.stats().await;
+    assert_eq!(
+        stats_after.discovered_peers, 0,
+        "stale peer should be pruned after TTL"
+    );
+
+    node.shutdown().await;
+    Ok(())
+}
+
 /// Scenario 5: Connect-on-demand exceeds soft cap
 /// max_peers = 3, but actor messaging to 4th node should work
 #[tokio::test]
@@ -241,8 +283,7 @@ async fn test_connect_on_demand_soft_cap() -> Result<(), Box<dyn std::error::Err
     config.max_peers = 2; // Very low soft cap
 
     // Node A (hub)
-    let node_a =
-        create_tls_node(config.clone()).await?;
+    let node_a = create_tls_node(config.clone()).await?;
     let addr_a = node_a.registry.bind_addr;
 
     // Nodes B, C, D all connect to A
@@ -250,8 +291,7 @@ async fn test_connect_on_demand_soft_cap() -> Result<(), Box<dyn std::error::Err
     let mut node_addrs: Vec<SocketAddr> = Vec::new();
 
     for _ in 0..3 {
-        let node =
-            create_tls_node(config.clone()).await?;
+        let node = create_tls_node(config.clone()).await?;
         let addr = node.registry.bind_addr;
 
         // Add peer tracking both ways
@@ -292,13 +332,11 @@ async fn test_known_peers_no_amnesia() -> Result<(), Box<dyn std::error::Error>>
     let config = peer_discovery_config();
 
     // Node A
-    let node_a =
-        create_tls_node(config.clone()).await?;
+    let node_a = create_tls_node(config.clone()).await?;
     let addr_a = node_a.registry.bind_addr;
 
     // Node B connects to A
-    let node_b =
-        create_tls_node(config.clone()).await?;
+    let node_b = create_tls_node(config.clone()).await?;
     let addr_b = node_b.registry.bind_addr;
 
     // Add peers and bootstrap
@@ -333,12 +371,34 @@ async fn test_known_peers_no_amnesia() -> Result<(), Box<dyn std::error::Error>>
 /// Malicious peer sending large peer list should be rejected
 #[tokio::test]
 async fn test_resource_exhaustion_protection() -> Result<(), Box<dyn std::error::Error>> {
-    // Test that MAX_PEER_LIST_SIZE (1000) is enforced
-    // This is tested at the unit level in on_peer_list_gossip
-    // Here we verify the constant is accessible
+    let config = peer_discovery_config();
+    let node = create_tls_node(config.clone()).await?;
 
-    // The protection is implemented in on_peer_list_gossip:
-    // if peers.len() > Self::MAX_PEER_LIST_SIZE { return vec![]; }
+    let now = kameo_remote::current_timestamp();
+    let mut peers =
+        Vec::with_capacity(kameo_remote::registry::GossipRegistry::MAX_PEER_LIST_SIZE + 1);
+    for i in 0..=kameo_remote::registry::GossipRegistry::MAX_PEER_LIST_SIZE {
+        peers.push(PeerInfoGossip {
+            address: format!("127.0.0.1:{}", 10_000 + i as u16),
+            peer_address: None,
+            node_id: None,
+            failures: 0,
+            last_attempt: now,
+            last_success: now,
+        });
+    }
+
+    let candidates = node
+        .registry
+        .on_peer_list_gossip(peers, "127.0.0.1:5000", now)
+        .await;
+
+    assert!(
+        candidates.is_empty(),
+        "oversized peer list should be rejected"
+    );
+
+    node.shutdown().await;
 
     Ok(())
 }
@@ -350,13 +410,11 @@ async fn test_peer_discovery_metrics() -> Result<(), Box<dyn std::error::Error>>
     let config = peer_discovery_config();
 
     // Node A
-    let node_a =
-        create_tls_node(config.clone()).await?;
+    let node_a = create_tls_node(config.clone()).await?;
     let addr_a = node_a.registry.bind_addr;
 
     // Node B connects to A
-    let node_b =
-        create_tls_node(config.clone()).await?;
+    let node_b = create_tls_node(config.clone()).await?;
     let addr_b = node_b.registry.bind_addr;
 
     // Add peers and bootstrap
@@ -395,17 +453,14 @@ async fn test_failure_recovery_backoff() -> Result<(), Box<dyn std::error::Error
     config.max_peer_failures = 3; // Lower threshold for faster test
 
     // Create hub node A
-    let node_a =
-        create_tls_node(config.clone()).await?;
+    let node_a = create_tls_node(config.clone()).await?;
     let addr_a = node_a.registry.bind_addr;
 
     // Create nodes B, C that connect to A
-    let node_b =
-        create_tls_node(config.clone()).await?;
+    let node_b = create_tls_node(config.clone()).await?;
     let addr_b = node_b.registry.bind_addr;
 
-    let node_c =
-        create_tls_node(config.clone()).await?;
+    let node_c = create_tls_node(config.clone()).await?;
     let addr_c = node_c.registry.bind_addr;
 
     // Setup mesh
@@ -423,6 +478,10 @@ async fn test_failure_recovery_backoff() -> Result<(), Box<dyn std::error::Error
     // Verify mesh formed
     let stats_a = node_a.stats().await;
     assert!(stats_a.active_peers >= 2, "A should have 2+ peers");
+    assert!(
+        stats_a.mesh_formation_time_ms.is_some(),
+        "mesh formation timing should be recorded"
+    );
 
     // Kill node C (simulating failure)
     node_c.shutdown().await;
@@ -433,6 +492,10 @@ async fn test_failure_recovery_backoff() -> Result<(), Box<dyn std::error::Error
     // A and B should still be connected
     let stats_a_after = node_a.stats().await;
     assert!(stats_a_after.active_peers >= 1, "A should still have B");
+    assert_eq!(
+        stats_a_after.mesh_formation_time_ms, stats_a.mesh_formation_time_ms,
+        "mesh formation timing should remain stable"
+    );
 
     // Cleanup
     node_a.shutdown().await;
@@ -448,13 +511,11 @@ async fn test_simultaneous_dial_tiebreaker() -> Result<(), Box<dyn std::error::E
     let config = peer_discovery_config();
 
     // Node A
-    let node_a =
-        create_tls_node(config.clone()).await?;
+    let node_a = create_tls_node(config.clone()).await?;
     let addr_a = node_a.registry.bind_addr;
 
     // Node B
-    let node_b =
-        create_tls_node(config.clone()).await?;
+    let node_b = create_tls_node(config.clone()).await?;
     let addr_b = node_b.registry.bind_addr;
 
     // Both nodes configured to connect to each other (mutual dial)
@@ -495,16 +556,14 @@ async fn test_advertised_address_routing() -> Result<(), Box<dyn std::error::Err
     let mut config = peer_discovery_config();
 
     // Node A binds to any address
-    let node_a =
-        create_tls_node(config.clone()).await?;
+    let node_a = create_tls_node(config.clone()).await?;
     let addr_a = node_a.registry.bind_addr;
 
     // Set advertise_address to the actual bound address
     config.advertise_address = Some(addr_a);
 
     // Node B should be able to connect using advertised address
-    let node_b =
-        create_tls_node(config.clone()).await?;
+    let node_b = create_tls_node(config.clone()).await?;
 
     // Add peer and bootstrap
     node_b.registry.add_peer(addr_a).await;
@@ -536,18 +595,36 @@ async fn test_ssrf_bogon_filtering() -> Result<(), Box<dyn std::error::Error>> {
     config.allow_link_local_discovery = false;
 
     // Node A with bogon filtering enabled
-    let node_a =
-        create_tls_node(config.clone()).await?;
+    let node_a = create_tls_node(config.clone()).await?;
 
-    // Try to add a loopback peer (should be filtered in discovery)
-    let loopback_addr: SocketAddr = "127.0.0.1:22".parse()?;
-    node_a.registry.add_peer(loopback_addr).await;
+    let peers = vec![
+        PeerInfoGossip {
+            address: "127.0.0.1:22".to_string(),
+            peer_address: None,
+            node_id: None,
+            failures: 0,
+            last_attempt: 0,
+            last_success: 0,
+        },
+        PeerInfoGossip {
+            address: "[fe80::1]:9000".to_string(),
+            peer_address: None,
+            node_id: None,
+            failures: 0,
+            last_attempt: 0,
+            last_success: 0,
+        },
+    ];
 
-    // Wait for any potential connection attempt
-    sleep(Duration::from_millis(500)).await;
+    let candidates = node_a
+        .registry
+        .on_peer_list_gossip(peers, "127.0.0.1:5000", kameo_remote::current_timestamp())
+        .await;
 
-    // The peer tracking may add it, but discovery filtering prevents dial
-    // The key is that the peer discovery manager filters it in on_peer_list_gossip
+    assert!(
+        candidates.is_empty(),
+        "bogon addresses should be filtered out"
+    );
 
     // Cleanup
     node_a.shutdown().await;
@@ -555,26 +632,64 @@ async fn test_ssrf_bogon_filtering() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Scenario 13: Version negotiation with legacy node
+/// Scenario 13: V2 capability negotiation
+#[tokio::test]
+async fn test_version_negotiation_v2_capabilities() -> Result<(), Box<dyn std::error::Error>> {
+    let config = peer_discovery_config();
+
+    let node_a = create_tls_node(config.clone()).await?;
+    let addr_a = node_a.registry.bind_addr;
+
+    let node_b = create_tls_node(config.clone()).await?;
+    let addr_b = node_b.registry.bind_addr;
+
+    node_a.registry.add_peer(addr_b).await;
+    node_b.registry.add_peer(addr_a).await;
+    node_b.bootstrap_non_blocking(vec![addr_a]).await;
+
+    sleep(Duration::from_secs(1)).await;
+
+    assert!(
+        node_a.registry.peer_supports_peer_list(&addr_b).await,
+        "Node A should negotiate peer discovery with node B"
+    );
+
+    assert!(
+        node_b.registry.peer_supports_peer_list(&addr_a).await,
+        "Node B should negotiate peer discovery with node A"
+    );
+
+    node_a.shutdown().await;
+    node_b.shutdown().await;
+
+    Ok(())
+}
+
+/// Scenario 14: Version negotiation with legacy node
 /// A (v2) connects to B (v1) - should not send PeerListGossip
 #[tokio::test]
 async fn test_version_negotiation_legacy() -> Result<(), Box<dyn std::error::Error>> {
     init_crypto();
     // Node A with peer discovery enabled (v2)
-    let mut config_v2 = peer_discovery_config();
-    config_v2.enable_peer_discovery = true;
+    let config_v2 = peer_discovery_config();
 
     // Node B with peer discovery disabled (simulates v1/legacy)
-    let mut config_v1 = GossipConfig::default();
-    config_v1.enable_peer_discovery = false;
-    config_v1.gossip_interval = Duration::from_millis(200);
+    let config_v1 = GossipConfig {
+        enable_peer_discovery: false,
+        gossip_interval: Duration::from_millis(200),
+        ..Default::default()
+    };
 
     let secret_a = SecretKey::generate();
-    let node_a = GossipRegistryHandle::new_with_tls("127.0.0.1:0".parse()?, secret_a, Some(config_v2)).await?;
+    let node_a =
+        GossipRegistryHandle::new_with_tls("127.0.0.1:0".parse()?, secret_a, Some(config_v2))
+            .await?;
     let addr_a = node_a.registry.bind_addr;
 
     let secret_b = SecretKey::generate();
-    let node_b = GossipRegistryHandle::new_with_tls("127.0.0.1:0".parse()?, secret_b, Some(config_v1)).await?;
+    let node_b =
+        GossipRegistryHandle::new_with_tls("127.0.0.1:0".parse()?, secret_b, Some(config_v1))
+            .await?;
     let addr_b = node_b.registry.bind_addr;
 
     // Connect them
@@ -592,6 +707,16 @@ async fn test_version_negotiation_legacy() -> Result<(), Box<dyn std::error::Err
         "Legacy node B should not discover peers via gossip"
     );
 
+    assert!(
+        !node_a.registry.peer_supports_peer_list(&addr_b).await,
+        "Node A should not negotiate peer discovery with legacy node B"
+    );
+
+    assert!(
+        !node_b.registry.peer_supports_peer_list(&addr_a).await,
+        "Legacy node should not advertise peer discovery capability"
+    );
+
     // Cleanup
     node_a.shutdown().await;
     node_b.shutdown().await;
@@ -599,27 +724,23 @@ async fn test_version_negotiation_legacy() -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
-/// Scenario 14: Partition and heal behavior
+/// Scenario 15: Partition and heal behavior
 /// Create partition between node groups, then heal and verify mesh reforms
 #[tokio::test]
 async fn test_partition_heal_behavior() -> Result<(), Box<dyn std::error::Error>> {
     let config = peer_discovery_config();
 
     // Create 4 nodes
-    let node_a =
-        create_tls_node(config.clone()).await?;
+    let node_a = create_tls_node(config.clone()).await?;
     let addr_a = node_a.registry.bind_addr;
 
-    let node_b =
-        create_tls_node(config.clone()).await?;
+    let node_b = create_tls_node(config.clone()).await?;
     let addr_b = node_b.registry.bind_addr;
 
-    let node_c =
-        create_tls_node(config.clone()).await?;
+    let node_c = create_tls_node(config.clone()).await?;
     let addr_c = node_c.registry.bind_addr;
 
-    let node_d =
-        create_tls_node(config.clone()).await?;
+    let node_d = create_tls_node(config.clone()).await?;
     let addr_d = node_d.registry.bind_addr;
 
     // Create initial mesh: A-B and C-D (two partitions)
@@ -648,6 +769,10 @@ async fn test_partition_heal_behavior() -> Result<(), Box<dyn std::error::Error>
         stats_b.active_peers >= 2,
         "B should have connections to both partitions after heal"
     );
+    assert!(
+        stats_b.mesh_formation_time_ms.is_some(),
+        "mesh formation timing should be recorded after heal"
+    );
 
     // Cleanup
     node_a.shutdown().await;
@@ -658,19 +783,17 @@ async fn test_partition_heal_behavior() -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
-/// Scenario 15: Identity verification via TLS
+/// Scenario 16: Identity verification via TLS
 /// Verify that NodeId is determined by TLS handshake, not gossip
 #[tokio::test]
 async fn test_identity_tls_verification() -> Result<(), Box<dyn std::error::Error>> {
     let config = peer_discovery_config();
 
     // Create two nodes
-    let node_a =
-        create_tls_node(config.clone()).await?;
+    let node_a = create_tls_node(config.clone()).await?;
     let addr_a = node_a.registry.bind_addr;
 
-    let node_b =
-        create_tls_node(config.clone()).await?;
+    let node_b = create_tls_node(config.clone()).await?;
     let addr_b = node_b.registry.bind_addr;
 
     // Connect nodes
@@ -705,8 +828,7 @@ async fn test_known_peers_lru_capacity() -> Result<(), Box<dyn std::error::Error
     let mut config = peer_discovery_config();
     config.known_peers_capacity = 5; // Very small for testing
 
-    let node_a =
-        create_tls_node(config.clone()).await?;
+    let node_a = create_tls_node(config.clone()).await?;
 
     // Add more peers than capacity
     for i in 0..10 {

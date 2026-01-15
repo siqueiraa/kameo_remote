@@ -24,13 +24,7 @@ async fn handle_echo_client(mut stream: TcpStream, peer: SocketAddr) {
     info!("Echo server: new client from {}", peer);
     let mut buffer = vec![0u8; 4096];
 
-    loop {
-        // Read length prefix
-        match stream.read_exact(&mut buffer[..4]).await {
-            Ok(_) => {}
-            Err(_) => break,
-        }
-
+    while (stream.read_exact(&mut buffer[..4]).await).is_ok() {
         let msg_len = u32::from_be_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]) as usize;
         if msg_len > buffer.len() {
             buffer.resize(msg_len, 0);
@@ -205,8 +199,7 @@ async fn test_batch_ask_simple() -> Result<()> {
                     match receiver.await {
                         Ok(response) => responses.push(response),
                         Err(_) => {
-                            return Err(kameo_remote::GossipError::Network(std::io::Error::new(
-                                std::io::ErrorKind::Other,
+                            return Err(kameo_remote::GossipError::Network(std::io::Error::other(
                                 "Failed to receive response",
                             )))
                         }

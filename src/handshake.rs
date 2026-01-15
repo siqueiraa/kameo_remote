@@ -3,8 +3,15 @@
 //! This module implements the Hello handshake that establishes peer capabilities
 //! at connection time. This enables gradual feature rollout and backward compatibility.
 
+use crate::{tls, GossipError, Result};
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
-use std::collections::HashSet;
+use std::{collections::HashSet, io};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::time::{timeout, Duration};
+use tracing::debug;
+
+const HELLO_MAX_SIZE: usize = 1024;
+const HELLO_TIMEOUT_MS: u64 = 3_000;
 
 /// Protocol version constants
 pub const PROTOCOL_VERSION_V1: u16 = 1;
@@ -105,6 +112,101 @@ impl PeerCapabilities {
     pub fn supports_feature(&self, feature: Feature) -> bool {
         self.features.contains(&feature)
     }
+}
+
+async fn read_exact_with_timeout<R>(reader: &mut R, buf: &mut [u8]) -> Result<()>
+where
+    R: AsyncRead + Unpin + Send,
+{
+    let mut offset = 0;
+    while offset < buf.len() {
+        let slice = &mut buf[offset..];
+        let read_future = async { reader.read(slice).await };
+        let bytes_read = match timeout(Duration::from_millis(HELLO_TIMEOUT_MS), read_future).await {
+            Ok(Ok(0)) => {
+                return Err(GossipError::Network(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "unexpected EOF during Hello handshake",
+                )))
+            }
+            Ok(Ok(n)) => n,
+            Ok(Err(err)) => return Err(GossipError::Network(err)),
+            Err(_) => return Err(GossipError::Timeout),
+        };
+        offset += bytes_read;
+    }
+    Ok(())
+}
+
+async fn send_hello_message<W>(stream: &mut W, hello: &Hello) -> Result<()>
+where
+    W: AsyncWrite + Unpin + Send,
+{
+    let serialized = rkyv::to_bytes::<rkyv::rancor::Error>(hello)?;
+    let len = serialized.len() as u32;
+    stream.write_all(&len.to_be_bytes()).await?;
+    stream.write_all(&serialized).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+async fn read_hello_message<R>(reader: &mut R) -> Result<Hello>
+where
+    R: AsyncRead + Unpin + Send,
+{
+    let mut len_buf = [0u8; 4];
+    read_exact_with_timeout(reader, &mut len_buf).await?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+
+    if len == 0 || len > HELLO_MAX_SIZE {
+        return Err(GossipError::TlsHandshakeFailed(format!(
+            "invalid Hello size: {} bytes",
+            len
+        )));
+    }
+
+    let mut buf = vec![0u8; len];
+    read_exact_with_timeout(reader, &mut buf).await?;
+    let hello: Hello = rkyv::from_bytes::<Hello, rkyv::rancor::Error>(&buf)?;
+    Ok(hello)
+}
+
+/// Perform Hello handshake if both peers negotiated discovery via ALPN
+pub async fn perform_hello_handshake<S>(
+    stream: &mut S,
+    negotiated_alpn: Option<&[u8]>,
+    enable_peer_discovery: bool,
+) -> Result<PeerCapabilities>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    if !enable_peer_discovery {
+        return Ok(PeerCapabilities::legacy());
+    }
+
+    let Some(alpn) = negotiated_alpn else {
+        debug!("no ALPN negotiated, skipping Hello handshake");
+        return Ok(PeerCapabilities::legacy());
+    };
+
+    if alpn != tls::ALPN_KAMEO_V2 {
+        debug!(
+            protocol = %String::from_utf8_lossy(alpn),
+            "peer negotiated legacy ALPN, skipping Hello handshake"
+        );
+        return Ok(PeerCapabilities::legacy());
+    }
+
+    let local_hello = Hello::new();
+    send_hello_message(stream, &local_hello).await?;
+    let remote_hello = read_hello_message(stream).await?;
+    let caps = PeerCapabilities::from_hello_exchange(&local_hello, &remote_hello);
+    debug!(
+        negotiated_version = caps.version,
+        peer_list = caps.can_send_peer_list(),
+        "Hello handshake negotiated capabilities"
+    );
+    Ok(caps)
 }
 
 #[cfg(test)]

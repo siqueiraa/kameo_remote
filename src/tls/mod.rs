@@ -152,25 +152,20 @@ impl ServerCertVerifier for NodeIdServerVerifier {
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> std::result::Result<ServerCertVerified, Error> {
-        // Extract NodeId from DNS name
-        let expected_node_id = match server_name {
-            ServerName::DnsName(dns_name) => {
-                let name_str = dns_name.as_ref();
-                name::decode(name_str)
-                    .ok_or_else(|| Error::General("Invalid DNS name format for NodeId".into()))?
-            }
-            _ => return Err(Error::General("Expected DNS name for NodeId".into())),
-        };
-
-        // Extract public key from certificate and verify it matches
+        // Extract public key from certificate
         let actual_node_id = extract_node_id_from_cert(end_entity)?;
 
-        if actual_node_id != expected_node_id {
-            return Err(Error::General(format!(
-                "NodeId mismatch: expected {}, got {}",
-                expected_node_id.fmt_short(),
-                actual_node_id.fmt_short()
-            )));
+        // If the SNI encodes a NodeId, ensure it matches. Otherwise (IP/other), skip strict check.
+        if let ServerName::DnsName(dns_name) = server_name {
+            if let Some(expected_node_id) = name::decode(dns_name.as_ref()) {
+                if actual_node_id != expected_node_id {
+                    return Err(Error::General(format!(
+                        "NodeId mismatch: expected {}, got {}",
+                        expected_node_id.fmt_short(),
+                        actual_node_id.fmt_short()
+                    )));
+                }
+            }
         }
 
         Ok(ServerCertVerified::assertion())
@@ -278,7 +273,7 @@ impl ClientCertVerifier for NodeIdClientVerifier {
 
 /// Extract NodeId from a certificate by parsing the Ed25519 public key
 /// This is a custom parser for our minimal self-signed certificates
-fn extract_node_id_from_cert(cert: &CertificateDer<'_>) -> std::result::Result<NodeId, Error> {
+pub fn extract_node_id_from_cert(cert: &CertificateDer<'_>) -> std::result::Result<NodeId, Error> {
     let cert_bytes = cert.as_ref();
 
     // The certificate structure we generate has the Ed25519 public key
@@ -368,5 +363,30 @@ mod tests {
         // Verify we can create connector and acceptor
         let _connector = config.connector();
         let _acceptor = config.acceptor();
+    }
+
+    #[test]
+    fn test_alpn_selection_based_on_feature_flag() {
+        ensure_crypto_provider();
+        let secret = SecretKey::generate();
+        let enabled = TlsConfig::with_peer_discovery(secret.clone(), true).unwrap();
+        assert_eq!(
+            enabled.client_config.alpn_protocols,
+            vec![ALPN_KAMEO_V2.to_vec(), ALPN_KAMEO_V1.to_vec()]
+        );
+        assert_eq!(
+            enabled.server_config.alpn_protocols,
+            vec![ALPN_KAMEO_V2.to_vec(), ALPN_KAMEO_V1.to_vec()]
+        );
+
+        let disabled = TlsConfig::with_peer_discovery(secret, false).unwrap();
+        assert_eq!(
+            disabled.client_config.alpn_protocols,
+            vec![ALPN_KAMEO_V1.to_vec()]
+        );
+        assert_eq!(
+            disabled.server_config.alpn_protocols,
+            vec![ALPN_KAMEO_V1.to_vec()]
+        );
     }
 }

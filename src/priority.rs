@@ -151,14 +151,14 @@ mod tests {
     #[test]
     fn test_registration_priority_clone() {
         let priority = RegistrationPriority::Immediate;
-        let cloned = priority.clone();
+        let cloned = priority;
         assert_eq!(priority, cloned);
     }
 
     #[test]
     fn test_consistency_level_clone() {
         let level = ConsistencyLevel::Strong;
-        let cloned = level.clone();
+        let cloned = level;
         assert_eq!(level, cloned);
     }
 }

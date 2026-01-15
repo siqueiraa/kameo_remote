@@ -1,4 +1,4 @@
-use kameo_remote::{ClockOrdering, NodeId, SecretKey, VectorClock};
+use kameo_remote::{ClockOrdering, SecretKey, VectorClock};
 use std::collections::HashSet;
 
 #[test]
@@ -9,8 +9,8 @@ fn test_vector_clock_basic_operations() {
     let node1 = key1.public();
     let node2 = key2.public();
 
-    let mut clock1 = VectorClock::new();
-    let mut clock2 = VectorClock::new();
+    let clock1 = VectorClock::new();
+    let clock2 = VectorClock::new();
 
     // Initial state: both empty clocks are equal
     assert_eq!(clock1.compare(&clock2), ClockOrdering::Equal);
@@ -39,16 +39,16 @@ fn test_vector_clock_merge() {
     let node2 = key2.public();
     let node3 = key3.public();
 
-    let mut clock1 = VectorClock::new();
+    let clock1 = VectorClock::new();
     clock1.increment(node1);
     clock1.increment(node1); // node1: 2
 
-    let mut clock2 = VectorClock::new();
+    let clock2 = VectorClock::new();
     clock2.increment(node2);
     clock2.increment(node2);
     clock2.increment(node2); // node2: 3
 
-    let mut clock3 = VectorClock::new();
+    let clock3 = VectorClock::new();
     clock3.increment(node3); // node3: 1
 
     // Merge all clocks
@@ -68,11 +68,11 @@ fn test_vector_clock_comparison() {
     let node1 = key1.public();
     let node2 = key2.public();
 
-    let mut clock1 = VectorClock::new();
+    let clock1 = VectorClock::new();
     clock1.increment(node1);
     clock1.increment(node2); // node1: 1, node2: 1
 
-    let mut clock2 = VectorClock::new();
+    let clock2 = VectorClock::new();
     clock2.increment(node1); // node1: 1, node2: 0
 
     // clock2 is before clock1 (clock1 has everything clock2 has and more)
@@ -88,10 +88,10 @@ fn test_vector_clock_comparison() {
     assert_eq!(clock2.compare(&clock1), ClockOrdering::After);
 
     // Create a concurrent scenario
-    let mut clock4 = VectorClock::new();
+    let clock4 = VectorClock::new();
     clock4.increment(node1);
     clock4.increment(node1); // node1: 2, node2: 0
-    let mut clock5 = VectorClock::new();
+    let clock5 = VectorClock::new();
     clock5.increment(node2);
     clock5.increment(node2); // node1: 0, node2: 2
 
@@ -112,7 +112,7 @@ fn test_vector_clock_gc() {
     let node2 = key2.public();
     let node3 = key3.public();
 
-    let mut clock = VectorClock::new();
+    let clock = VectorClock::new();
     clock.increment(node1);
     clock.increment(node2);
     clock.increment(node3);
@@ -139,7 +139,7 @@ fn test_vector_clock_empty_check() {
     let key1 = SecretKey::from_bytes(&[1u8; 32]).unwrap();
     let node1 = key1.public();
 
-    let mut clock = VectorClock::new();
+    let clock = VectorClock::new();
     assert!(clock.is_effectively_empty());
 
     // The new empty clock is effectively empty
@@ -153,7 +153,7 @@ fn test_vector_clock_empty_check() {
 #[test]
 fn test_vector_clock_large_scale_no_truncation() {
     // Test that vector clocks can grow large without truncation
-    let mut clock = VectorClock::new();
+    let clock = VectorClock::new();
 
     // Add 1500 different nodes (past the old truncation limit)
     for i in 0..1500 {
@@ -192,10 +192,10 @@ fn test_vector_clock_concurrent_add_remove_consistency() {
     let node2 = key2.public();
 
     // Create concurrent vector clocks
-    let mut clock1 = VectorClock::new();
+    let clock1 = VectorClock::new();
     clock1.increment(node1); // node1: 1
 
-    let mut clock2 = VectorClock::new();
+    let clock2 = VectorClock::new();
     clock2.increment(node2); // node2: 1
 
     // These clocks are concurrent
@@ -205,8 +205,8 @@ fn test_vector_clock_concurrent_add_remove_consistency() {
     // This ensures all nodes make the same decision
 
     // Simulate a scenario where both nodes make concurrent updates
-    let mut clock1_copy = clock1.clone();
-    let mut clock2_copy = clock2.clone();
+    let clock1_copy = clock1.clone();
+    let clock2_copy = clock2.clone();
 
     // Node1 advances
     clock1_copy.increment(node1); // node1: 2
@@ -229,13 +229,13 @@ fn test_vector_clock_merge_preserves_causality() {
     let node3 = key3.public();
 
     // Create a causal chain: clock1 -> clock2 -> clock3
-    let mut clock1 = VectorClock::new();
+    let clock1 = VectorClock::new();
     clock1.increment(node1); // node1: 1
 
-    let mut clock2 = clock1.clone();
+    let clock2 = clock1.clone();
     clock2.increment(node2); // node1: 1, node2: 1
 
-    let mut clock3 = clock2.clone();
+    let clock3 = clock2.clone();
     clock3.increment(node3); // node1: 1, node2: 1, node3: 1
 
     // Verify causal relationships
@@ -244,7 +244,7 @@ fn test_vector_clock_merge_preserves_causality() {
     assert_eq!(clock1.compare(&clock3), ClockOrdering::Before);
 
     // Create a concurrent branch
-    let mut clock4 = clock1.clone();
+    let clock4 = clock1.clone();
     clock4.increment(node3); // node1: 1, node3: 1
 
     // clock4 is concurrent with clock2 (clock2 has node2:1, clock4 has node3:1)
@@ -253,7 +253,7 @@ fn test_vector_clock_merge_preserves_causality() {
     assert_eq!(clock4.compare(&clock3), ClockOrdering::Before);
 
     // Merge concurrent clocks
-    let mut merged = clock3.clone();
+    let merged = clock3.clone();
     merged.merge(&clock4);
 
     // After merging clock4 into clock3, merged should equal clock3
@@ -279,7 +279,7 @@ fn test_vector_clock_gc_preserves_active_nodes() {
     let node3 = key3.public();
     let node4 = key4.public();
 
-    let mut clock = VectorClock::new();
+    let clock = VectorClock::new();
     clock.increment(node1);
     clock.increment(node2);
     clock.increment(node3);
@@ -313,10 +313,10 @@ fn test_vector_clock_deterministic_ordering() {
     let node2 = key2.public();
 
     // Create two concurrent clocks
-    let mut clock1 = VectorClock::new();
+    let clock1 = VectorClock::new();
     clock1.increment(node1);
 
-    let mut clock2 = VectorClock::new();
+    let clock2 = VectorClock::new();
     clock2.increment(node2);
 
     // They should be concurrent
@@ -339,11 +339,11 @@ fn test_vector_clock_merge_idempotent() {
     let node1 = key1.public();
     let node2 = key2.public();
 
-    let mut clock1 = VectorClock::new();
+    let clock1 = VectorClock::new();
     clock1.increment(node1);
     clock1.increment(node1); // node1: 2
 
-    let mut clock2 = VectorClock::new();
+    let clock2 = VectorClock::new();
     clock2.increment(node2);
     clock2.increment(node2);
     clock2.increment(node2); // node2: 3
@@ -368,8 +368,8 @@ async fn test_vector_clock_in_actor_location() {
     let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
     let peer_id = kameo_remote::PeerId::new("test_peer");
 
-    let mut location1 = RemoteActorLocation::new_with_peer(addr, peer_id.clone());
-    let mut location2 = RemoteActorLocation::new_with_peer(addr, peer_id.clone());
+    let location1 = RemoteActorLocation::new_with_peer(addr, peer_id.clone());
+    let location2 = RemoteActorLocation::new_with_peer(addr, peer_id.clone());
 
     // Increment vector clocks differently
     location1.vector_clock.increment(location1.node_id);
@@ -402,8 +402,8 @@ fn test_vector_clock_conflict_resolution() {
     let peer1 = PeerId::new("peer1");
     let peer2 = PeerId::new("peer2");
 
-    let mut location1 = RemoteActorLocation::new_with_peer(addr1, peer1);
-    let mut location2 = RemoteActorLocation::new_with_peer(addr2, peer2);
+    let location1 = RemoteActorLocation::new_with_peer(addr1, peer1);
+    let location2 = RemoteActorLocation::new_with_peer(addr2, peer2);
 
     // Simulate concurrent updates
     location1.vector_clock.increment(location1.node_id);
@@ -433,11 +433,11 @@ fn test_actor_removed_vector_clock_ordering() {
 
     // Scenario 1: Removal is outdated (Before)
     {
-        let mut current_clock = VectorClock::new();
+        let current_clock = VectorClock::new();
         current_clock.increment(node1);
         current_clock.increment(node1); // node1: 2
 
-        let mut removal_clock = VectorClock::new();
+        let removal_clock = VectorClock::new();
         removal_clock.increment(node1); // node1: 1
 
         // Removal is before current state - should NOT apply
@@ -446,10 +446,10 @@ fn test_actor_removed_vector_clock_ordering() {
 
     // Scenario 2: Removal is newer (After)
     {
-        let mut current_clock = VectorClock::new();
+        let current_clock = VectorClock::new();
         current_clock.increment(node1); // node1: 1
 
-        let mut removal_clock = VectorClock::new();
+        let removal_clock = VectorClock::new();
         removal_clock.increment(node1);
         removal_clock.increment(node1); // node1: 2
 
@@ -459,10 +459,10 @@ fn test_actor_removed_vector_clock_ordering() {
 
     // Scenario 3: Removal is concurrent
     {
-        let mut current_clock = VectorClock::new();
+        let current_clock = VectorClock::new();
         current_clock.increment(node1); // node1: 1, node2: 0
 
-        let mut removal_clock = VectorClock::new();
+        let removal_clock = VectorClock::new();
         removal_clock.increment(node2); // node1: 0, node2: 1
 
         // Removal is concurrent - conservative approach, should apply
@@ -475,11 +475,11 @@ fn test_actor_removed_vector_clock_ordering() {
     // Scenario 4: Complex case - removal after re-add
     {
         // Actor was added by node1
-        let mut add_clock = VectorClock::new();
+        let add_clock = VectorClock::new();
         add_clock.increment(node1); // node1: 1
 
         // Actor was removed by node2 BEFORE seeing the add
-        let mut early_removal_clock = VectorClock::new();
+        let early_removal_clock = VectorClock::new();
         early_removal_clock.increment(node2); // node2: 1, doesn't know about node1
 
         // This removal is concurrent with the add - would apply conservatively
@@ -489,7 +489,7 @@ fn test_actor_removed_vector_clock_ordering() {
         );
 
         // Actor was removed by node2 AFTER seeing the add
-        let mut late_removal_clock = add_clock.clone();
+        let late_removal_clock = add_clock.clone();
         late_removal_clock.increment(node2); // node1: 1, node2: 1
 
         // This removal is after the add - should definitely apply

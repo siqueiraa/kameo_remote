@@ -2,7 +2,6 @@ use kameo_remote::{GossipConfig, GossipRegistryHandle, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
 use tracing::{error, info};
 
 const NUM_REQUESTS: usize = 1000;
@@ -30,7 +29,6 @@ async fn test_batch_ask_performance() -> Result<()> {
     info!("Client started on {}", actual_client_addr);
 
     // Set up echo server that responds with i+1
-    let server_registry_clone = server_registry.registry.clone();
     let echo_server_handle = tokio::spawn(async move {
         // Accept connections and handle ask requests
         loop {
@@ -66,8 +64,7 @@ async fn test_batch_ask_performance() -> Result<()> {
         let start = Instant::now();
         let mut responses = Vec::new();
 
-        for i in 0..NUM_REQUESTS {
-            let request = &all_requests[i];
+        for (i, request) in all_requests.iter().enumerate() {
             match connection.ask(request).await {
                 Ok(response) => responses.push(response),
                 Err(e) => error!("Ask {} failed: {}", i, e),

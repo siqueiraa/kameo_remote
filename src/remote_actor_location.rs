@@ -206,7 +206,7 @@ mod tests {
     #[test]
     fn test_actor_location_new() {
         let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-        let location = RemoteActorLocation::new(addr);
+        let location = RemoteActorLocation::new_with_peer(addr, crate::PeerId::new("test_peer"));
 
         assert_eq!(location.address, addr.to_string());
         assert_eq!(location.priority, RegistrationPriority::Normal);
@@ -334,7 +334,7 @@ mod tests {
     #[test]
     fn test_actor_location_debug() {
         let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-        let location = RemoteActorLocation::new(addr);
+        let location = RemoteActorLocation::new_with_peer(addr, crate::PeerId::new("test_peer"));
         let debug_str = format!("{:?}", location);
 
         assert!(debug_str.contains("RemoteActorLocation"));
