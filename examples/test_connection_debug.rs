@@ -1,4 +1,4 @@
-use kameo_remote::{GossipConfig, GossipRegistryHandle};
+use kameo_remote::{GossipConfig, GossipRegistryHandle, KeyPair};
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -14,11 +14,15 @@ async fn main() {
         ..Default::default()
     };
 
+    let key_pair_a = KeyPair::new_for_testing("node_a");
+    let key_pair_b = KeyPair::new_for_testing("node_b");
+    let peer_id_a = key_pair_a.peer_id();
+
     // Start Node A
     println!("Starting Node A on 127.0.0.1:8001...");
-    let handle_a = GossipRegistryHandle::new(
+    let handle_a = GossipRegistryHandle::new_with_keypair(
         "127.0.0.1:8001".parse().unwrap(),
-        vec![], // No peers initially
+        key_pair_a,
         Some(config.clone()),
     )
     .await
@@ -30,14 +34,20 @@ async fn main() {
 
     // Start Node B
     println!("Starting Node B on 127.0.0.1:8002...");
-    let handle_b = GossipRegistryHandle::new(
+    let handle_b = GossipRegistryHandle::new_with_keypair(
         "127.0.0.1:8002".parse().unwrap(),
-        vec!["127.0.0.1:8001".parse().unwrap()], // Connect to Node A
+        key_pair_b,
         Some(config),
     )
     .await
     .expect("Failed to create node B");
     println!("Node B started");
+
+    let peer_a = handle_b.add_peer(&peer_id_a).await;
+    peer_a
+        .connect(&"127.0.0.1:8001".parse().unwrap())
+        .await
+        .expect("Failed to connect node B to node A");
 
     // Monitor stats
     for i in 0..10 {

@@ -1,4 +1,4 @@
-use kameo_remote::{GossipRegistryHandle, RegistrationPriority, GossipConfig};
+use kameo_remote::{GossipConfig, GossipRegistryHandle, KeyPair, RegistrationPriority};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
@@ -6,12 +6,12 @@ use tokio::time::sleep;
 /// Helper function to create a test registry handle with custom config
 async fn create_test_registry(
     bind_addr: &str,
-    peers: Vec<std::net::SocketAddr>,
+    keypair: KeyPair,
     config: Option<GossipConfig>,
 ) -> Arc<GossipRegistryHandle> {
     let bind_addr = bind_addr.parse().unwrap();
     Arc::new(
-        GossipRegistryHandle::new(bind_addr, peers, config)
+        GossipRegistryHandle::new_with_keypair(bind_addr, keypair, config)
             .await
             .unwrap()
     )
@@ -30,7 +30,7 @@ async fn test_priority_registration_timing() {
     
     let registry = create_test_registry(
         "127.0.0.1:0",
-        vec![],
+        KeyPair::new_for_testing("priority_single"),
         Some(config),
     ).await;
     
@@ -100,9 +100,10 @@ async fn test_two_node_gossip_propagation() {
     // Create node1 first
     let node1 = create_test_registry(
         "127.0.0.1:0",
-        vec![],
+        KeyPair::new_for_testing("priority_node1"),
         Some(config.clone()),
     ).await;
+    let node1_id = node1.registry.peer_id;
     
     let node1_addr = node1.registry.bind_addr;
     println!("Node1 bound to: {}", node1_addr);
@@ -110,13 +111,16 @@ async fn test_two_node_gossip_propagation() {
     // Create node2 with node1 as peer
     let node2 = create_test_registry(
         "127.0.0.1:0",
-        vec![node1_addr], // Bootstrap with node1
+        KeyPair::new_for_testing("priority_node2"),
         Some(config),
     ).await;
     
     let node2_addr = node2.registry.bind_addr;
     println!("Node2 bound to: {}", node2_addr);
     
+    let peer1_from_2 = node2.add_peer(&node1_id).await;
+    peer1_from_2.connect(&node1_addr).await.unwrap();
+
     // Wait for bootstrap connection to establish
     sleep(Duration::from_millis(500)).await;
     

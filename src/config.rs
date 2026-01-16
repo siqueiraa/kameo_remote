@@ -15,6 +15,9 @@ pub const DEFAULT_CLEANUP_INTERVAL_SECS: u64 = 60;
 /// Default dead peer timeout in seconds (15 minutes)
 pub const DEFAULT_DEAD_PEER_TIMEOUT_SECS: u64 = 900;
 
+/// Default max concurrent ask inflight
+pub const DEFAULT_ASK_INFLIGHT_LIMIT: usize = 128;
+
 /// Default small cluster threshold - clusters with this many nodes or fewer use full sync
 /// Set to 0 to always use delta sync when possible
 pub const DEFAULT_SMALL_CLUSTER_THRESHOLD: usize = 5;
@@ -76,6 +79,8 @@ pub struct GossipConfig {
     pub max_immediate_retries: usize,
     /// Timeout for causal consistency operations
     pub causal_consistency_timeout: Duration,
+    /// Max in-flight ask permits per connection
+    pub ask_inflight_limit: usize,
     /// How long to keep disconnected peers before removing them (default: 15 minutes)
     pub dead_peer_timeout: Duration,
 
@@ -145,6 +150,7 @@ impl Default for GossipConfig {
             urgent_gossip_fanout: 5,
             max_immediate_retries: 3,
             causal_consistency_timeout: Duration::from_millis(500),
+            ask_inflight_limit: DEFAULT_ASK_INFLIGHT_LIMIT,
             dead_peer_timeout: Duration::from_secs(DEFAULT_DEAD_PEER_TIMEOUT_SECS),
             // Peer discovery defaults
             advertise_address: None,
@@ -210,6 +216,7 @@ mod tests {
             config.causal_consistency_timeout,
             Duration::from_millis(500)
         );
+        assert_eq!(config.ask_inflight_limit, DEFAULT_ASK_INFLIGHT_LIMIT);
         assert_eq!(config.dead_peer_timeout, Duration::from_secs(900));
         // Peer discovery defaults
         assert!(config.advertise_address.is_none());

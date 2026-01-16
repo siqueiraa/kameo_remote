@@ -1,4 +1,4 @@
-use kameo_remote::{ActorLocation, GossipConfig, GossipRegistryHandle, RegistrationPriority};
+use kameo_remote::{ActorLocation, GossipConfig, GossipRegistryHandle, KeyPair, RegistrationPriority};
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -11,14 +11,27 @@ async fn test_multi_node_gossip_propagation() -> Result<(), Box<dyn std::error::
     let node2_addr: SocketAddr = "127.0.0.1:0".parse()?;
     let node3_addr: SocketAddr = "127.0.0.1:0".parse()?;
 
+    let config = GossipConfig::default();
     // Start three nodes
-    let node1 = GossipRegistryHandle::new(node1_addr, vec![], None).await?;
+    let node1_keypair = KeyPair::new_for_testing("gossip_prop_node1");
+    let node1_id = node1_keypair.peer_id();
+    let node1 = GossipRegistryHandle::new_with_keypair(node1_addr, node1_keypair, Some(config.clone())).await?;
     let node1_actual = node1.registry.bind_addr;
 
-    let node2 = GossipRegistryHandle::new(node2_addr, vec![node1_actual], None).await?;
+    let node2_keypair = KeyPair::new_for_testing("gossip_prop_node2");
+    let node2_id = node2_keypair.peer_id();
+    let node2 = GossipRegistryHandle::new_with_keypair(node2_addr, node2_keypair, Some(config.clone())).await?;
     let node2_actual = node2.registry.bind_addr;
 
-    let node3 = GossipRegistryHandle::new(node3_addr, vec![node1_actual, node2_actual], None).await?;
+    let node3_keypair = KeyPair::new_for_testing("gossip_prop_node3");
+    let node3 = GossipRegistryHandle::new_with_keypair(node3_addr, node3_keypair, Some(config.clone())).await?;
+
+    let peer1_from_2 = node2.add_peer(&node1_id).await;
+    peer1_from_2.connect(&node1_actual).await?;
+    let peer1_from_3 = node3.add_peer(&node1_id).await;
+    peer1_from_3.connect(&node1_actual).await?;
+    let peer2_from_3 = node3.add_peer(&node2_id).await;
+    peer2_from_3.connect(&node2_actual).await?;
 
     // Wait for bootstrap
     sleep(Duration::from_millis(500)).await;
@@ -57,11 +70,18 @@ async fn test_actor_update_propagation() -> Result<(), Box<dyn std::error::Error
     let node1_addr: SocketAddr = "127.0.0.1:0".parse()?;
     let node2_addr: SocketAddr = "127.0.0.1:0".parse()?;
 
+    let config = GossipConfig::default();
     // Start two nodes
-    let node1 = GossipRegistryHandle::new(node1_addr, vec![], None).await?;
+    let node1_keypair = KeyPair::new_for_testing("gossip_prop_update_node1");
+    let node1_id = node1_keypair.peer_id();
+    let node1 = GossipRegistryHandle::new_with_keypair(node1_addr, node1_keypair, Some(config.clone())).await?;
     let node1_actual = node1.registry.bind_addr;
 
-    let node2 = GossipRegistryHandle::new(node2_addr, vec![node1_actual], None).await?;
+    let node2_keypair = KeyPair::new_for_testing("gossip_prop_update_node2");
+    let node2 = GossipRegistryHandle::new_with_keypair(node2_addr, node2_keypair, Some(config.clone())).await?;
+
+    let peer1_from_2 = node2.add_peer(&node1_id).await;
+    peer1_from_2.connect(&node1_actual).await?;
 
     // Wait for bootstrap
     sleep(Duration::from_millis(500)).await;
@@ -98,11 +118,18 @@ async fn test_actor_removal_propagation() -> Result<(), Box<dyn std::error::Erro
     let node1_addr: SocketAddr = "127.0.0.1:0".parse()?;
     let node2_addr: SocketAddr = "127.0.0.1:0".parse()?;
 
+    let config = GossipConfig::default();
     // Start two nodes
-    let node1 = GossipRegistryHandle::new(node1_addr, vec![], None).await?;
+    let node1_keypair = KeyPair::new_for_testing("gossip_prop_remove_node1");
+    let node1_id = node1_keypair.peer_id();
+    let node1 = GossipRegistryHandle::new_with_keypair(node1_addr, node1_keypair, Some(config.clone())).await?;
     let node1_actual = node1.registry.bind_addr;
 
-    let node2 = GossipRegistryHandle::new(node2_addr, vec![node1_actual], None).await?;
+    let node2_keypair = KeyPair::new_for_testing("gossip_prop_remove_node2");
+    let node2 = GossipRegistryHandle::new_with_keypair(node2_addr, node2_keypair, Some(config.clone())).await?;
+
+    let peer1_from_2 = node2.add_peer(&node1_id).await;
+    peer1_from_2.connect(&node1_actual).await?;
 
     // Wait for bootstrap
     sleep(Duration::from_millis(500)).await;

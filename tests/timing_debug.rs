@@ -11,12 +11,24 @@ async fn debug_timing_variations() {
     let node1_addr = "127.0.0.1:25101".parse().unwrap();
     let node2_addr = "127.0.0.1:25102".parse().unwrap();
 
-    let node1 = GossipRegistryHandle::new(node1_addr, vec![node2_addr], Some(config.clone()))
-        .await
-        .unwrap();
-    let node2 = GossipRegistryHandle::new(node2_addr, vec![node1_addr], Some(config.clone()))
-        .await
-        .unwrap();
+    let node1_keypair = KeyPair::new_for_testing("timing_node1");
+    let node2_keypair = KeyPair::new_for_testing("timing_node2");
+    let node1_id = node1_keypair.peer_id();
+    let node2_id = node2_keypair.peer_id();
+
+    let node1 =
+        GossipRegistryHandle::new_with_keypair(node1_addr, node1_keypair, Some(config.clone()))
+            .await
+            .unwrap();
+    let node2 =
+        GossipRegistryHandle::new_with_keypair(node2_addr, node2_keypair, Some(config.clone()))
+            .await
+            .unwrap();
+
+    let peer2 = node1.add_peer(&node2_id).await;
+    peer2.connect(&node2_addr).await.unwrap();
+    let peer1 = node2.add_peer(&node1_id).await;
+    peer1.connect(&node1_addr).await.unwrap();
 
     // Give a moment for connections to stabilize
     sleep(Duration::from_millis(50)).await;

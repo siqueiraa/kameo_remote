@@ -366,7 +366,7 @@ async fn test_vector_clock_in_actor_location() {
     use std::net::SocketAddr;
 
     let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-    let peer_id = kameo_remote::PeerId::new("test_peer");
+    let peer_id = kameo_remote::KeyPair::new_for_testing("test_peer").peer_id();
 
     let location1 = RemoteActorLocation::new_with_peer(addr, peer_id.clone());
     let location2 = RemoteActorLocation::new_with_peer(addr, peer_id.clone());
@@ -393,14 +393,14 @@ async fn test_vector_clock_in_actor_location() {
 
 #[test]
 fn test_vector_clock_conflict_resolution() {
-    use kameo_remote::{PeerId, RemoteActorLocation};
+    use kameo_remote::RemoteActorLocation;
     use std::net::SocketAddr;
 
     let addr1: SocketAddr = "127.0.0.1:8080".parse().unwrap();
     let addr2: SocketAddr = "127.0.0.1:8081".parse().unwrap();
 
-    let peer1 = PeerId::new("peer1");
-    let peer2 = PeerId::new("peer2");
+    let peer1 = kameo_remote::KeyPair::new_for_testing("peer1").peer_id();
+    let peer2 = kameo_remote::KeyPair::new_for_testing("peer2").peer_id();
 
     let location1 = RemoteActorLocation::new_with_peer(addr1, peer1);
     let location2 = RemoteActorLocation::new_with_peer(addr2, peer2);

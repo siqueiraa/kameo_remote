@@ -153,11 +153,6 @@ async fn test_peer_id_conversions() {
         display_string, hex_string,
         "Display should match hex string"
     );
-    assert_eq!(
-        peer_id.as_str(),
-        hex_string,
-        "as_str should match hex string"
-    );
 
     println!("   ✅ PeerId conversions working correctly");
 }
@@ -172,13 +167,14 @@ async fn test_key_mismatch_connection_rejection() {
     let server_addr = "127.0.0.1:29101".parse().unwrap();
 
     let server_config = GossipConfig {
-        key_pair: Some(server_keypair),
+        key_pair: Some(server_keypair.clone()),
         ..Default::default()
     };
 
-    let server_registry = GossipRegistryHandle::new(server_addr, vec![], Some(server_config))
-        .await
-        .expect("Should create server registry");
+    let server_registry =
+        GossipRegistryHandle::new_with_keypair(server_addr, server_keypair, Some(server_config))
+            .await
+            .expect("Should create server registry");
 
     println!("   🖥️  Server started with PeerId: {}", server_peer_id);
 
@@ -188,13 +184,14 @@ async fn test_key_mismatch_connection_rejection() {
     let client_addr = "127.0.0.1:29102".parse().unwrap();
 
     let client_config = GossipConfig {
-        key_pair: Some(client_keypair),
+        key_pair: Some(client_keypair.clone()),
         ..Default::default()
     };
 
-    let client_registry = GossipRegistryHandle::new(client_addr, vec![], Some(client_config))
-        .await
-        .expect("Should create client registry");
+    let client_registry =
+        GossipRegistryHandle::new_with_keypair(client_addr, client_keypair, Some(client_config))
+            .await
+            .expect("Should create client registry");
 
     println!("   💻 Client started with PeerId: {}", client_peer_id);
     assert_ne!(
@@ -315,39 +312,4 @@ async fn test_invalid_key_edge_cases() {
     }
 
     println!("   ✅ Invalid key edge cases handled correctly");
-}
-
-#[tokio::test]
-async fn test_legacy_string_compatibility() {
-    println!("🔄 Testing legacy string compatibility...");
-
-    // Test creating PeerId from string (legacy mode)
-    let legacy_string = "kameo_node_12345";
-    let peer_id_from_string = PeerId::new(legacy_string);
-
-    // Should create a deterministic PeerId from the string
-    let peer_id_from_string_again = PeerId::new(legacy_string);
-    assert_eq!(
-        peer_id_from_string, peer_id_from_string_again,
-        "Same legacy string should produce same PeerId"
-    );
-
-    // Different strings should produce different PeerIds
-    let different_peer_id = PeerId::new("different_node_67890");
-    assert_ne!(
-        peer_id_from_string, different_peer_id,
-        "Different legacy strings should produce different PeerIds"
-    );
-
-    println!("   ✅ Legacy string compatibility working");
-
-    // Test that we can still convert to hex and back
-    let hex_repr = peer_id_from_string.to_hex();
-    let peer_id_from_hex = PeerId::from_hex(&hex_repr).expect("Should parse hex");
-    assert_eq!(
-        peer_id_from_string, peer_id_from_hex,
-        "Legacy PeerId should survive hex roundtrip"
-    );
-
-    println!("   ✅ Legacy compatibility with hex conversion working");
 }

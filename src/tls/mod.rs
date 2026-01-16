@@ -15,8 +15,6 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 // ALPN Protocol versions for version negotiation (Phase 5)
 /// V2 protocol - supports peer discovery via PeerListGossip
 pub const ALPN_KAMEO_V2: &[u8] = b"kameo-remote-v2";
-/// V1/Legacy protocol - no peer discovery
-pub const ALPN_KAMEO_V1: &[u8] = b"kameo-gossip/1";
 
 /// Ensure the rustls CryptoProvider is installed (required for TLS)
 /// This uses the ring provider which is enabled in kameo_remote's Cargo.toml
@@ -41,7 +39,6 @@ pub struct TlsConfig {
 
 impl TlsConfig {
     /// Create a new TLS configuration with the given secret key
-    /// Uses legacy ALPN (v1 only) for backward compatibility
     pub fn new(secret_key: SecretKey) -> Result<Self> {
         Self::with_peer_discovery(secret_key, false)
     }
@@ -49,12 +46,9 @@ impl TlsConfig {
     /// Create a new TLS configuration with peer discovery support
     ///
     /// If `enable_peer_discovery` is true:
-    /// - Advertises both v2 and v1 ALPN protocols (preferring v2)
     /// - Enables Hello handshake for feature negotiation
-    ///
-    /// If false:
-    /// - Only advertises v1 for backward compatibility with legacy nodes
     pub fn with_peer_discovery(secret_key: SecretKey, enable_peer_discovery: bool) -> Result<Self> {
+        ensure_crypto_provider();
         let node_id = secret_key.public();
 
         // Create client config with ALPN based on peer discovery setting
@@ -83,22 +77,15 @@ impl TlsConfig {
 }
 
 /// Create client configuration for TLS 1.3 with custom verification
-/// If `enable_peer_discovery` is true, advertises both v2 and v1 ALPN protocols (preferring v2)
-/// If false, only advertises v1 for backward compatibility
 fn make_client_config(secret_key: &SecretKey, enable_peer_discovery: bool) -> Result<ClientConfig> {
     let mut config = ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(NodeIdServerVerifier::new()))
         .with_client_cert_resolver(Arc::new(resolver::AlwaysResolvesCert::new(secret_key)?));
 
-    // Set ALPN protocols - v2 first (preferred) if peer discovery is enabled
-    config.alpn_protocols = if enable_peer_discovery {
-        // V2 advertises both, prefers v2
-        vec![ALPN_KAMEO_V2.to_vec(), ALPN_KAMEO_V1.to_vec()]
-    } else {
-        // V1/Legacy only advertises v1
-        vec![ALPN_KAMEO_V1.to_vec()]
-    };
+    // Set ALPN protocol to v2 only (TLS-only mode)
+    let _ = enable_peer_discovery;
+    config.alpn_protocols = vec![ALPN_KAMEO_V2.to_vec()];
 
     // Enable key logging for debugging if SSLKEYLOGFILE is set
     if std::env::var("SSLKEYLOGFILE").is_ok() {
@@ -109,21 +96,14 @@ fn make_client_config(secret_key: &SecretKey, enable_peer_discovery: bool) -> Re
 }
 
 /// Create server configuration for TLS 1.3
-/// If `enable_peer_discovery` is true, advertises both v2 and v1 ALPN protocols (preferring v2)
-/// If false, only advertises v1 for backward compatibility
 fn make_server_config(secret_key: &SecretKey, enable_peer_discovery: bool) -> Result<ServerConfig> {
     let mut config = ServerConfig::builder()
         .with_client_cert_verifier(Arc::new(NodeIdClientVerifier::new()))
         .with_cert_resolver(Arc::new(resolver::AlwaysResolvesCert::new(secret_key)?));
 
-    // Set ALPN protocols - v2 first (preferred) if peer discovery is enabled
-    config.alpn_protocols = if enable_peer_discovery {
-        // V2 advertises both, prefers v2
-        vec![ALPN_KAMEO_V2.to_vec(), ALPN_KAMEO_V1.to_vec()]
-    } else {
-        // V1/Legacy only advertises v1
-        vec![ALPN_KAMEO_V1.to_vec()]
-    };
+    // Set ALPN protocol to v2 only (TLS-only mode)
+    let _ = enable_peer_discovery;
+    config.alpn_protocols = vec![ALPN_KAMEO_V2.to_vec()];
 
     // Enable key logging for debugging if SSLKEYLOGFILE is set
     if std::env::var("SSLKEYLOGFILE").is_ok() {
@@ -259,7 +239,7 @@ impl ClientCertVerifier for NodeIdClientVerifier {
     }
 
     fn client_auth_mandatory(&self) -> bool {
-        false // Start with optional client auth for migration
+        false // Optional client auth; server does not require client certs
     }
 
     fn root_hint_subjects(&self) -> &[DistinguishedName] {
@@ -366,27 +346,27 @@ mod tests {
     }
 
     #[test]
-    fn test_alpn_selection_based_on_feature_flag() {
+    fn test_alpn_selection_v2_only() {
         ensure_crypto_provider();
         let secret = SecretKey::generate();
         let enabled = TlsConfig::with_peer_discovery(secret.clone(), true).unwrap();
         assert_eq!(
             enabled.client_config.alpn_protocols,
-            vec![ALPN_KAMEO_V2.to_vec(), ALPN_KAMEO_V1.to_vec()]
+            vec![ALPN_KAMEO_V2.to_vec()]
         );
         assert_eq!(
             enabled.server_config.alpn_protocols,
-            vec![ALPN_KAMEO_V2.to_vec(), ALPN_KAMEO_V1.to_vec()]
+            vec![ALPN_KAMEO_V2.to_vec()]
         );
 
         let disabled = TlsConfig::with_peer_discovery(secret, false).unwrap();
         assert_eq!(
             disabled.client_config.alpn_protocols,
-            vec![ALPN_KAMEO_V1.to_vec()]
+            vec![ALPN_KAMEO_V2.to_vec()]
         );
         assert_eq!(
             disabled.server_config.alpn_protocols,
-            vec![ALPN_KAMEO_V1.to_vec()]
+            vec![ALPN_KAMEO_V2.to_vec()]
         );
     }
 }

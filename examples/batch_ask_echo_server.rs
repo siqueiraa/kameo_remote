@@ -1,4 +1,4 @@
-use kameo_remote::{GossipConfig, GossipRegistryHandle, MessageType, Result};
+use kameo_remote::{GossipConfig, GossipRegistryHandle, KeyPair, MessageType, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -123,8 +123,13 @@ async fn main() -> Result<()> {
 
     // Start a gossip registry (for the connection pool)
     let registry_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let registry =
-        GossipRegistryHandle::new(registry_addr, vec![], Some(GossipConfig::default())).await?;
+    let key_pair = KeyPair::new_for_testing("batch_ask_echo_server");
+    let registry = GossipRegistryHandle::new_with_keypair(
+        registry_addr,
+        key_pair,
+        Some(GossipConfig::default()),
+    )
+    .await?;
     info!("Registry started on {}", registry.registry.bind_addr);
 
     // Get connection to echo server

@@ -1,4 +1,4 @@
-use kameo_remote::{GossipConfig, GossipRegistryHandle, KeyPair, PeerId, RegistrationPriority};
+use kameo_remote::{GossipConfig, GossipRegistryHandle, KeyPair, RegistrationPriority};
 use std::{net::SocketAddr, time::Duration};
 use tokio::time::sleep;
 
@@ -12,16 +12,20 @@ async fn main() {
         .with_env_filter("kameo_remote=info")
         .init();
 
+    let node_a_keypair = KeyPair::new_for_testing("node_a");
+    let node_b_keypair = KeyPair::new_for_testing("node_b");
+    let node_c_keypair = KeyPair::new_for_testing("node_c");
+
     let config = GossipConfig {
-        key_pair: Some(KeyPair::new_for_testing("node_c")),
+        key_pair: Some(node_c_keypair.clone()),
         gossip_interval: Duration::from_secs(TEST_GOSSIP_INTERVAL_SECS),
         ..Default::default()
     };
 
     println!("Starting Node C on 127.0.0.1:8003...");
-    let handle = GossipRegistryHandle::new(
+    let handle = GossipRegistryHandle::new_with_keypair(
         "127.0.0.1:8003".parse().unwrap(),
-        vec![], // No initial peers
+        node_c_keypair.clone(),
         Some(config),
     )
     .await
@@ -30,8 +34,8 @@ async fn main() {
     println!("Node C started at {}", handle.registry.bind_addr);
 
     // Add peers and attempt connections
-    let peer_a = handle.add_peer(&PeerId::new("node_a")).await;
-    let peer_b = handle.add_peer(&PeerId::new("node_b")).await;
+    let peer_a = handle.add_peer(&node_a_keypair.peer_id()).await;
+    let peer_b = handle.add_peer(&node_b_keypair.peer_id()).await;
 
     println!("Attempting to connect to node_a...");
     match peer_a.connect(&"127.0.0.1:8001".parse().unwrap()).await {
@@ -72,12 +76,12 @@ async fn main() {
 
             // Check all configured peers (from peer_id_to_addr)
             for entry in pool.peer_id_to_addr.iter() {
-                let node_id = entry.key();
+                let peer_id = entry.key();
                 let addr = entry.value();
                 configured_count += 1;
 
                 // Check if we have an active connection to this node
-                let has_connection = pool.get_connection_by_node_id(&node_id.as_str()).is_some();
+                let has_connection = pool.get_connection_by_peer_id(peer_id).is_some();
                 if has_connection {
                     connected_count += 1;
                 }
@@ -124,7 +128,7 @@ async fn main() {
                 } else {
                     "NOT_CONNECTED".to_string()
                 };
-                status.push(format!("  {} ({}) - {}", node_id, addr, status_str));
+                status.push(format!("  {} ({}) - {}", peer_id, addr, status_str));
             }
             (status, configured_count, connected_count)
         };

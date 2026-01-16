@@ -156,10 +156,9 @@ async fn test_local_connection_wins() -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-/// Scenario 3: Feature flag disabled - legacy behavior
-/// V2 binary with enable_peer_discovery = false should behave like V1
+/// Scenario 3: Feature flag disabled - no peer discovery
 #[tokio::test]
-async fn test_feature_flag_disabled_legacy_behavior() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_feature_flag_disabled_no_discovery() -> Result<(), Box<dyn std::error::Error>> {
     let config = GossipConfig {
         enable_peer_discovery: false, // Disabled
         gossip_interval: Duration::from_millis(200),
@@ -659,65 +658,6 @@ async fn test_version_negotiation_v2_capabilities() -> Result<(), Box<dyn std::e
         "Node B should negotiate peer discovery with node A"
     );
 
-    node_a.shutdown().await;
-    node_b.shutdown().await;
-
-    Ok(())
-}
-
-/// Scenario 14: Version negotiation with legacy node
-/// A (v2) connects to B (v1) - should not send PeerListGossip
-#[tokio::test]
-async fn test_version_negotiation_legacy() -> Result<(), Box<dyn std::error::Error>> {
-    init_crypto();
-    // Node A with peer discovery enabled (v2)
-    let config_v2 = peer_discovery_config();
-
-    // Node B with peer discovery disabled (simulates v1/legacy)
-    let config_v1 = GossipConfig {
-        enable_peer_discovery: false,
-        gossip_interval: Duration::from_millis(200),
-        ..Default::default()
-    };
-
-    let secret_a = SecretKey::generate();
-    let node_a =
-        GossipRegistryHandle::new_with_tls("127.0.0.1:0".parse()?, secret_a, Some(config_v2))
-            .await?;
-    let addr_a = node_a.registry.bind_addr;
-
-    let secret_b = SecretKey::generate();
-    let node_b =
-        GossipRegistryHandle::new_with_tls("127.0.0.1:0".parse()?, secret_b, Some(config_v1))
-            .await?;
-    let addr_b = node_b.registry.bind_addr;
-
-    // Connect them
-    node_a.registry.add_peer(addr_b).await;
-    node_b.registry.add_peer(addr_a).await;
-    node_b.bootstrap_non_blocking(vec![addr_a]).await;
-
-    // Wait for connection and gossip
-    sleep(Duration::from_secs(2)).await;
-
-    // B (legacy) should have 0 discovered peers since it doesn't process PeerListGossip
-    let stats_b = node_b.stats().await;
-    assert_eq!(
-        stats_b.discovered_peers, 0,
-        "Legacy node B should not discover peers via gossip"
-    );
-
-    assert!(
-        !node_a.registry.peer_supports_peer_list(&addr_b).await,
-        "Node A should not negotiate peer discovery with legacy node B"
-    );
-
-    assert!(
-        !node_b.registry.peer_supports_peer_list(&addr_a).await,
-        "Legacy node should not advertise peer discovery capability"
-    );
-
-    // Cleanup
     node_a.shutdown().await;
     node_b.shutdown().await;
 

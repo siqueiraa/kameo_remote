@@ -9,17 +9,27 @@ async fn test_tell_message_api_comprehensive() {
     println!("🚀 TellMessage API Comprehensive Test");
     println!("=====================================");
 
-    // Setup two nodes with basic gossip
-    let config = GossipConfig::default();
+    // Setup two nodes with basic gossip (TLS-only)
     let node1_addr = "127.0.0.1:27001".parse().unwrap();
     let node2_addr = "127.0.0.1:27002".parse().unwrap();
 
-    let node1 = GossipRegistryHandle::new(node1_addr, vec![node2_addr], Some(config.clone()))
-        .await
-        .unwrap();
-    let node2 = GossipRegistryHandle::new(node2_addr, vec![node1_addr], Some(config.clone()))
-        .await
-        .unwrap();
+    let node1_keypair = KeyPair::new_for_testing("node1");
+    let node2_keypair = KeyPair::new_for_testing("node2");
+
+    let node1 = GossipRegistryHandle::new_with_keypair(
+        node1_addr,
+        node1_keypair,
+        Some(GossipConfig::default()),
+    )
+    .await
+    .unwrap();
+    let node2 = GossipRegistryHandle::new_with_keypair(
+        node2_addr,
+        node2_keypair,
+        Some(GossipConfig::default()),
+    )
+    .await
+    .unwrap();
 
     // Wait for connection establishment
     sleep(Duration::from_millis(100)).await;
@@ -536,10 +546,14 @@ async fn test_tell_message_high_volume_performance() {
     let node1_addr = "127.0.0.1:28001".parse().unwrap();
     let node2_addr = "127.0.0.1:28002".parse().unwrap();
 
-    let node1 = GossipRegistryHandle::new(node1_addr, vec![node2_addr], Some(config.clone()))
-        .await
-        .unwrap();
-    let node2 = GossipRegistryHandle::new(node2_addr, vec![node1_addr], Some(config.clone()))
+    let node1_keypair = KeyPair::new_for_testing("perf_node1");
+    let node2_keypair = KeyPair::new_for_testing("perf_node2");
+
+    let node1 =
+        GossipRegistryHandle::new_with_keypair(node1_addr, node1_keypair, Some(config.clone()))
+            .await
+            .unwrap();
+    let node2 = GossipRegistryHandle::new_with_keypair(node2_addr, node2_keypair, Some(config))
         .await
         .unwrap();
 

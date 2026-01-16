@@ -13,7 +13,7 @@ async fn test_local_actor_wins_over_remote_update() -> Result<(), Box<dyn std::e
 
     let node_a = create_tls_node(config.clone()).await?;
     let node_b = create_tls_node(config.clone()).await?;
-    connect_bidirectional(&node_a, &node_b).await;
+    connect_bidirectional(&node_a, &node_b).await?;
 
     let addr_a = parse_addr("127.0.0.1:9401");
     let addr_b = parse_addr("127.0.0.1:9402");

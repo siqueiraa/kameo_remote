@@ -15,13 +15,15 @@ async fn main() {
 
     info!("🚀 Testing gossip retry mechanism");
 
+    let node1_keypair = KeyPair::new_for_testing("node1");
+    let node2_keypair = KeyPair::new_for_testing("node2");
+
     // Start node1 with a peer configured for node2 (which isn't running yet)
     info!("Starting node1 with node2 as a peer (node2 not running yet)");
-    let handle1 = GossipRegistryHandle::new(
+    let handle1 = GossipRegistryHandle::new_with_keypair(
         node1_addr,
-        vec![],
+        node1_keypair.clone(),
         Some(GossipConfig {
-            key_pair: Some(KeyPair::new_for_testing("node1")),
             gossip_interval: Duration::from_secs(2), // Gossip every 2 seconds for faster testing
             peer_retry_interval: Duration::from_secs(5), // Retry failed peers every 5 seconds
             ..Default::default()
@@ -31,7 +33,7 @@ async fn main() {
     .unwrap();
 
     // Add node2 as a peer and try to connect (should fail)
-    let peer2 = handle1.add_peer(&PeerId::new("node2")).await;
+    let peer2 = handle1.add_peer(&node2_keypair.peer_id()).await;
     match peer2.connect(&node2_addr).await {
         Ok(_) => info!("Unexpectedly connected to node2"),
         Err(e) => info!("Expected failure connecting to node2: {}", e),
@@ -50,11 +52,10 @@ async fn main() {
 
     // Now start node2
     info!("Starting node2 after 10 seconds");
-    let handle2 = GossipRegistryHandle::new(
+    let handle2 = GossipRegistryHandle::new_with_keypair(
         node2_addr,
-        vec![],
+        node2_keypair.clone(),
         Some(GossipConfig {
-            key_pair: Some(KeyPair::new_for_testing("node2")),
             gossip_interval: Duration::from_secs(2),
             ..Default::default()
         }),
@@ -63,7 +64,7 @@ async fn main() {
     .unwrap();
 
     // Add node1 as a peer
-    let peer1 = handle2.add_peer(&PeerId::new("node1")).await;
+    let peer1 = handle2.add_peer(&node1_keypair.peer_id()).await;
     peer1.connect(&node1_addr).await.unwrap();
 
     // Register an actor on node2

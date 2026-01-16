@@ -1,11 +1,18 @@
 use kameo_remote::registry::*;
-use kameo_remote::{ActorLocation, GossipConfig, GossipError, RegistrationPriority};
+use kameo_remote::{ActorLocation, GossipConfig, GossipError, KeyPair, RegistrationPriority};
 use std::net::SocketAddr;
 use std::time::Duration;
 
+fn test_config(seed: &str) -> GossipConfig {
+    GossipConfig {
+        key_pair: Some(KeyPair::new_for_testing(seed)),
+        ..Default::default()
+    }
+}
+
 fn create_test_registry() -> GossipRegistry {
     let bind_addr = "127.0.0.1:0".parse().unwrap();
-    let config = GossipConfig::default();
+    let config = test_config("unit_registry");
     GossipRegistry::new(bind_addr, config)
 }
 
@@ -21,7 +28,7 @@ fn create_test_actor_location(addr: SocketAddr) -> ActorLocation {
 #[tokio::test]
 async fn test_registry_creation() {
     let bind_addr = "127.0.0.1:8080".parse().unwrap();
-    let config = GossipConfig::default();
+    let config = test_config("unit_registry_creation");
     
     let registry = GossipRegistry::new(bind_addr, config.clone());
     

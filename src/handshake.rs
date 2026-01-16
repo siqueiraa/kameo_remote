@@ -1,7 +1,7 @@
 //! Hello handshake protocol for peer capability negotiation
 //!
 //! This module implements the Hello handshake that establishes peer capabilities
-//! at connection time. This enables gradual feature rollout and backward compatibility.
+//! at connection time for TLS-only v2 peers.
 
 use crate::{tls, GossipError, Result};
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
@@ -14,7 +14,6 @@ const HELLO_MAX_SIZE: usize = 1024;
 const HELLO_TIMEOUT_MS: u64 = 3_000;
 
 /// Protocol version constants
-pub const PROTOCOL_VERSION_V1: u16 = 1;
 pub const PROTOCOL_VERSION_V2: u16 = 2;
 
 /// Current protocol version
@@ -45,14 +44,6 @@ impl Hello {
         }
     }
 
-    /// Create a legacy Hello message (v1, no peer discovery)
-    pub fn legacy() -> Self {
-        Self {
-            protocol_version: PROTOCOL_VERSION_V1,
-            features: vec![],
-        }
-    }
-
     /// Create Hello with specific features
     pub fn with_features(features: Vec<Feature>) -> Self {
         Self {
@@ -78,15 +69,6 @@ pub struct PeerCapabilities {
 }
 
 impl PeerCapabilities {
-    /// Create capabilities for a legacy (v1) peer
-    /// Legacy peers don't support any new features
-    pub fn legacy() -> Self {
-        Self {
-            version: PROTOCOL_VERSION_V1,
-            features: HashSet::new(),
-        }
-    }
-
     /// Create capabilities from a Hello exchange
     /// Takes the intersection of features and minimum version
     pub fn from_hello_exchange(local: &Hello, remote: &Hello) -> Self {
@@ -180,26 +162,30 @@ pub async fn perform_hello_handshake<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    if !enable_peer_discovery {
-        return Ok(PeerCapabilities::legacy());
-    }
-
-    let Some(alpn) = negotiated_alpn else {
-        debug!("no ALPN negotiated, skipping Hello handshake");
-        return Ok(PeerCapabilities::legacy());
-    };
+    let alpn = negotiated_alpn.ok_or_else(|| {
+        GossipError::TlsHandshakeFailed("missing ALPN negotiation result".to_string())
+    })?;
 
     if alpn != tls::ALPN_KAMEO_V2 {
-        debug!(
-            protocol = %String::from_utf8_lossy(alpn),
-            "peer negotiated legacy ALPN, skipping Hello handshake"
-        );
-        return Ok(PeerCapabilities::legacy());
+        return Err(GossipError::TlsHandshakeFailed(format!(
+            "unsupported ALPN: {}",
+            String::from_utf8_lossy(alpn)
+        )));
     }
 
-    let local_hello = Hello::new();
+    let local_hello = if enable_peer_discovery {
+        Hello::new()
+    } else {
+        Hello::with_features(Vec::new())
+    };
     send_hello_message(stream, &local_hello).await?;
     let remote_hello = read_hello_message(stream).await?;
+    if remote_hello.protocol_version != CURRENT_PROTOCOL_VERSION {
+        return Err(GossipError::TlsHandshakeFailed(format!(
+            "unsupported protocol version: {}",
+            remote_hello.protocol_version
+        )));
+    }
     let caps = PeerCapabilities::from_hello_exchange(&local_hello, &remote_hello);
     debug!(
         negotiated_version = caps.version,
@@ -221,13 +207,6 @@ mod tests {
     }
 
     #[test]
-    fn test_hello_legacy() {
-        let hello = Hello::legacy();
-        assert_eq!(hello.protocol_version, PROTOCOL_VERSION_V1);
-        assert!(hello.features.is_empty());
-    }
-
-    #[test]
     fn test_hello_serialization() {
         let hello = Hello::new();
 
@@ -244,14 +223,6 @@ mod tests {
     }
 
     #[test]
-    fn test_peer_capabilities_legacy() {
-        let caps = PeerCapabilities::legacy();
-        assert_eq!(caps.version, PROTOCOL_VERSION_V1);
-        assert!(caps.features.is_empty());
-        assert!(!caps.can_send_peer_list());
-    }
-
-    #[test]
     fn test_peer_capabilities_from_hello_exchange_both_v2() {
         let local = Hello::new();
         let remote = Hello::new();
@@ -261,18 +232,6 @@ mod tests {
         assert_eq!(caps.version, PROTOCOL_VERSION_V2);
         assert!(caps.features.contains(&Feature::PeerListGossip));
         assert!(caps.can_send_peer_list());
-    }
-
-    #[test]
-    fn test_peer_capabilities_from_hello_exchange_legacy_remote() {
-        let local = Hello::new();
-        let remote = Hello::legacy();
-
-        let caps = PeerCapabilities::from_hello_exchange(&local, &remote);
-
-        assert_eq!(caps.version, PROTOCOL_VERSION_V1);
-        assert!(caps.features.is_empty()); // No common features
-        assert!(!caps.can_send_peer_list());
     }
 
     #[test]
@@ -323,18 +282,5 @@ mod tests {
         assert_eq!(a_caps.features, b_caps.features);
         assert!(a_caps.can_send_peer_list());
         assert!(b_caps.can_send_peer_list());
-    }
-
-    #[test]
-    fn test_hello_handshake_with_legacy_node() {
-        // Scenario: V2 node connects to V1 node
-        let v2_hello = Hello::new();
-        let v1_hello = Hello::legacy();
-
-        let caps = PeerCapabilities::from_hello_exchange(&v2_hello, &v1_hello);
-
-        // Should fall back to V1 behavior
-        assert_eq!(caps.version, PROTOCOL_VERSION_V1);
-        assert!(!caps.can_send_peer_list());
     }
 }

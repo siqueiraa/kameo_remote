@@ -1,4 +1,4 @@
-use kameo_remote::{GossipConfig, GossipRegistryHandle, KeyPair, PeerId};
+use kameo_remote::{GossipConfig, GossipRegistryHandle, KeyPair};
 use std::net::SocketAddr;
 use tokio::time::{sleep, Duration};
 
@@ -12,32 +12,35 @@ async fn main() {
     let addr_a: SocketAddr = "127.0.0.1:9001".parse().unwrap();
     let addr_b: SocketAddr = "127.0.0.1:9002".parse().unwrap();
 
+    let key_pair_a = KeyPair::new_for_testing("node_a");
+    let key_pair_b = KeyPair::new_for_testing("node_b");
+    let peer_id_a = key_pair_a.peer_id();
+    let peer_id_b = key_pair_b.peer_id();
+
     let config_a = GossipConfig {
-        key_pair: Some(KeyPair::new_for_testing("node_a")),
         gossip_interval: Duration::from_secs(300),
         ..Default::default()
     };
 
     let config_b = GossipConfig {
-        key_pair: Some(KeyPair::new_for_testing("node_b")),
         gossip_interval: Duration::from_secs(300),
         ..Default::default()
     };
 
     // Start nodes
-    let handle_a = GossipRegistryHandle::new(addr_a, vec![], Some(config_a))
+    let handle_a = GossipRegistryHandle::new_with_keypair(addr_a, key_pair_a, Some(config_a))
         .await
         .unwrap();
 
-    let handle_b = GossipRegistryHandle::new(addr_b, vec![], Some(config_b))
+    let handle_b = GossipRegistryHandle::new_with_keypair(addr_b, key_pair_b, Some(config_b))
         .await
         .unwrap();
 
     // Connect nodes - both directions
-    let peer_b = handle_a.add_peer(&PeerId::new("node_b")).await;
+    let peer_b = handle_a.add_peer(&peer_id_b).await;
     peer_b.connect(&addr_b).await.unwrap();
 
-    let peer_a = handle_b.add_peer(&PeerId::new("node_a")).await;
+    let peer_a = handle_b.add_peer(&peer_id_a).await;
     peer_a.connect(&addr_a).await.unwrap();
 
     sleep(Duration::from_millis(100)).await;

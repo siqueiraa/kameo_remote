@@ -1,11 +1,12 @@
 use kameo_remote::registry::{GossipRegistry, PeerInfoGossip};
-use kameo_remote::GossipConfig;
+use kameo_remote::{GossipConfig, KeyPair};
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::time::sleep;
 
-fn peer_discovery_config() -> GossipConfig {
+fn peer_discovery_config(seed: &str) -> GossipConfig {
     GossipConfig {
+        key_pair: Some(KeyPair::new_for_testing(seed)),
         enable_peer_discovery: true,
         allow_loopback_discovery: true,
         allow_link_local_discovery: true,
@@ -31,9 +32,10 @@ fn peer_info(addr: &str, last_attempt: u64, last_success: u64) -> PeerInfoGossip
 
 #[tokio::test]
 async fn test_peer_list_cleanup_symmetric() -> Result<(), Box<dyn std::error::Error>> {
-    let config = peer_discovery_config();
-    let registry_a = GossipRegistry::new("127.0.0.1:0".parse()?, config.clone());
-    let registry_b = GossipRegistry::new("127.0.0.1:0".parse()?, config.clone());
+    let registry_a =
+        GossipRegistry::new("127.0.0.1:0".parse()?, peer_discovery_config("peer_sym_a"));
+    let registry_b =
+        GossipRegistry::new("127.0.0.1:0".parse()?, peer_discovery_config("peer_sym_b"));
 
     let now = kameo_remote::current_timestamp();
     let stale = peer_info(
@@ -69,9 +71,14 @@ async fn test_peer_list_cleanup_symmetric() -> Result<(), Box<dyn std::error::Er
 
 #[tokio::test]
 async fn test_mesh_formation_metric_symmetric() -> Result<(), Box<dyn std::error::Error>> {
-    let config = peer_discovery_config();
-    let registry_a = GossipRegistry::new("127.0.0.1:0".parse()?, config.clone());
-    let registry_b = GossipRegistry::new("127.0.0.1:0".parse()?, config.clone());
+    let registry_a = GossipRegistry::new(
+        "127.0.0.1:0".parse()?,
+        peer_discovery_config("peer_sym_metric_a"),
+    );
+    let registry_b = GossipRegistry::new(
+        "127.0.0.1:0".parse()?,
+        peer_discovery_config("peer_sym_metric_b"),
+    );
 
     registry_a
         .mark_peer_connected("127.0.0.1:5100".parse::<SocketAddr>()?)

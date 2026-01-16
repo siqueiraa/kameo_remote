@@ -1,13 +1,9 @@
 use std::net::SocketAddr;
-use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
-use kameo_remote::{
-    GossipConfig, GossipRegistryHandle, KeyPair, MessageType, PeerId, 
-    RegistrationPriority, RemoteActorLocation
-};
+use kameo_remote::{GossipConfig, GossipRegistryHandle, KeyPair, RegistrationPriority};
 
 /// Test the complete ask/response flow with correlation tracking
 #[tokio::test]
@@ -28,6 +24,8 @@ async fn test_ask_response_with_correlation() {
     
     let key_pair_a = KeyPair::new_for_testing("node_a");
     let key_pair_b = KeyPair::new_for_testing("node_b");
+    let peer_id_a = key_pair_a.peer_id();
+    let peer_id_b = key_pair_b.peer_id();
     
     let config = GossipConfig {
         gossip_interval: Duration::from_secs(2),
@@ -35,20 +33,22 @@ async fn test_ask_response_with_correlation() {
     };
     
     // Start Node A
-    let handle_a = GossipRegistryHandle::new(key_pair_a.clone(), config.clone());
+    let handle_a = GossipRegistryHandle::new_with_keypair(addr_a, key_pair_a, Some(config.clone()))
+        .await
+        .unwrap();
     let registry_a = handle_a.registry.clone();
-    handle_a.start_server(addr_a).await.unwrap();
     
     // Start Node B
-    let handle_b = GossipRegistryHandle::new(key_pair_b.clone(), config.clone());
+    let handle_b = GossipRegistryHandle::new_with_keypair(addr_b, key_pair_b, Some(config.clone()))
+        .await
+        .unwrap();
     let registry_b = handle_b.registry.clone();
-    handle_b.start_server(addr_b).await.unwrap();
     
     // Connect nodes
-    let peer_a = handle_b.add_peer(&PeerId::new("node_a"));
+    let peer_a = handle_b.add_peer(&peer_id_a).await;
     peer_a.connect(&addr_a).await.unwrap();
     
-    let peer_b = handle_a.add_peer(&PeerId::new("node_b"));
+    let peer_b = handle_a.add_peer(&peer_id_b).await;
     peer_b.connect(&addr_b).await.unwrap();
     
     sleep(Duration::from_millis(500)).await;
@@ -64,7 +64,7 @@ async fn test_ask_response_with_correlation() {
     info!("Test 1: Simple ask/response");
     {
         let pool = registry_b.connection_pool.lock().await;
-        let conn = pool.connections.get(&addr_a).unwrap();
+        let conn = pool.connections_by_addr.get(&addr_a).unwrap();
         
         // Send ask request
         let request = b"2 + 2 = ?";
@@ -96,7 +96,7 @@ async fn test_ask_response_with_correlation() {
     info!("\nTest 2: Multiple concurrent asks");
     {
         let pool = registry_a.connection_pool.lock().await;
-        let conn = pool.connections.get(&addr_b).unwrap().clone();
+        let conn = pool.connections_by_addr.get(&addr_b).unwrap().clone();
         drop(pool);
         
         let mut handles = Vec::new();
@@ -133,7 +133,7 @@ async fn test_ask_response_with_correlation() {
     info!("\nTest 3: Correlation ID tracking");
     {
         let pool = registry_a.connection_pool.lock().await;
-        let conn = pool.connections.values().next().unwrap();
+        let conn = pool.connections_by_addr.values().next().unwrap();
         
         // Send multiple asks rapidly to test correlation ID allocation
         let mut futures = Vec::new();
@@ -180,15 +180,16 @@ async fn test_ask_error_cases() {
     let key_pair = KeyPair::new_for_testing("test_node");
     let config = GossipConfig::default();
     
-    let handle = GossipRegistryHandle::new(key_pair, config);
+    let handle = GossipRegistryHandle::new_with_keypair(addr, key_pair, Some(config))
+        .await
+        .unwrap();
     let registry = handle.registry.clone();
-    handle.start_server(addr).await.unwrap();
     
     // Test 1: Ask with no connection
     info!("Test 1: Ask with no connection");
     {
         let pool = registry.connection_pool.lock().await;
-        assert!(pool.connections.is_empty(), "Should have no connections");
+        assert!(pool.connections_by_addr.is_empty(), "Should have no connections");
     }
     
     // Test 2: Ask after connection failure
@@ -196,7 +197,8 @@ async fn test_ask_error_cases() {
     {
         // Try to connect to non-existent peer
         let fake_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
-        let peer = handle.add_peer(&PeerId::new("fake_peer"));
+        let fake_peer_id = KeyPair::new_for_testing("fake_peer").peer_id();
+        let peer = handle.add_peer(&fake_peer_id).await;
         
         match peer.connect(&fake_addr).await {
             Ok(_) => panic!("Should not connect to non-existent peer"),
@@ -229,19 +231,22 @@ async fn test_ask_performance() {
     
     let key_pair_a = KeyPair::new_for_testing("perf_node_a");
     let key_pair_b = KeyPair::new_for_testing("perf_node_b");
+    let peer_id_b = key_pair_b.peer_id();
     
     let config = GossipConfig::default();
     
     // Start nodes
-    let handle_a = GossipRegistryHandle::new(key_pair_a, config.clone());
+    let handle_a = GossipRegistryHandle::new_with_keypair(addr_a, key_pair_a, Some(config.clone()))
+        .await
+        .unwrap();
     let registry_a = handle_a.registry.clone();
-    handle_a.start_server(addr_a).await.unwrap();
     
-    let handle_b = GossipRegistryHandle::new(key_pair_b, config);
-    handle_b.start_server(addr_b).await.unwrap();
+    let handle_b = GossipRegistryHandle::new_with_keypair(addr_b, key_pair_b, Some(config))
+        .await
+        .unwrap();
     
     // Connect nodes
-    let peer_b = handle_a.add_peer(&PeerId::new("perf_node_b"));
+    let peer_b = handle_a.add_peer(&peer_id_b).await;
     peer_b.connect(&addr_b).await.unwrap();
     
     sleep(Duration::from_millis(500)).await;
@@ -249,7 +254,7 @@ async fn test_ask_performance() {
     // Warm up
     {
         let pool = registry_a.connection_pool.lock().await;
-        let conn = pool.connections.values().next().unwrap();
+        let conn = pool.connections_by_addr.values().next().unwrap();
         for _ in 0..100 {
             let _ = conn.ask_with_reply_to(b"warmup").await;
         }
@@ -259,7 +264,7 @@ async fn test_ask_performance() {
     
     // Performance test
     let pool = registry_a.connection_pool.lock().await;
-    let conn = pool.connections.values().next().unwrap().clone();
+    let conn = pool.connections_by_addr.values().next().unwrap().clone();
     drop(pool);
     
     let num_requests = 10000;

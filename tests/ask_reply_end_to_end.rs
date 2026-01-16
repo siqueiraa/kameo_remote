@@ -2,7 +2,7 @@ mod common;
 
 use common::{create_tls_node, wait_for_condition};
 use kameo_remote::registry::{ActorMessageFuture, ActorMessageHandler, RegistryMessage};
-use kameo_remote::{GossipConfig, PeerId};
+use kameo_remote::GossipConfig;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
@@ -197,7 +197,8 @@ async fn test_ask_timeout() {
     let addr_b: SocketAddr = "127.0.0.1:8004".parse().unwrap(); // This won't exist
 
     // Try to connect to non-existent node
-    let peer_b = handle_a.add_peer(&PeerId::new("node_b")).await;
+    let peer_b_id = kameo_remote::KeyPair::new_for_testing("node_b").peer_id();
+    let peer_b = handle_a.add_peer(&peer_b_id).await;
 
     // Connection should fail
     match peer_b.connect(&addr_b).await {
