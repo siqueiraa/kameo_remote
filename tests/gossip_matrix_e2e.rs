@@ -81,7 +81,10 @@ async fn test_gossip_matrix_convergence_line_topology() -> Result<(), Box<dyn st
         }
     }
 
-    assert!(converged, "all nodes should converge on all actors in line topology");
+    assert!(
+        converged,
+        "all nodes should converge on all actors in line topology"
+    );
 
     node_a.shutdown().await;
     node_b.shutdown().await;

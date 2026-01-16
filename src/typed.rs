@@ -139,7 +139,8 @@ pub trait WireType {
 }
 
 /// Helper trait for rkyv-serializable wire types.
-pub trait WireEncode: WireType
+pub trait WireEncode:
+    WireType
     + for<'a> rkyv::Serialize<
         rkyv::rancor::Strategy<
             rkyv::ser::Serializer<
@@ -218,8 +219,8 @@ pub fn encode_typed<T>(value: &T) -> Result<Bytes>
 where
     T: WireEncode,
 {
-    let payload = rkyv::to_bytes::<rkyv::rancor::Error>(value)
-        .map_err(GossipError::Serialization)?;
+    let payload =
+        rkyv::to_bytes::<rkyv::rancor::Error>(value).map_err(GossipError::Serialization)?;
 
     #[cfg(debug_assertions)]
     {
@@ -260,7 +261,7 @@ pub fn typed_payload_parts<T: WireType>(
     {
         let prefix = T::TYPE_HASH.to_be_bytes();
         let total_len = prefix.len() + payload.len();
-        return (payload, Some(prefix), total_len);
+        (payload, Some(prefix), total_len)
     }
 
     #[cfg(not(debug_assertions))]
@@ -409,7 +410,9 @@ where
         if hash != T::TYPE_HASH {
             return Err(GossipError::InvalidConfig(format!(
                 "typed payload hash mismatch for {}: expected {:016x}, got {:016x}",
-                T::TYPE_NAME, T::TYPE_HASH, hash
+                T::TYPE_NAME,
+                T::TYPE_HASH,
+                hash
             )));
         }
         let body = &payload[8..];
@@ -453,14 +456,16 @@ where
         if hash != T::TYPE_HASH {
             return Err(GossipError::InvalidConfig(format!(
                 "typed payload hash mismatch for {}: expected {:016x}, got {:016x}",
-                T::TYPE_NAME, T::TYPE_HASH, hash
+                T::TYPE_NAME,
+                T::TYPE_HASH,
+                hash
             )));
         }
-        return Ok(ArchivedBytes {
+        Ok(ArchivedBytes {
             bytes: payload,
             offset: 8,
             _marker: PhantomData,
-        });
+        })
     }
 
     #[cfg(not(debug_assertions))]

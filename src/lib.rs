@@ -10,10 +10,10 @@ pub mod registry;
 pub mod remote_actor_location;
 pub mod reply_to;
 pub mod stream_writer;
-pub mod tls;
-pub mod typed;
 #[cfg(any(test, feature = "test-helpers", debug_assertions))]
 pub mod test_helpers;
+pub mod tls;
+pub mod typed;
 
 use dashmap::DashMap;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};

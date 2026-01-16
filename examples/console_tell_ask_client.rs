@@ -151,7 +151,9 @@ async fn main() -> Result<()> {
         }
         #[cfg(not(debug_assertions))]
         {
-            println!("⚠️  Typed ask is disabled in release builds; use a debug build to verify types.");
+            println!(
+                "⚠️  Typed ask is disabled in release builds; use a debug build to verify types."
+            );
         }
     }
 

@@ -2,6 +2,7 @@ use kameo_remote::*;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
+use tracing_subscriber::EnvFilter;
 
 static TEST_MUTEX: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
@@ -16,7 +17,29 @@ async fn wait_for_lookup(
             return location;
         }
         if start.elapsed() > timeout {
-            panic!("Timed out waiting for actor lookup: {}", name);
+            let stats = handle.stats().await;
+            panic!("Timed out waiting for actor lookup: {} stats: {:?}", name, stats);
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn wait_for_active_peers(
+    handle: &GossipRegistryHandle,
+    min_peers: usize,
+    timeout: Duration,
+) {
+    let start = Instant::now();
+    loop {
+        if handle.stats().await.active_peers >= min_peers {
+            return;
+        }
+        if start.elapsed() > timeout {
+            let stats = handle.stats().await;
+            panic!(
+                "Timed out waiting for active peers (min {}): stats: {:?}",
+                min_peers, stats
+            );
         }
         sleep(Duration::from_millis(20)).await;
     }
@@ -39,6 +62,9 @@ async fn get_connection_for_peer(
 /// Tests request-response patterns with performance comparisons
 #[tokio::test]
 async fn test_ask_with_lookup_and_performance() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .try_init();
     let _guard = TEST_MUTEX
         .get_or_init(|| tokio::sync::Mutex::new(()))
         .lock()
@@ -99,7 +125,8 @@ async fn test_ask_with_lookup_and_performance() {
         .await
         .unwrap();
 
-    sleep(Duration::from_millis(200)).await;
+    wait_for_active_peers(&node2, 1, Duration::from_secs(2)).await;
+    wait_for_active_peers(&node3, 1, Duration::from_secs(2)).await;
     println!("✅ All nodes connected");
 
     // Register service actors
@@ -137,6 +164,12 @@ async fn test_ask_with_lookup_and_performance() {
 
     // Wait for propagation
     sleep(Duration::from_millis(100)).await;
+    println!(
+        "   🔍 Stats after registration:\n      node1={:?}\n      node2={:?}\n      node3={:?}",
+        node1.stats().await,
+        node2.stats().await,
+        node3.stats().await
+    );
 
     // ===========================================
     // PART 1: CREATE ACTOR REFS WITH LOOKUP
@@ -148,14 +181,31 @@ async fn test_ask_with_lookup_and_performance() {
 
     // Lookup actors and create connections
     let db_location = wait_for_lookup(&node1, "database_service", Duration::from_secs(2)).await;
-    let db_conn = get_connection_for_peer(&node1, &db_location.peer_id, &node1_id, "127.0.0.1:30001".parse().unwrap()).await;
+    let db_conn = get_connection_for_peer(
+        &node1,
+        &db_location.peer_id,
+        &node1_id,
+        "127.0.0.1:30001".parse().unwrap(),
+    )
+    .await;
 
-    let compute_location =
-        wait_for_lookup(&node1, "compute_service", Duration::from_secs(2)).await;
-    let compute_conn = get_connection_for_peer(&node1, &compute_location.peer_id, &node1_id, "127.0.0.1:30001".parse().unwrap()).await;
+    let compute_location = wait_for_lookup(&node1, "compute_service", Duration::from_secs(2)).await;
+    let compute_conn = get_connection_for_peer(
+        &node1,
+        &compute_location.peer_id,
+        &node1_id,
+        "127.0.0.1:30001".parse().unwrap(),
+    )
+    .await;
 
     let cache_location = wait_for_lookup(&node1, "cache_service", Duration::from_secs(2)).await;
-    let cache_conn = get_connection_for_peer(&node1, &cache_location.peer_id, &node1_id, "127.0.0.1:30001".parse().unwrap()).await;
+    let cache_conn = get_connection_for_peer(
+        &node1,
+        &cache_location.peer_id,
+        &node1_id,
+        "127.0.0.1:30001".parse().unwrap(),
+    )
+    .await;
 
     let lookup_time = lookup_start.elapsed();
 

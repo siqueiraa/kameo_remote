@@ -19,8 +19,7 @@ mod tests {
     fn typed_roundtrip_ok() {
         let msg = Ping { id: 7 };
         let payload = encode_typed(&msg).expect("encode_typed should succeed");
-        let decoded: Ping =
-            decode_typed(payload.as_ref()).expect("decode_typed should succeed");
+        let decoded: Ping = decode_typed(payload.as_ref()).expect("decode_typed should succeed");
         assert_eq!(decoded, msg);
     }
 

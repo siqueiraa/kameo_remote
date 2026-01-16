@@ -19,6 +19,36 @@ use crate::{
     GossipConfig, GossipError, RegistrationPriority, RemoteActorLocation, Result,
 };
 
+const REGISTRY_MESSAGE_ALIGNMENT: usize = {
+    let message_align = std::mem::align_of::<rkyv::Archived<RegistryMessage>>();
+    let location_align = std::mem::align_of::<rkyv::Archived<RemoteActorLocation>>();
+    if message_align > location_align {
+        message_align
+    } else {
+        location_align
+    }
+};
+type RegistryAlignedVec = rkyv::util::AlignedVec<{ REGISTRY_MESSAGE_ALIGNMENT }>;
+
+#[inline]
+fn decode_registry_message(
+    payload: &[u8],
+) -> std::result::Result<RegistryMessage, rkyv::rancor::Error> {
+    if is_registry_payload_aligned(payload) {
+        rkyv::from_bytes::<RegistryMessage, rkyv::rancor::Error>(payload)
+    } else {
+        let mut aligned = RegistryAlignedVec::with_capacity(payload.len());
+        aligned.extend_from_slice(payload);
+        rkyv::from_bytes::<RegistryMessage, rkyv::rancor::Error>(aligned.as_ref())
+    }
+}
+
+#[inline]
+fn is_registry_payload_aligned(payload: &[u8]) -> bool {
+    let ptr = payload.as_ptr() as usize;
+    ptr.is_multiple_of(REGISTRY_MESSAGE_ALIGNMENT)
+}
+
 /// Per-connection streaming state for managing partial streams
 #[derive(Debug)]
 struct StreamingState {
@@ -930,7 +960,11 @@ where
                     false
                 }
             } else {
-                pool.add_connection_by_peer_id(peer_id.clone(), peer_state_addr, connection_arc.clone());
+                pool.add_connection_by_peer_id(
+                    peer_id.clone(),
+                    peer_state_addr,
+                    connection_arc.clone(),
+                );
                 true
             }
         };
@@ -1204,6 +1238,7 @@ where
 }
 
 /// Result type for message reading that can handle gossip, actor, and streaming messages
+#[derive(Debug)]
 pub(crate) enum MessageReadResult {
     Gossip(RegistryMessage, Option<u16>),
     AskRaw {
@@ -1372,7 +1407,7 @@ where
         let payload = msg_data.slice(crate::framing::ASK_RESPONSE_HEADER_LEN..);
 
         // Try to deserialize as RegistryMessage first (Ask wrapper for gossip)
-        match rkyv::from_bytes::<RegistryMessage, rkyv::rancor::Error>(payload.as_ref()) {
+        match decode_registry_message(payload.as_ref()) {
             Ok(msg) => {
                 debug!(
                     correlation_id = correlation_id,
@@ -1380,10 +1415,11 @@ where
                 );
                 Ok(MessageReadResult::Gossip(msg, Some(correlation_id)))
             }
-            Err(_) => {
+            Err(err) => {
                 debug!(
                     correlation_id = correlation_id,
                     payload_len = payload.len(),
+                    error = %err,
                     "Received raw Ask payload"
                 );
                 Ok(MessageReadResult::AskRaw {
@@ -1415,11 +1451,16 @@ where
                         if msg_data.len() >= crate::framing::GOSSIP_HEADER_LEN {
                             // Create a properly aligned buffer for the payload
                             let payload = msg_data.slice(crate::framing::GOSSIP_HEADER_LEN..);
-                            match rkyv::from_bytes::<RegistryMessage, rkyv::rancor::Error>(
-                                payload.as_ref(),
-                            ) {
+                            match decode_registry_message(payload.as_ref()) {
                                 Ok(msg) => return Ok(MessageReadResult::Gossip(msg, None)),
-                                Err(_) => return Ok(MessageReadResult::Raw(msg_data)),
+                                Err(err) => {
+                                    debug!(
+                                        payload_len = payload.len(),
+                                        error = %err,
+                                        "Failed to decode gossip payload"
+                                    );
+                                    return Ok(MessageReadResult::Raw(msg_data));
+                                }
                             }
                         } else {
                             return Ok(MessageReadResult::Raw(msg_data));
@@ -1480,18 +1521,17 @@ where
                         };
 
                         // Extract chunk data (everything after the header)
-                        let chunk_data =
-                            if msg_data.len()
-                                > crate::framing::STREAM_HEADER_PREFIX_LEN
-                                    + crate::StreamHeader::SERIALIZED_SIZE
-                            {
-                                msg_data.slice(
-                                    crate::framing::STREAM_HEADER_PREFIX_LEN
-                                        + crate::StreamHeader::SERIALIZED_SIZE..,
-                                )
-                            } else {
-                                bytes::Bytes::new()
-                            };
+                        let chunk_data = if msg_data.len()
+                            > crate::framing::STREAM_HEADER_PREFIX_LEN
+                                + crate::StreamHeader::SERIALIZED_SIZE
+                        {
+                            msg_data.slice(
+                                crate::framing::STREAM_HEADER_PREFIX_LEN
+                                    + crate::StreamHeader::SERIALIZED_SIZE..,
+                            )
+                        } else {
+                            bytes::Bytes::new()
+                        };
 
                         return Ok(MessageReadResult::Streaming {
                             msg_type: first_byte,
@@ -1514,7 +1554,7 @@ where
 #[cfg(test)]
 mod framing_tests {
     use super::{read_message_from_tls_reader, MessageReadResult};
-    use crate::{framing, MessageType};
+    use crate::{framing, registry::RegistryMessage, MessageType};
     use tokio::io::AsyncWriteExt;
 
     async fn read_frame(frame: Vec<u8>) -> MessageReadResult {
@@ -1530,8 +1570,7 @@ mod framing_tests {
     #[tokio::test]
     async fn ask_raw_parses_with_padded_header() {
         let payload_bytes = b"hello";
-        let header =
-            framing::write_ask_response_header(MessageType::Ask, 42, payload_bytes.len());
+        let header = framing::write_ask_response_header(MessageType::Ask, 42, payload_bytes.len());
         let mut frame = Vec::with_capacity(header.len() + payload_bytes.len());
         frame.extend_from_slice(&header);
         frame.extend_from_slice(payload_bytes);
@@ -1601,6 +1640,36 @@ mod framing_tests {
                 assert_eq!(body.as_ref(), payload_bytes);
             }
             _ => panic!("unexpected result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn gossip_registry_payload_deserializes_from_aligned_buffer() {
+        let message = RegistryMessage::ImmediateAck {
+            actor_name: "test_actor".to_string(),
+            success: true,
+        };
+        let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&message).unwrap();
+        let header = framing::write_gossip_frame_prefix(payload.len());
+        let mut frame = Vec::with_capacity(header.len() + payload.len());
+        frame.extend_from_slice(&header);
+        frame.extend_from_slice(&payload);
+
+        match read_frame(frame).await {
+            MessageReadResult::Gossip(parsed, correlation_id) => {
+                assert!(correlation_id.is_none());
+                match parsed {
+                    RegistryMessage::ImmediateAck {
+                        actor_name,
+                        success,
+                    } => {
+                        assert_eq!(actor_name, "test_actor");
+                        assert!(success);
+                    }
+                    other => panic!("unexpected gossip payload: {:?}", other),
+                }
+            }
+            other => panic!("unexpected result: {:?}", other),
         }
     }
 }
