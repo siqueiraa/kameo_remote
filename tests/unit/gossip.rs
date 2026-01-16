@@ -1,5 +1,5 @@
 use kameo_remote::registry::*;
-use kameo_remote::{ActorLocation, GossipConfig, GossipError, RegistrationPriority};
+use kameo_remote::{ActorLocation, GossipConfig, GossipError, KeyPair, RegistrationPriority};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
@@ -19,6 +19,13 @@ fn create_test_actor_location(addr: SocketAddr) -> ActorLocation {
         wall_clock_time: kameo_remote::current_timestamp(),
         priority: RegistrationPriority::Normal,
         local_registration_time: 0,
+    }
+}
+
+fn test_config(seed: &str) -> GossipConfig {
+    GossipConfig {
+        key_pair: Some(KeyPair::new_for_testing(seed)),
+        ..Default::default()
     }
 }
 
@@ -491,7 +498,7 @@ fn test_gossip_error_types() {
 #[tokio::test]
 async fn test_complex_gossip_scenario() {
     let bind_addr = "127.0.0.1:0".parse().unwrap();
-    let config = GossipConfig::default();
+    let config = test_config("unit_gossip_complex");
     let registry = GossipRegistry::new(bind_addr, config);
     
     // Add some peers
@@ -542,7 +549,7 @@ async fn test_complex_gossip_scenario() {
 #[tokio::test]
 async fn test_gossip_state_transitions() {
     let bind_addr = "127.0.0.1:0".parse().unwrap();
-    let config = GossipConfig::default();
+    let config = test_config("unit_gossip_multi");
     let registry = GossipRegistry::new(bind_addr, config);
     
     // Initial state

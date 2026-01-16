@@ -6,14 +6,14 @@ use std::net::SocketAddr;
 /// For remote actors, we need to know their address and which peer is hosting them
 #[derive(Archive, RkyvSerialize, RkyvDeserialize, Debug, Clone, PartialEq)]
 pub struct RemoteActorLocation {
-    pub address: String, // Use String instead of SocketAddr for rkyv compatibility
-    pub peer_id: crate::PeerId, // Which peer is hosting this actor
-    pub node_id: NodeId, // Node ID for vector clock operations
-    pub vector_clock: VectorClock, // Vector clock for causal ordering
-    pub wall_clock_time: u64, // Still needed for TTL calculations
+    pub address: String,                // Use String for rkyv serialization
+    pub peer_id: crate::PeerId,         // Which peer is hosting this actor
+    pub node_id: NodeId,                // Node ID for vector clock operations
+    pub vector_clock: VectorClock,      // Vector clock for causal ordering
+    pub wall_clock_time: u64,           // Still needed for TTL calculations
     pub priority: RegistrationPriority, // Registration priority for propagation
-    pub local_registration_time: u128, // Precise registration time for timing measurements
-    pub metadata: Vec<u8>, // Optional metadata (e.g., serialized ActorId)
+    pub local_registration_time: u128,  // Precise registration time for timing measurements
+    pub metadata: Vec<u8>,              // Optional metadata (e.g., serialized ActorId)
 }
 
 impl RemoteActorLocation {
@@ -98,16 +98,12 @@ impl RemoteActorLocation {
         }
     }
 
-    /// Temporary constructor for backward compatibility - will be removed
-    #[deprecated(note = "Use new_with_peer instead")]
-    pub fn new(address: SocketAddr) -> Self {
-        // Use a dummy peer_id for now
-        Self::new_with_peer(address, crate::PeerId::new("unknown"))
-    }
-
     /// Create with specific priority
-    pub fn new_with_priority(address: SocketAddr, priority: RegistrationPriority) -> Self {
-        let peer_id = crate::PeerId::new("unknown");
+    pub fn new_with_priority(
+        address: SocketAddr,
+        peer_id: crate::PeerId,
+        priority: RegistrationPriority,
+    ) -> Self {
         let node_id = peer_id
             .to_verifying_key()
             .ok()
@@ -136,8 +132,7 @@ impl RemoteActorLocation {
     }
 
     /// Create with current wall clock time
-    pub fn new_with_wall_time(address: SocketAddr, wall_time: u64) -> Self {
-        let peer_id = crate::PeerId::new("unknown");
+    pub fn new_with_wall_time(address: SocketAddr, peer_id: crate::PeerId, wall_time: u64) -> Self {
         let node_id = peer_id
             .to_verifying_key()
             .ok()
@@ -168,10 +163,10 @@ impl RemoteActorLocation {
     /// Create with both wall time and priority
     pub fn new_with_wall_time_and_priority(
         address: SocketAddr,
+        peer_id: crate::PeerId,
         wall_time: u64,
         priority: RegistrationPriority,
     ) -> Self {
-        let peer_id = crate::PeerId::new("unknown");
         let node_id = peer_id
             .to_verifying_key()
             .ok()
@@ -193,7 +188,7 @@ impl RemoteActorLocation {
         }
     }
 
-    /// Get the socket address as a SocketAddr (for compatibility)
+    /// Get the socket address as a SocketAddr
     pub fn socket_addr(&self) -> Result<SocketAddr, std::net::AddrParseError> {
         self.address.parse()
     }
@@ -206,7 +201,8 @@ mod tests {
     #[test]
     fn test_actor_location_new() {
         let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-        let location = RemoteActorLocation::new_with_peer(addr, crate::PeerId::new("test_peer"));
+        let peer_id = crate::KeyPair::new_for_testing("test_peer").peer_id();
+        let location = RemoteActorLocation::new_with_peer(addr, peer_id);
 
         assert_eq!(location.address, addr.to_string());
         assert_eq!(location.priority, RegistrationPriority::Normal);
@@ -217,8 +213,9 @@ mod tests {
     #[test]
     fn test_actor_location_new_with_priority() {
         let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let peer_id = crate::KeyPair::new_for_testing("test_peer").peer_id();
         let location =
-            RemoteActorLocation::new_with_priority(addr, RegistrationPriority::Immediate);
+            RemoteActorLocation::new_with_priority(addr, peer_id, RegistrationPriority::Immediate);
 
         assert_eq!(location.address, addr.to_string());
         assert_eq!(location.priority, RegistrationPriority::Immediate);
@@ -230,7 +227,8 @@ mod tests {
     fn test_actor_location_new_with_wall_time() {
         let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         let wall_time = 12345678;
-        let location = RemoteActorLocation::new_with_wall_time(addr, wall_time);
+        let peer_id = crate::KeyPair::new_for_testing("test_peer").peer_id();
+        let location = RemoteActorLocation::new_with_wall_time(addr, peer_id, wall_time);
 
         assert_eq!(location.address, addr.to_string());
         assert_eq!(location.wall_clock_time, wall_time);
@@ -242,8 +240,10 @@ mod tests {
     fn test_actor_location_new_with_wall_time_and_priority() {
         let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         let wall_time = 12345678;
+        let peer_id = crate::KeyPair::new_for_testing("test_peer").peer_id();
         let location = RemoteActorLocation::new_with_wall_time_and_priority(
             addr,
+            peer_id,
             wall_time,
             RegistrationPriority::Immediate,
         );
@@ -257,8 +257,9 @@ mod tests {
     #[test]
     fn test_actor_location_clone() {
         let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let peer_id = crate::KeyPair::new_for_testing("test_peer").peer_id();
         let location =
-            RemoteActorLocation::new_with_priority(addr, RegistrationPriority::Immediate);
+            RemoteActorLocation::new_with_priority(addr, peer_id, RegistrationPriority::Immediate);
         let cloned = location.clone();
 
         assert_eq!(location.address, cloned.address);
@@ -275,7 +276,7 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
 
         // Create with specific values to test equality
-        let peer_id = crate::PeerId::new("test_peer");
+        let peer_id = crate::KeyPair::new_for_testing("test_peer").peer_id();
         let node_id = peer_id
             .to_verifying_key()
             .ok()
@@ -334,7 +335,8 @@ mod tests {
     #[test]
     fn test_actor_location_debug() {
         let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-        let location = RemoteActorLocation::new_with_peer(addr, crate::PeerId::new("test_peer"));
+        let peer_id = crate::KeyPair::new_for_testing("test_peer").peer_id();
+        let location = RemoteActorLocation::new_with_peer(addr, peer_id);
         let debug_str = format!("{:?}", location);
 
         assert!(debug_str.contains("RemoteActorLocation"));
@@ -345,8 +347,9 @@ mod tests {
     #[test]
     fn test_actor_location_serialization() {
         let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let peer_id = crate::KeyPair::new_for_testing("test_peer").peer_id();
         let location =
-            RemoteActorLocation::new_with_priority(addr, RegistrationPriority::Immediate);
+            RemoteActorLocation::new_with_priority(addr, peer_id, RegistrationPriority::Immediate);
 
         let serialized = rkyv::to_bytes::<rkyv::rancor::Error>(&location).unwrap();
         let deserialized: RemoteActorLocation =
@@ -366,11 +369,8 @@ mod tests {
     fn test_actor_location_with_metadata() {
         let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         let metadata = vec![0x12, 0x34, 0x56, 0x78];
-        let location = RemoteActorLocation::new_with_metadata(
-            addr,
-            crate::PeerId::new("test_peer"),
-            metadata.clone(),
-        );
+        let peer_id = crate::KeyPair::new_for_testing("test_peer").peer_id();
+        let location = RemoteActorLocation::new_with_metadata(addr, peer_id, metadata.clone());
 
         assert_eq!(location.address, addr.to_string());
         assert_eq!(location.metadata, metadata);

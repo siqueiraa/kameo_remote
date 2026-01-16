@@ -1,4 +1,4 @@
-use kameo_remote::{GossipRegistryHandle, GossipConfig, RegistrationPriority};
+use kameo_remote::{GossipConfig, GossipRegistryHandle, KeyPair, RegistrationPriority};
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -24,25 +24,38 @@ async fn test_node_b_killed_a_detects_immediately() {
     };
     
     // Start node A
-    let handle_a = GossipRegistryHandle::new(
+    let keypair_a = KeyPair::new_for_testing("conn_fail_a");
+    let peer_id_a = keypair_a.peer_id();
+    let handle_a = GossipRegistryHandle::new_with_keypair(
         "127.0.0.1:0".parse().unwrap(),
-        vec![],
+        keypair_a,
         Some(config.clone()),
-    ).await.expect("Failed to create node A");
+    )
+    .await
+    .expect("Failed to create node A");
     
     let node_a_addr = handle_a.registry.bind_addr;
     eprintln!("Node A started at {}", node_a_addr);
     
     // Start node B with A as bootstrap peer (this triggers immediate connection)
-    let handle_b = GossipRegistryHandle::new(
+    let keypair_b = KeyPair::new_for_testing("conn_fail_b");
+    let peer_id_b = keypair_b.peer_id();
+    let handle_b = GossipRegistryHandle::new_with_keypair(
         "127.0.0.1:0".parse().unwrap(),
-        vec![node_a_addr], // Bootstrap with A
+        keypair_b,
         Some(config.clone()),
-    ).await.expect("Failed to create node B");
+    )
+    .await
+    .expect("Failed to create node B");
     
     let node_b_addr = handle_b.registry.bind_addr;
     eprintln!("Node B started at {} with A as bootstrap peer", node_b_addr);
     
+    let peer_a = handle_b.add_peer(&peer_id_a).await;
+    peer_a.connect(&node_a_addr).await.expect("Failed to connect B to A");
+    let peer_b = handle_a.add_peer(&peer_id_b).await;
+    peer_b.connect(&node_b_addr).await.expect("Failed to connect A to B");
+
     // Wait for connection establishment
     eprintln!("Waiting for connection establishment...");
     sleep(Duration::from_millis(500)).await;
@@ -108,20 +121,33 @@ async fn test_node_a_killed_b_detects_immediately() {
     };
     
     // Start node B first (it will be the "server")
-    let handle_b = GossipRegistryHandle::new(
+    let keypair_b = KeyPair::new_for_testing("conn_fail_b_server");
+    let peer_id_b = keypair_b.peer_id();
+    let handle_b = GossipRegistryHandle::new_with_keypair(
         "127.0.0.1:0".parse().unwrap(),
-        vec![], // B starts with no peers
+        keypair_b,
         Some(config.clone()),
-    ).await.expect("Failed to create node B");
+    )
+    .await
+    .expect("Failed to create node B");
     
     let node_b_addr = handle_b.registry.bind_addr;
     
     // Start node A connecting to B (like NAT scenario)
-    let handle_a = GossipRegistryHandle::new(
+    let keypair_a = KeyPair::new_for_testing("conn_fail_a_client");
+    let peer_id_a = keypair_a.peer_id();
+    let handle_a = GossipRegistryHandle::new_with_keypair(
         "127.0.0.1:0".parse().unwrap(),
-        vec![node_b_addr], // A connects to B on startup
+        keypair_a,
         Some(config.clone()),
-    ).await.expect("Failed to create node A");
+    )
+    .await
+    .expect("Failed to create node A");
+
+    let peer_b = handle_a.add_peer(&peer_id_b).await;
+    peer_b.connect(&node_b_addr).await.expect("Failed to connect A to B");
+    let peer_a = handle_b.add_peer(&peer_id_a).await;
+    peer_a.connect(&handle_a.registry.bind_addr).await.expect("Failed to connect B to A");
     
     // Wait for initial connection attempt
     sleep(Duration::from_millis(500)).await;
@@ -218,20 +244,33 @@ async fn test_nat_scenario_bidirectional_communication() {
     };
     
     // Start node B (public node)
-    let handle_b = GossipRegistryHandle::new(
+    let keypair_b = KeyPair::new_for_testing("nat_public_b");
+    let peer_id_b = keypair_b.peer_id();
+    let handle_b = GossipRegistryHandle::new_with_keypair(
         "127.0.0.1:0".parse().unwrap(),
-        vec![],
+        keypair_b,
         Some(config.clone()),
-    ).await.expect("Failed to create node B");
+    )
+    .await
+    .expect("Failed to create node B");
     
     let node_b_addr = handle_b.registry.bind_addr;
     
     // Start node A (behind NAT) - only connects to B, doesn't accept incoming
-    let handle_a = GossipRegistryHandle::new(
+    let keypair_a = KeyPair::new_for_testing("nat_private_a");
+    let peer_id_a = keypair_a.peer_id();
+    let handle_a = GossipRegistryHandle::new_with_keypair(
         "127.0.0.1:0".parse().unwrap(),
-        vec![node_b_addr], // A connects to B
+        keypair_a,
         Some(config.clone()),
-    ).await.expect("Failed to create node A");
+    )
+    .await
+    .expect("Failed to create node A");
+
+    let peer_b = handle_a.add_peer(&peer_id_b).await;
+    peer_b.connect(&node_b_addr).await.expect("Failed to connect A to B");
+    let peer_a = handle_b.add_peer(&peer_id_a).await;
+    peer_a.connect(&handle_a.registry.bind_addr).await.expect("Failed to connect B to A");
     
     // Important: B should NOT try to connect to A (simulating NAT)
     // The connection is only initiated by A

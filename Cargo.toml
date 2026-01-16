@@ -26,7 +26,7 @@ tracing = "0.1.41"
 uuid = { version = "1.17.0", features = ["serde", "v4"] }
 
 # TLS and cryptographic dependencies
-rustls = { version = "0.23", features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tokio-rustls = "0.26"
 data-encoding = "2.5"  # For BASE32 DNS encoding
 zeroize = { version = "1.7", features = ["derive"] }  # For secure key handling

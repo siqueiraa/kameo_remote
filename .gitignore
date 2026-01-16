@@ -5,3 +5,4 @@ Cargo.lock
 sprints/
 qa/
 spec/
+.DS_Store

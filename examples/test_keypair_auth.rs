@@ -45,7 +45,8 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let server_addr: SocketAddr = "127.0.0.1:29501".parse()?;
-    let registry = GossipRegistryHandle::new(server_addr, vec![], Some(config)).await?;
+    let registry =
+        GossipRegistryHandle::new_with_keypair(server_addr, server_keypair, Some(config)).await?;
 
     // Register test actors
     registry
@@ -90,12 +91,13 @@ async fn run_client_with_valid_keypair() -> Result<(), Box<dyn std::error::Error
     println!();
 
     let config = GossipConfig {
-        key_pair: Some(client_keypair),
+        key_pair: Some(client_keypair.clone()),
         ..Default::default()
     };
 
     let client_addr: SocketAddr = "127.0.0.1:29504".parse()?;
-    let registry = GossipRegistryHandle::new(client_addr, vec![], Some(config)).await?;
+    let registry =
+        GossipRegistryHandle::new_with_keypair(client_addr, client_keypair, Some(config)).await?;
 
     // Connect to server
     let server_keypair = KeyPair::new_for_testing("test_server_2025");
@@ -168,12 +170,13 @@ async fn run_client_with_invalid_keypair() -> Result<(), Box<dyn std::error::Err
 
     // Use the actual keypair but will try to claim the wrong identity
     let config = GossipConfig {
-        key_pair: Some(actual_keypair),
+        key_pair: Some(actual_keypair.clone()),
         ..Default::default()
     };
 
     let client_addr: SocketAddr = "127.0.0.1:29505".parse()?;
-    let registry = GossipRegistryHandle::new(client_addr, vec![], Some(config)).await?;
+    let registry =
+        GossipRegistryHandle::new_with_keypair(client_addr, actual_keypair, Some(config)).await?;
 
     // Connect to server
     let server_keypair = KeyPair::new_for_testing("test_server_2025");

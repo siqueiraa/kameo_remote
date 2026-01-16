@@ -1,71 +1,7 @@
-use kameo_remote::{GossipConfig, GossipRegistryHandle, MessageType, Result};
-use std::net::SocketAddr;
+use kameo_remote::{GossipConfig, GossipRegistryHandle, KeyPair, Result};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
 use tracing::info;
-
-/// Simple test echo server that adds 1 to received integers
-async fn start_echo_server() -> Result<SocketAddr> {
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-
-    tokio::spawn(async move {
-        while let Ok((stream, peer)) = listener.accept().await {
-            tokio::spawn(handle_echo_client(stream, peer));
-        }
-    });
-
-    Ok(addr)
-}
-
-async fn handle_echo_client(mut stream: TcpStream, peer: SocketAddr) {
-    info!("Echo server: new client from {}", peer);
-    let mut buffer = vec![0u8; 4096];
-
-    while (stream.read_exact(&mut buffer[..4]).await).is_ok() {
-        let msg_len = u32::from_be_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]) as usize;
-        if msg_len > buffer.len() {
-            buffer.resize(msg_len, 0);
-        }
-
-        // Read message
-        if stream.read_exact(&mut buffer[..msg_len]).await.is_err() {
-            break;
-        }
-
-        // Parse header
-        if msg_len < 8 {
-            continue;
-        }
-
-        let msg_type = buffer[0];
-        let correlation_id = u16::from_be_bytes([buffer[1], buffer[2]]);
-        let payload = &buffer[8..msg_len];
-
-        if msg_type == MessageType::Ask as u8 && payload.len() >= 4 {
-            // Parse integer
-            let value = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
-            let response_value = value + 1;
-
-            // Build response
-            let response_payload = response_value.to_be_bytes();
-            let response_size = 8 + response_payload.len();
-            let mut response = Vec::with_capacity(4 + response_size);
-
-            response.extend_from_slice(&(response_size as u32).to_be_bytes());
-            response.push(MessageType::Response as u8);
-            response.extend_from_slice(&correlation_id.to_be_bytes());
-            response.extend_from_slice(&[0u8; 5]);
-            response.extend_from_slice(&response_payload);
-
-            if stream.write_all(&response).await.is_err() {
-                break;
-            }
-        }
-    }
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_batch_ask_simple() -> Result<()> {
@@ -74,14 +10,20 @@ async fn test_batch_ask_simple() -> Result<()> {
         .try_init()
         .ok();
 
-    // Start echo server
-    let echo_addr = start_echo_server().await?;
-    info!("Echo server started on {}", echo_addr);
-
-    // Start gossip registry
-    let registry = GossipRegistryHandle::new(
+    // Start gossip registry client
+    let key_pair = KeyPair::new_for_testing("batch_ask_simple_client");
+    let registry = GossipRegistryHandle::new_with_keypair(
         "127.0.0.1:0".parse().unwrap(),
-        vec![],
+        key_pair,
+        Some(GossipConfig::default()),
+    )
+    .await?;
+
+    // Start gossip registry server
+    let server_key_pair = KeyPair::new_for_testing("batch_ask_simple_server");
+    let server = GossipRegistryHandle::new_with_keypair(
+        "127.0.0.1:0".parse().unwrap(),
+        server_key_pair,
         Some(GossipConfig::default()),
     )
     .await?;
@@ -90,8 +32,13 @@ async fn test_batch_ask_simple() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Get connection
-    let conn = registry.get_connection(echo_addr).await?;
-    info!("Connected to echo server");
+    let server_peer_id = server.registry.peer_id.clone();
+    let server_addr = server.registry.bind_addr;
+    let peer = registry.add_peer(&server_peer_id).await;
+    peer.connect(&server_addr).await?;
+
+    let conn = registry.get_connection_to_peer(&server_peer_id).await?;
+    info!("Connected to server via TLS");
 
     // Test 1: Single ask
     {
@@ -248,6 +195,7 @@ async fn test_batch_ask_simple() -> Result<()> {
 
     // Cleanup
     registry.shutdown().await;
+    server.shutdown().await;
 
     Ok(())
 }
@@ -259,16 +207,32 @@ async fn test_batch_ask_with_timeout() -> Result<()> {
         .try_init()
         .ok();
 
-    // Start echo server
-    let echo_addr = start_echo_server().await?;
+    // Start registry client
+    let key_pair = KeyPair::new_for_testing("batch_ask_simple_alt_client");
+    let registry = GossipRegistryHandle::new_with_keypair(
+        "127.0.0.1:0".parse().unwrap(),
+        key_pair,
+        Some(GossipConfig::default()),
+    )
+    .await?;
 
-    // Start registry
-    let registry = GossipRegistryHandle::new("127.0.0.1:0".parse().unwrap(), vec![], None).await?;
+    // Start registry server
+    let server_key_pair = KeyPair::new_for_testing("batch_ask_simple_alt_server");
+    let server = GossipRegistryHandle::new_with_keypair(
+        "127.0.0.1:0".parse().unwrap(),
+        server_key_pair,
+        Some(GossipConfig::default()),
+    )
+    .await?;
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Get connection
-    let conn = registry.get_connection(echo_addr).await?;
+    let server_peer_id = server.registry.peer_id.clone();
+    let server_addr = server.registry.bind_addr;
+    let peer = registry.add_peer(&server_peer_id).await;
+    peer.connect(&server_addr).await?;
+    let conn = registry.get_connection_to_peer(&server_peer_id).await?;
 
     // Test batch with timeout
     let requests: Vec<Vec<u8>> = (0..5u32).map(|i| i.to_be_bytes().to_vec()).collect();
@@ -295,6 +259,7 @@ async fn test_batch_ask_with_timeout() -> Result<()> {
 
     // Cleanup
     registry.shutdown().await;
+    server.shutdown().await;
 
     Ok(())
 }

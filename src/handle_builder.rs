@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 /// Builder for creating a GossipRegistryHandle with proper peer configuration
 pub struct GossipRegistryBuilder {
     bind_addr: SocketAddr,
-    peers: Vec<(String, SocketAddr)>,
+    peers: Vec<(PeerId, SocketAddr)>,
     config: Option<GossipConfig>,
 }
 
@@ -25,24 +25,27 @@ impl GossipRegistryBuilder {
     }
 
     /// Add a peer with a specific ID and address
-    pub fn add_peer(mut self, peer_id: &str, addr: SocketAddr) -> Self {
-        self.peers.push((peer_id.to_string(), addr));
+    pub fn add_peer(mut self, peer_id: PeerId, addr: SocketAddr) -> Self {
+        self.peers.push((peer_id, addr));
         self
     }
 
     /// Build and start the gossip registry
     pub async fn build(self) -> Result<GossipRegistryHandle> {
-        // Create the handle with empty peers
-        let handle = GossipRegistryHandle::new(
-            self.bind_addr,
-            vec![], // Always empty to avoid auto-generated names
-            self.config,
-        )
-        .await?;
+        let config = self.config.unwrap_or_default();
+        let keypair = config
+            .key_pair
+            .as_ref()
+            .ok_or_else(|| crate::GossipError::InvalidKeyPair("missing key_pair".to_string()))?;
+        let secret_key = keypair.to_secret_key();
+
+        // Create the handle with TLS enabled
+        let handle =
+            GossipRegistryHandle::new_with_tls(self.bind_addr, secret_key, Some(config)).await?;
 
         // Add peers with proper IDs
         for (peer_id, addr) in self.peers {
-            let peer = handle.add_peer(&PeerId::new(&peer_id)).await;
+            let peer = handle.add_peer(&peer_id).await;
             // Try to connect but don't fail if the peer isn't up yet
             let _ = peer.connect(&addr).await;
         }
@@ -64,12 +67,17 @@ mod tests {
         let node2_addr = "127.0.0.1:36002".parse().unwrap();
 
         // Create node1 with builder
+        let node1_keypair = crate::KeyPair::new_for_testing("node1");
+        let node2_keypair = crate::KeyPair::new_for_testing("node2");
+        let node1_id = node1_keypair.peer_id();
+        let node2_id = node2_keypair.peer_id();
+
         let handle1 = GossipRegistryBuilder::new(node1_addr)
             .with_config(GossipConfig {
-                key_pair: Some(crate::KeyPair::new_for_testing("node1")),
+                key_pair: Some(node1_keypair),
                 ..Default::default()
             })
-            .add_peer("node2", node2_addr)
+            .add_peer(node2_id, node2_addr)
             .build()
             .await
             .unwrap();
@@ -77,10 +85,10 @@ mod tests {
         // Create node2 with builder
         let handle2 = GossipRegistryBuilder::new(node2_addr)
             .with_config(GossipConfig {
-                key_pair: Some(crate::KeyPair::new_for_testing("node2")),
+                key_pair: Some(node2_keypair),
                 ..Default::default()
             })
-            .add_peer("node1", node1_addr)
+            .add_peer(node1_id, node1_addr)
             .build()
             .await
             .unwrap();

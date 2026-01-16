@@ -1,4 +1,4 @@
-use kameo_remote::{GossipConfig, GossipRegistryHandle, RemoteActorLocation};
+use kameo_remote::{GossipConfig, GossipRegistryHandle, KeyPair, RemoteActorLocation};
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -15,9 +15,17 @@ fn create_test_config() -> GossipConfig {
     }
 }
 
+fn test_keypair(name: &str) -> KeyPair {
+    KeyPair::new_for_testing(name)
+}
+
+fn test_peer_id(name: &str) -> kameo_remote::PeerId {
+    test_keypair(name).peer_id()
+}
+
 /// Helper function to create a test actor location
 fn create_test_actor_location(addr: SocketAddr, peer_name: &str) -> RemoteActorLocation {
-    let peer_id = kameo_remote::PeerId::new(peer_name);
+    let peer_id = test_peer_id(peer_name);
     RemoteActorLocation::new_with_peer(addr, peer_id)
 }
 
@@ -34,28 +42,36 @@ async fn test_register_actor_sync_real_single_peer() {
     let config = create_test_config();
 
     // Start first node
-    let handle1 = GossipRegistryHandle::new(node1_addr, vec![], Some(config.clone()))
-        .await
-        .expect("Failed to start node1");
+    let handle1 = GossipRegistryHandle::new_with_keypair(
+        node1_addr,
+        test_keypair("node1"),
+        Some(config.clone()),
+    )
+    .await
+    .expect("Failed to start node1");
     let node1_actual_addr = handle1.registry.bind_addr;
     println!("✅ Node1 started on {}", node1_actual_addr);
 
     // Start second node
-    let handle2 = GossipRegistryHandle::new(node2_addr, vec![], Some(config.clone()))
-        .await
-        .expect("Failed to start node2");
+    let handle2 = GossipRegistryHandle::new_with_keypair(
+        node2_addr,
+        test_keypair("node2"),
+        Some(config.clone()),
+    )
+    .await
+    .expect("Failed to start node2");
     let node2_actual_addr = handle2.registry.bind_addr;
     println!("✅ Node2 started on {}", node2_actual_addr);
 
     // Connect nodes as peers
-    let peer2_id = kameo_remote::PeerId::new("node2");
+    let peer2_id = test_peer_id("node2");
     let peer2 = handle1.add_peer(&peer2_id).await;
     peer2
         .connect(&node2_actual_addr)
         .await
         .expect("Failed to connect to node2");
 
-    let peer1_id = kameo_remote::PeerId::new("node1");
+    let peer1_id = test_peer_id("node1");
     let peer1 = handle2.add_peer(&peer1_id).await;
     peer1
         .connect(&node1_actual_addr)
@@ -139,9 +155,13 @@ async fn test_register_actor_sync_real_no_peers_vs_with_peers() {
 
     // === TEST 1: No peers - should be immediate ===
     let solo_addr = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
-    let solo_handle = GossipRegistryHandle::new(solo_addr, vec![], Some(config.clone()))
-        .await
-        .expect("Failed to start solo node");
+    let solo_handle = GossipRegistryHandle::new_with_keypair(
+        solo_addr,
+        test_keypair("solo"),
+        Some(config.clone()),
+    )
+    .await
+    .expect("Failed to start solo node");
     let solo_actual_addr = solo_handle.registry.bind_addr;
 
     println!("✅ Solo node started on {}", solo_actual_addr);
@@ -171,25 +191,33 @@ async fn test_register_actor_sync_real_no_peers_vs_with_peers() {
     let node1_addr = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
     let node2_addr = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
 
-    let handle1 = GossipRegistryHandle::new(node1_addr, vec![], Some(config.clone()))
-        .await
-        .expect("Failed to start node1");
+    let handle1 = GossipRegistryHandle::new_with_keypair(
+        node1_addr,
+        test_keypair("node1"),
+        Some(config.clone()),
+    )
+    .await
+    .expect("Failed to start node1");
     let node1_actual_addr = handle1.registry.bind_addr;
 
-    let handle2 = GossipRegistryHandle::new(node2_addr, vec![], Some(config.clone()))
-        .await
-        .expect("Failed to start node2");
+    let handle2 = GossipRegistryHandle::new_with_keypair(
+        node2_addr,
+        test_keypair("node2"),
+        Some(config.clone()),
+    )
+    .await
+    .expect("Failed to start node2");
     let node2_actual_addr = handle2.registry.bind_addr;
 
     // Connect as peers
-    let peer2_id = kameo_remote::PeerId::new("node2");
+    let peer2_id = test_peer_id("node2");
     let peer2 = handle1.add_peer(&peer2_id).await;
     peer2
         .connect(&node2_actual_addr)
         .await
         .expect("Failed to connect to node2");
 
-    let peer1_id = kameo_remote::PeerId::new("node1");
+    let peer1_id = test_peer_id("node1");
     let peer1 = handle2.add_peer(&peer1_id).await;
     peer1
         .connect(&node1_actual_addr)
@@ -269,9 +297,14 @@ async fn test_register_actor_sync_real_multiple_peers() {
 
     for i in 0..4 {
         let addr = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
-        let handle = GossipRegistryHandle::new(addr, vec![], Some(config.clone()))
-            .await
-            .unwrap_or_else(|_| panic!("Failed to start node{}", i));
+        let node_name = format!("node{}", i);
+        let handle = GossipRegistryHandle::new_with_keypair(
+            addr,
+            test_keypair(&node_name),
+            Some(config.clone()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("Failed to start node{}", i));
         let actual_addr = handle.registry.bind_addr;
 
         handles.push(handle);
@@ -283,7 +316,7 @@ async fn test_register_actor_sync_real_multiple_peers() {
     for (i, handle) in handles.iter().enumerate() {
         for (j, addr) in addrs.iter().enumerate() {
             if i != j {
-                let peer_id = kameo_remote::PeerId::new(format!("node{}", j));
+                let peer_id = test_peer_id(&format!("node{}", j));
                 let peer = handle.add_peer(&peer_id).await;
                 peer.connect(addr)
                     .await
@@ -364,27 +397,33 @@ async fn test_register_actor_sync_real_peer_timeout() {
     };
 
     // Start two nodes
-    let handle1 =
-        GossipRegistryHandle::new("127.0.0.1:0".parse().unwrap(), vec![], Some(config.clone()))
-            .await
-            .expect("Failed to start node1");
+    let handle1 = GossipRegistryHandle::new_with_keypair(
+        "127.0.0.1:0".parse().unwrap(),
+        test_keypair("node1_timeout"),
+        Some(config.clone()),
+    )
+    .await
+    .expect("Failed to start node1");
     let node1_addr = handle1.registry.bind_addr;
 
-    let handle2 =
-        GossipRegistryHandle::new("127.0.0.1:0".parse().unwrap(), vec![], Some(config.clone()))
-            .await
-            .expect("Failed to start node2");
+    let handle2 = GossipRegistryHandle::new_with_keypair(
+        "127.0.0.1:0".parse().unwrap(),
+        test_keypair("node2_timeout"),
+        Some(config.clone()),
+    )
+    .await
+    .expect("Failed to start node2");
     let node2_addr = handle2.registry.bind_addr;
 
     // Connect as peers
-    let peer2_id = kameo_remote::PeerId::new("node2");
+    let peer2_id = test_peer_id("node2_timeout");
     let peer2 = handle1.add_peer(&peer2_id).await;
     peer2
         .connect(&node2_addr)
         .await
         .expect("Failed to connect to node2");
 
-    let peer1_id = kameo_remote::PeerId::new("node1");
+    let peer1_id = test_peer_id("node1_timeout");
     let peer1 = handle2.add_peer(&peer1_id).await;
     peer1
         .connect(&node1_addr)

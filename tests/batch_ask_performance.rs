@@ -1,4 +1,4 @@
-use kameo_remote::{GossipConfig, GossipRegistryHandle, Result};
+use kameo_remote::{GossipConfig, GossipRegistryHandle, KeyPair, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -16,15 +16,25 @@ async fn test_batch_ask_performance() -> Result<()> {
 
     // Start server node that will handle ask requests
     let server_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let server_registry =
-        GossipRegistryHandle::new(server_addr, vec![], Some(GossipConfig::default())).await?;
+    let server_keypair = KeyPair::new_for_testing("batch_perf_server");
+    let server_registry = GossipRegistryHandle::new_with_keypair(
+        server_addr,
+        server_keypair,
+        Some(GossipConfig::default()),
+    )
+    .await?;
     let actual_server_addr = server_registry.registry.bind_addr;
     info!("Server started on {}", actual_server_addr);
 
     // Start client node
     let client_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let client_registry =
-        GossipRegistryHandle::new(client_addr, vec![], Some(GossipConfig::default())).await?;
+    let client_keypair = KeyPair::new_for_testing("batch_perf_client");
+    let client_registry = GossipRegistryHandle::new_with_keypair(
+        client_addr,
+        client_keypair,
+        Some(GossipConfig::default()),
+    )
+    .await?;
     let actual_client_addr = client_registry.registry.bind_addr;
     info!("Client started on {}", actual_client_addr);
 
@@ -263,11 +273,23 @@ async fn test_batch_ask_with_timeout() -> Result<()> {
 
     // Start nodes
     let server_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let server = GossipRegistryHandle::new(server_addr, vec![], None).await?;
+    let server_keypair = KeyPair::new_for_testing("batch_perf_server_alt");
+    let server = GossipRegistryHandle::new_with_keypair(
+        server_addr,
+        server_keypair,
+        Some(GossipConfig::default()),
+    )
+    .await?;
     let actual_server_addr = server.registry.bind_addr;
 
     let client_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let client = GossipRegistryHandle::new(client_addr, vec![], None).await?;
+    let client_keypair = KeyPair::new_for_testing("batch_perf_client_alt");
+    let client = GossipRegistryHandle::new_with_keypair(
+        client_addr,
+        client_keypair,
+        Some(GossipConfig::default()),
+    )
+    .await?;
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 

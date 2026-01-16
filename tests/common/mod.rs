@@ -23,23 +23,37 @@ pub async fn create_tls_node(
     let secret_key = SecretKey::generate();
     let private_bytes = secret_key.to_bytes();
     let key_pair = KeyPair::from_private_key_bytes(&private_bytes)
-        .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+        .map_err(Box::<dyn std::error::Error>::from)?;
     config.key_pair = Some(key_pair);
-    let node =
-        GossipRegistryHandle::new_with_tls("127.0.0.1:0".parse()?, secret_key, Some(config)).await?;
+    let node = GossipRegistryHandle::new_with_tls("127.0.0.1:0".parse()?, secret_key, Some(config))
+        .await?;
     Ok(node)
 }
 
 #[allow(dead_code)]
-pub async fn connect_bidirectional(a: &GossipRegistryHandle, b: &GossipRegistryHandle) {
+pub async fn connect_bidirectional(
+    a: &GossipRegistryHandle,
+    b: &GossipRegistryHandle,
+) -> Result<(), Box<dyn std::error::Error>> {
     let addr_a = a.registry.bind_addr;
     let addr_b = b.registry.bind_addr;
+    let peer_id_a = a.registry.peer_id.clone();
+    let peer_id_b = b.registry.peer_id.clone();
 
-    a.registry.add_peer(addr_b).await;
-    b.registry.add_peer(addr_a).await;
+    a.registry
+        .configure_peer(peer_id_b.clone(), addr_b)
+        .await;
+    b.registry
+        .configure_peer(peer_id_a.clone(), addr_a)
+        .await;
 
-    a.bootstrap_non_blocking(vec![addr_b]).await;
-    b.bootstrap_non_blocking(vec![addr_a]).await;
+    let peer_b = a.add_peer(&peer_id_b).await;
+    peer_b.connect(&addr_b).await?;
+
+    let peer_a = b.add_peer(&peer_id_a).await;
+    peer_a.connect(&addr_a).await?;
+
+    Ok(())
 }
 
 #[allow(dead_code)]

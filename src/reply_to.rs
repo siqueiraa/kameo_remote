@@ -1,4 +1,5 @@
-use crate::{GossipError, MessageType, Result};
+use crate::{GossipError, Result};
+use bytes::Bytes;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,27 +16,10 @@ pub struct ReplyTo {
 impl ReplyTo {
     /// Send reply back to the original requester
     pub async fn reply(self, response: &[u8]) -> Result<()> {
-        // Build response message with length prefix + 8-byte header + payload
-        let total_size = 8 + response.len();
-        let mut msg = Vec::with_capacity(4 + total_size);
-
-        // Length prefix (4 bytes)
-        msg.extend_from_slice(&(total_size as u32).to_be_bytes());
-
-        // Header: [type:1][corr_id:2][reserved:5]
-        msg.push(MessageType::Response as u8);
-        msg.extend_from_slice(&self.correlation_id.to_be_bytes());
-        msg.extend_from_slice(&[0u8; 5]); // reserved bytes
-        msg.extend_from_slice(response);
-
-        tracing::info!(
-            "ReplyTo::reply: sending response with correlation_id={} on connection to {}",
-            self.correlation_id,
-            self.connection.addr
-        );
-
-        // Send directly using the connection's raw bytes method
-        let result = self.connection.send_raw_bytes(&msg);
+        let result = self
+            .connection
+            .send_response_bytes(self.correlation_id, Bytes::copy_from_slice(response))
+            .await;
 
         match &result {
             Ok(_) => tracing::info!("ReplyTo::reply: successfully sent response"),
@@ -43,6 +27,25 @@ impl ReplyTo {
         }
 
         result
+    }
+
+    /// Reply using owned bytes without copying the payload.
+    pub async fn reply_bytes(self, response: Bytes) -> Result<()> {
+        self.connection
+            .send_response_bytes(self.correlation_id, response)
+            .await
+    }
+
+    /// Reply with a typed payload (rkyv) and debug-only type hash verification.
+    pub async fn reply_typed<T>(self, value: &T) -> Result<()>
+    where
+        T: crate::typed::WireEncode,
+    {
+        let payload = crate::typed::encode_typed_pooled(value)?;
+        let (payload, prefix, payload_len) = crate::typed::typed_payload_parts::<T>(payload);
+        self.connection
+            .send_response_pooled(self.correlation_id, payload, prefix, payload_len)
+            .await
     }
 
     /// Reply with a serializable type using rkyv
@@ -61,7 +64,8 @@ impl ReplyTo {
     {
         let response =
             rkyv::to_bytes::<rkyv::rancor::Error>(value).map_err(GossipError::Serialization)?;
-        self.reply(&response).await
+        self.reply_bytes(Bytes::copy_from_slice(response.as_ref()))
+            .await
     }
 
     /// Create a reply handle with timeout

@@ -13,7 +13,7 @@ use tokio::{
 };
 
 use kameo_remote::{
-    ActorLocation, GossipConfig, GossipRegistryHandle, RegistrationPriority,
+    ActorLocation, GossipConfig, GossipRegistryHandle, KeyPair, RegistrationPriority,
 };
 
 const TEST_DATA_SIZE: usize = 100 * 1024 * 1024; // 100MB
@@ -72,8 +72,25 @@ async fn test_direct_connection_throughput() {
     let receiver_addr = "127.0.0.1:21001".parse().unwrap();
     let sender_addr = "127.0.0.1:21002".parse().unwrap();
     
-    let receiver_handle = GossipRegistryHandle::new(receiver_addr, config.clone()).await.unwrap();
-    let sender_handle = GossipRegistryHandle::new(sender_addr, config.clone()).await.unwrap();
+    let receiver_keypair = KeyPair::new_for_testing("throughput_receiver_1");
+    let sender_keypair = KeyPair::new_for_testing("throughput_sender_1");
+    let receiver_peer_id = receiver_keypair.peer_id();
+    let sender_peer_id = sender_keypair.peer_id();
+
+    let receiver_handle = GossipRegistryHandle::new_with_keypair(
+        receiver_addr,
+        receiver_keypair,
+        Some(config.clone()),
+    )
+    .await
+    .unwrap();
+    let sender_handle = GossipRegistryHandle::new_with_keypair(
+        sender_addr,
+        sender_keypair,
+        Some(config.clone()),
+    )
+    .await
+    .unwrap();
     
     // Register a throughput test actor on receiver
     let actor_addr = "127.0.0.1:21003".parse().unwrap();
@@ -86,8 +103,10 @@ async fn test_direct_connection_throughput() {
     ).await.unwrap();
     
     // Connect nodes - this establishes the connection pool
-    receiver_handle.add_peer(sender_addr).await.unwrap();
-    sender_handle.add_peer(receiver_addr).await.unwrap();
+    let peer_sender = receiver_handle.add_peer(&sender_peer_id).await;
+    peer_sender.connect(&sender_addr).await.unwrap();
+    let peer_receiver = sender_handle.add_peer(&receiver_peer_id).await;
+    peer_receiver.connect(&receiver_addr).await.unwrap();
     
     // Wait for gossip propagation
     sleep(Duration::from_millis(100)).await;
@@ -149,8 +168,25 @@ async fn test_tell_throughput() {
     let receiver_addr = "127.0.0.1:21101".parse().unwrap();
     let sender_addr = "127.0.0.1:21102".parse().unwrap();
     
-    let receiver_handle = GossipRegistryHandle::new(receiver_addr, config.clone()).await.unwrap();
-    let sender_handle = GossipRegistryHandle::new(sender_addr, config.clone()).await.unwrap();
+    let receiver_keypair = KeyPair::new_for_testing("throughput_receiver_2");
+    let sender_keypair = KeyPair::new_for_testing("throughput_sender_2");
+    let receiver_peer_id = receiver_keypair.peer_id();
+    let sender_peer_id = sender_keypair.peer_id();
+
+    let receiver_handle = GossipRegistryHandle::new_with_keypair(
+        receiver_addr,
+        receiver_keypair,
+        Some(config.clone()),
+    )
+    .await
+    .unwrap();
+    let sender_handle = GossipRegistryHandle::new_with_keypair(
+        sender_addr,
+        sender_keypair,
+        Some(config.clone()),
+    )
+    .await
+    .unwrap();
     
     // Register actor
     let actor_addr = "127.0.0.1:21103".parse().unwrap();
@@ -163,8 +199,10 @@ async fn test_tell_throughput() {
     ).await.unwrap();
     
     // Connect nodes - establishes connection pool
-    receiver_handle.add_peer(sender_addr).await.unwrap();
-    sender_handle.add_peer(receiver_addr).await.unwrap();
+    let peer_sender = receiver_handle.add_peer(&sender_peer_id).await;
+    peer_sender.connect(&sender_addr).await.unwrap();
+    let peer_receiver = sender_handle.add_peer(&receiver_peer_id).await;
+    peer_receiver.connect(&receiver_addr).await.unwrap();
     
     // Wait for propagation
     sleep(Duration::from_millis(100)).await;
@@ -247,8 +285,25 @@ async fn test_ask_throughput() {
     let receiver_addr = "127.0.0.1:21201".parse().unwrap();
     let sender_addr = "127.0.0.1:21202".parse().unwrap();
     
-    let receiver_handle = GossipRegistryHandle::new(receiver_addr, config.clone()).await.unwrap();
-    let sender_handle = GossipRegistryHandle::new(sender_addr, config.clone()).await.unwrap();
+    let receiver_keypair = KeyPair::new_for_testing("throughput_receiver_3");
+    let sender_keypair = KeyPair::new_for_testing("throughput_sender_3");
+    let receiver_peer_id = receiver_keypair.peer_id();
+    let sender_peer_id = sender_keypair.peer_id();
+
+    let receiver_handle = GossipRegistryHandle::new_with_keypair(
+        receiver_addr,
+        receiver_keypair,
+        Some(config.clone()),
+    )
+    .await
+    .unwrap();
+    let sender_handle = GossipRegistryHandle::new_with_keypair(
+        sender_addr,
+        sender_keypair,
+        Some(config.clone()),
+    )
+    .await
+    .unwrap();
     
     // Register actor
     let actor_addr = "127.0.0.1:21203".parse().unwrap();
@@ -261,8 +316,10 @@ async fn test_ask_throughput() {
     ).await.unwrap();
     
     // Connect nodes - establishes connection pool
-    receiver_handle.add_peer(sender_addr).await.unwrap();
-    sender_handle.add_peer(receiver_addr).await.unwrap();
+    let peer_sender = receiver_handle.add_peer(&sender_peer_id).await;
+    peer_sender.connect(&sender_addr).await.unwrap();
+    let peer_receiver = sender_handle.add_peer(&receiver_peer_id).await;
+    peer_receiver.connect(&receiver_addr).await.unwrap();
     
     // Wait for propagation
     sleep(Duration::from_millis(100)).await;

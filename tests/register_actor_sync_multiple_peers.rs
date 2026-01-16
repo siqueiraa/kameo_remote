@@ -8,6 +8,10 @@ use std::time::Duration;
 /// Helper function to create a test registry
 fn create_test_registry(bind_addr: SocketAddr) -> GossipRegistry {
     let config = GossipConfig {
+        key_pair: Some(kameo_remote::KeyPair::new_for_testing(format!(
+            "node_{}",
+            bind_addr.port()
+        ))),
         gossip_interval: Duration::from_millis(100),
         max_peer_failures: 3,
         dead_peer_timeout: Duration::from_secs(60),
@@ -18,7 +22,7 @@ fn create_test_registry(bind_addr: SocketAddr) -> GossipRegistry {
 
 /// Helper function to create a test actor location
 fn create_test_actor_location(addr: SocketAddr) -> RemoteActorLocation {
-    let peer_id = kameo_remote::PeerId::new("test_peer");
+    let peer_id = kameo_remote::KeyPair::new_for_testing("test_peer").peer_id();
     RemoteActorLocation::new_with_peer(addr, peer_id)
 }
 

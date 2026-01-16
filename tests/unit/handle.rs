@@ -1,20 +1,25 @@
-use kameo_remote::{GossipRegistryHandle, GossipConfig};
+use kameo_remote::{GossipConfig, GossipRegistryHandle, KeyPair};
+use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::time::sleep;
+
+async fn create_handle(
+    bind_addr: SocketAddr,
+    config: Option<GossipConfig>,
+    seed: &str,
+) -> GossipRegistryHandle {
+    let keypair = KeyPair::new_for_testing(seed);
+    GossipRegistryHandle::new_with_keypair(bind_addr, keypair, config)
+        .await
+        .unwrap()
+}
 
 #[tokio::test]
 async fn test_registry_handle_creation() {
     let bind_addr = "127.0.0.1:0".parse().unwrap();
     let config = GossipConfig::default();
     
-    let handle = GossipRegistryHandle::new(
-        bind_addr,
-        vec![],
-        Some(config),
-    ).await;
-    
-    assert!(handle.is_ok());
-    let handle = handle.unwrap();
+    let handle = create_handle(bind_addr, Some(config), "unit_handle_create").await;
     
     // Should start with empty registry
     let stats = handle.stats().await;
@@ -30,19 +35,29 @@ async fn test_registry_handle_with_peers() {
     let bind_addr = "127.0.0.1:0".parse().unwrap();
     let config = GossipConfig::default();
     
-    let peers = vec![
-        "127.0.0.1:8001".parse().unwrap(),
-        "127.0.0.1:8002".parse().unwrap(),
-    ];
-    
-    let handle = GossipRegistryHandle::new(
-        bind_addr,
-        peers,
+    let handle = create_handle(bind_addr, Some(config.clone()), "unit_handle_with_peers").await;
+    let peer1 = create_handle(
+        "127.0.0.1:0".parse().unwrap(),
+        Some(config.clone()),
+        "unit_peer_1",
+    )
+    .await;
+    let peer2 = create_handle(
+        "127.0.0.1:0".parse().unwrap(),
         Some(config),
-    ).await;
-    
-    assert!(handle.is_ok());
-    let handle = handle.unwrap();
+        "unit_peer_2",
+    )
+    .await;
+
+    let peer1_addr = peer1.registry.bind_addr;
+    let peer2_addr = peer2.registry.bind_addr;
+    let peer1_id = peer1.registry.peer_id;
+    let peer2_id = peer2.registry.peer_id;
+
+    let conn1 = handle.add_peer(&peer1_id).await;
+    conn1.connect(&peer1_addr).await.unwrap();
+    let conn2 = handle.add_peer(&peer2_id).await;
+    conn2.connect(&peer2_addr).await.unwrap();
     
     // Give bootstrap time to complete
     sleep(Duration::from_millis(100)).await;
@@ -57,14 +72,7 @@ async fn test_registry_handle_with_peers() {
 async fn test_registry_handle_default_config() {
     let bind_addr = "127.0.0.1:0".parse().unwrap();
     
-    let handle = GossipRegistryHandle::new(
-        bind_addr,
-        vec![],
-        None, // Use default config
-    ).await;
-    
-    assert!(handle.is_ok());
-    let handle = handle.unwrap();
+    let handle = create_handle(bind_addr, None, "unit_handle_default").await;
     
     let stats = handle.stats().await;
     
@@ -76,11 +84,7 @@ async fn test_register_actor() {
     let bind_addr = "127.0.0.1:0".parse().unwrap();
     let config = GossipConfig::default();
     
-    let handle = GossipRegistryHandle::new(
-        bind_addr,
-        vec![],
-        Some(config),
-    ).await.unwrap();
+    let handle = create_handle(bind_addr, Some(config), "unit_register_actor").await;
     
     let actor_name = "test_actor".to_string();
     let actor_addr = "127.0.0.1:9001".parse().unwrap();
@@ -106,11 +110,7 @@ async fn test_register_multiple_actors() {
     let bind_addr = "127.0.0.1:0".parse().unwrap();
     let config = GossipConfig::default();
     
-    let handle = GossipRegistryHandle::new(
-        bind_addr,
-        vec![],
-        Some(config),
-    ).await.unwrap();
+    let handle = create_handle(bind_addr, Some(config), "unit_register_multiple").await;
     
     // Register multiple actors
     let actors = vec![
@@ -147,11 +147,7 @@ async fn test_unregister_actor() {
     let bind_addr = "127.0.0.1:0".parse().unwrap();
     let config = GossipConfig::default();
     
-    let handle = GossipRegistryHandle::new(
-        bind_addr,
-        vec![],
-        Some(config),
-    ).await.unwrap();
+    let handle = create_handle(bind_addr, Some(config), "unit_unregister").await;
     
     let actor_name = "test_actor".to_string();
     let actor_addr = "127.0.0.1:9001".parse().unwrap();
@@ -186,11 +182,7 @@ async fn test_unregister_nonexistent_actor() {
     let bind_addr = "127.0.0.1:0".parse().unwrap();
     let config = GossipConfig::default();
     
-    let handle = GossipRegistryHandle::new(
-        bind_addr,
-        vec![],
-        Some(config),
-    ).await.unwrap();
+    let handle = create_handle(bind_addr, Some(config), "unit_unregister_missing").await;
     
     let result = handle.unregister("nonexistent").await;
     assert!(result.is_ok());
@@ -204,11 +196,7 @@ async fn test_lookup_nonexistent_actor() {
     let bind_addr = "127.0.0.1:0".parse().unwrap();
     let config = GossipConfig::default();
     
-    let handle = GossipRegistryHandle::new(
-        bind_addr,
-        vec![],
-        Some(config),
-    ).await.unwrap();
+    let handle = create_handle(bind_addr, Some(config), "unit_lookup_missing").await;
     
     let found = handle.lookup("nonexistent").await;
     assert!(found.is_none());
@@ -221,11 +209,7 @@ async fn test_stats_tracking() {
     let bind_addr = "127.0.0.1:0".parse().unwrap();
     let config = GossipConfig::default();
     
-    let handle = GossipRegistryHandle::new(
-        bind_addr,
-        vec![],
-        Some(config),
-    ).await.unwrap();
+    let handle = create_handle(bind_addr, Some(config), "unit_stats").await;
     
     // Initial stats
     let stats = handle.stats().await;
@@ -255,11 +239,7 @@ async fn test_shutdown() {
     let bind_addr = "127.0.0.1:0".parse().unwrap();
     let config = GossipConfig::default();
     
-    let handle = GossipRegistryHandle::new(
-        bind_addr,
-        vec![],
-        Some(config),
-    ).await.unwrap();
+    let handle = create_handle(bind_addr, Some(config), "unit_shutdown").await;
     
     // Should be able to operate before shutdown
     let result = handle.register(
@@ -287,11 +267,7 @@ async fn test_actor_lifecycle() {
     let bind_addr = "127.0.0.1:0".parse().unwrap();
     let config = GossipConfig::default();
     
-    let handle = GossipRegistryHandle::new(
-        bind_addr,
-        vec![],
-        Some(config),
-    ).await.unwrap();
+    let handle = create_handle(bind_addr, Some(config), "unit_actor_lifecycle").await;
     
     let actor_name = "lifecycle_actor".to_string();
     let actor_addr = "127.0.0.1:9001".parse().unwrap();
@@ -326,11 +302,7 @@ async fn test_concurrent_operations() {
     let config = GossipConfig::default();
     
     let handle = std::sync::Arc::new(
-        GossipRegistryHandle::new(
-                bind_addr,
-            vec![],
-            Some(config),
-        ).await.unwrap()
+        create_handle(bind_addr, Some(config), "unit_concurrent_ops").await
     );
     
     // Concurrent registrations
@@ -368,20 +340,25 @@ async fn test_two_node_communication() {
     };
     
     // Start first node
-    let handle1 = GossipRegistryHandle::new(
+    let handle1 = create_handle(
         "127.0.0.1:0".parse().unwrap(),
-        vec![],
         Some(config.clone()),
-    ).await.unwrap();
+        "unit_two_node_1",
+    )
+    .await;
     
     let node1_addr = handle1.registry.bind_addr;
     
     // Start second node connected to first
-    let handle2 = GossipRegistryHandle::new(
+    let handle2 = create_handle(
         "127.0.0.1:0".parse().unwrap(),
-        vec![node1_addr],
         Some(config),
-    ).await.unwrap();
+        "unit_two_node_2",
+    )
+    .await;
+
+    let peer1_from_2 = handle2.add_peer(&handle1.registry.peer_id).await;
+    peer1_from_2.connect(&node1_addr).await.unwrap();
     
     // Give time for connection
     sleep(Duration::from_millis(200)).await;
@@ -429,11 +406,7 @@ async fn test_custom_config() {
         ..Default::default()
     };
     
-    let handle = GossipRegistryHandle::new(
-        bind_addr,
-        vec![],
-        Some(config),
-    ).await.unwrap();
+    let handle = create_handle(bind_addr, Some(config), "unit_custom_config").await;
     
     // Should work with custom config
     let result = handle.register(
@@ -451,11 +424,7 @@ async fn test_error_handling() {
     
     let config = GossipConfig::default();
     
-    let handle = GossipRegistryHandle::new(
-        bind_addr,
-        vec![],
-        Some(config),
-    ).await.unwrap();
+    let handle = create_handle(bind_addr, Some(config), "unit_error_handling").await;
     
     // Register an actor
     handle.register(
@@ -487,11 +456,7 @@ async fn test_error_handling() {
 async fn test_bind_to_specific_address() {
     let bind_addr = "127.0.0.1:0".parse().unwrap(); // Let OS choose port
     
-    let handle = GossipRegistryHandle::new(
-        bind_addr,
-        vec![],
-        None,
-    ).await.unwrap();
+    let handle = create_handle(bind_addr, None, "unit_bind_specific").await;
     
     // Should bind to some address
     let actual_addr = handle.registry.bind_addr;
@@ -505,11 +470,7 @@ async fn test_bind_to_specific_address() {
 async fn test_repeated_shutdown() {
     let bind_addr = "127.0.0.1:0".parse().unwrap();
     
-    let handle = GossipRegistryHandle::new(
-        bind_addr,
-        vec![],
-        None,
-    ).await.unwrap();
+    let handle = create_handle(bind_addr, None, "unit_repeated_shutdown").await;
     
     // Multiple shutdowns should not panic
     handle.shutdown().await;

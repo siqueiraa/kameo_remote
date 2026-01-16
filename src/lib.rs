@@ -1,9 +1,9 @@
 pub mod config;
 pub mod connection_pool;
+pub mod framing;
 mod handle;
 mod handle_builder;
 pub mod handshake;
-pub mod migration;
 pub mod peer_discovery;
 pub mod priority;
 pub mod registry;
@@ -11,6 +11,9 @@ pub mod remote_actor_location;
 pub mod reply_to;
 pub mod stream_writer;
 pub mod tls;
+pub mod typed;
+#[cfg(any(test, feature = "test-helpers", debug_assertions))]
+pub mod test_helpers;
 
 use dashmap::DashMap;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -31,6 +34,7 @@ pub use handle_builder::GossipRegistryBuilder;
 pub use priority::{ConsistencyLevel, RegistrationPriority};
 pub use remote_actor_location::RemoteActorLocation;
 pub use reply_to::{ReplyTo, TimeoutReplyTo};
+pub use typed::{decode_typed, encode_typed, WireEncode, WireType};
 
 // =================== New Iroh-style types ===================
 
@@ -86,7 +90,7 @@ impl PublicKey {
         hex::encode(&self.inner[..5])
     }
 
-    /// Convert to PeerId for backward compatibility with existing code
+    /// Convert to PeerId
     pub fn to_peer_id(&self) -> PeerId {
         PeerId::from_bytes(self.as_bytes()).expect("NodeId should always convert to valid PeerId")
     }
@@ -197,6 +201,15 @@ impl SecretKey {
     /// Get raw bytes (use with caution - these should be zeroized after use)
     pub fn to_bytes(&self) -> [u8; 32] {
         self.secret.to_bytes()
+    }
+
+    /// Convert to a KeyPair for existing APIs
+    pub fn to_keypair(&self) -> KeyPair {
+        let mut key_bytes = self.to_bytes();
+        let keypair = KeyPair::from_private_key_bytes(&key_bytes)
+            .expect("SecretKey should always convert to valid KeyPair");
+        key_bytes.zeroize();
+        keypair
     }
 }
 
@@ -538,6 +551,15 @@ impl KeyPair {
         self.verifying_key.to_bytes()
     }
 
+    /// Convert to SecretKey for TLS identity use
+    pub fn to_secret_key(&self) -> SecretKey {
+        let mut key_bytes = self.private_key_bytes();
+        let secret =
+            SecretKey::from_bytes(&key_bytes).expect("KeyPair should always convert to SecretKey");
+        key_bytes.zeroize();
+        secret
+    }
+
     /// Sign a message
     pub fn sign(&self, message: &[u8]) -> Signature {
         self.signing_key.sign(message)
@@ -573,14 +595,14 @@ impl std::fmt::Debug for KeyPair {
 pub struct PeerId([u8; 32]);
 
 impl PeerId {
-    /// Create a new PeerId from a string (for backward compatibility)
-    pub fn new(s: impl Into<String>) -> Self {
-        Self::from(s.into())
-    }
-
     /// Create a PeerId from a verifying key
     pub fn from_verifying_key(key: VerifyingKey) -> Self {
         Self(key.to_bytes())
+    }
+
+    /// Create a PeerId from a PublicKey
+    pub fn from_public_key(key: &PublicKey) -> Self {
+        Self(*key.as_bytes())
     }
 
     /// Create a PeerId from public key bytes
@@ -622,11 +644,6 @@ impl PeerId {
         hex::encode(self.0)
     }
 
-    /// Get as a string (for backward compatibility)
-    pub fn as_str(&self) -> String {
-        self.to_hex()
-    }
-
     /// Verify a signature
     pub fn verify_signature(&self, message: &[u8], signature: &Signature) -> Result<()> {
         let verifying_key = self.to_verifying_key()?;
@@ -643,7 +660,7 @@ impl PeerId {
 
 impl std::fmt::Display for PeerId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", &self.to_hex()[..8]) // Show first 8 chars for brevity
+        write!(f, "{}", self.to_hex())
     }
 }
 
@@ -653,17 +670,15 @@ impl std::fmt::Debug for PeerId {
     }
 }
 
-// For backward compatibility and testing
-impl From<String> for PeerId {
-    fn from(s: String) -> Self {
-        // Try to parse as hex, if it fails create a test keypair
-        Self::from_hex(&s).unwrap_or_else(|_| KeyPair::new_for_testing(&s).peer_id())
+impl From<PublicKey> for PeerId {
+    fn from(key: PublicKey) -> Self {
+        Self(*key.as_bytes())
     }
 }
 
-impl From<&str> for PeerId {
-    fn from(s: &str) -> Self {
-        Self::from(s.to_string())
+impl From<&PublicKey> for PeerId {
+    fn from(key: &PublicKey) -> Self {
+        Self(*key.as_bytes())
     }
 }
 
@@ -689,6 +704,7 @@ impl Peer {
         {
             let pool = self.registry.connection_pool.lock().await;
             pool.peer_id_to_addr.insert(self.peer_id.clone(), *addr);
+            pool.reindex_connection_addr(&self.peer_id, *addr);
         }
 
         // Add the peer to gossip state so it can be selected for gossip rounds
@@ -702,7 +718,7 @@ impl Peer {
             let peers_before = gossip_state.peers.len();
 
             // Convert PeerId to NodeId for TLS
-            let node_id = crate::migration::migrate_peer_id_to_node_id(&self.peer_id).ok();
+            let node_id = Some(self.peer_id.to_node_id());
             if node_id.is_some() {
                 tracing::debug!("🔐 Converted PeerId {} to NodeId for TLS", self.peer_id);
             }
@@ -733,7 +749,7 @@ impl Peer {
         }
 
         // Then attempt to connect with enhanced error context
-        match self.registry.connect_to_peer(&self.peer_id.as_str()).await {
+        match self.registry.connect_to_peer(&self.peer_id).await {
             Ok(()) => {
                 tracing::info!(
                     peer_id = %self.peer_id,
@@ -880,7 +896,7 @@ impl Peer {
         let pool = self.registry.connection_pool.lock().await;
 
         // Check if we have a connection by peer ID
-        if let Some(conn) = pool.get_connection_by_node_id(&self.peer_id.as_str()) {
+        if let Some(conn) = pool.get_connection_by_peer_id(&self.peer_id) {
             conn.is_connected()
         } else {
             false
@@ -891,7 +907,7 @@ impl Peer {
     pub async fn disconnect(&self) -> Result<()> {
         let mut pool = self.registry.connection_pool.lock().await;
 
-        if let Some(conn) = pool.get_connection_by_node_id(&self.peer_id.as_str()) {
+        if let Some(conn) = pool.get_connection_by_peer_id(&self.peer_id) {
             // Mark connection as disconnected
             conn.set_state(crate::connection_pool::ConnectionState::Disconnected);
 
@@ -942,10 +958,7 @@ impl Peer {
             // Check if we have a connection to this peer
             {
                 let pool = self.registry.connection_pool.lock().await;
-                if pool
-                    .get_connection_by_node_id(&self.peer_id.as_str())
-                    .is_some()
-                {
+                if pool.get_connection_by_peer_id(&self.peer_id).is_some() {
                     break;
                 }
             }

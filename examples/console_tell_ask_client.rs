@@ -1,13 +1,15 @@
 use anyhow::Result;
+use bytes::Bytes;
+use futures::future::BoxFuture;
+use futures::stream::{FuturesUnordered, StreamExt};
 use kameo_remote::registry::RegistryMessage;
-use kameo_remote::{GossipConfig, GossipRegistryHandle, NodeId, SecretKey};
+use kameo_remote::{wire_type, GossipConfig, GossipRegistryHandle, NodeId, SecretKey};
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::env;
 use std::fs;
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::Path;
-use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicU64, Ordering};
-use futures::stream::{FuturesUnordered, StreamExt};
+use std::time::{Duration, Instant};
 
 struct CountingAlloc;
 
@@ -15,6 +17,19 @@ static ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
 static DEALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
 static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
 static DEALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
+
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone)]
+struct EchoRequest {
+    payload: Vec<u8>,
+}
+
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone)]
+struct EchoResponse {
+    payload: Vec<u8>,
+}
+
+wire_type!(EchoRequest, "kameo.remote.EchoRequest");
+wire_type!(EchoResponse, "kameo.remote.EchoResponse");
 
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
@@ -36,7 +51,7 @@ static GLOBAL: CountingAlloc = CountingAlloc;
 /// Console tell/ask client (TLS).
 ///
 /// Usage:
-///   cargo run --example console_tell_ask_client /tmp/kameo_tls/console_tell_ask_server.pub
+///   cargo run --example console_tell_ask_client /tmp/kameo_tls/console_tell_ask_server.pub [tell_count] [ask_count] [ask_concurrency] [--typed]
 #[tokio::main]
 async fn main() -> Result<()> {
     rustls::crypto::ring::default_provider()
@@ -53,6 +68,7 @@ async fn main() -> Result<()> {
     let tell_count: usize = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(1000);
     let ask_count: usize = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(100);
     let ask_concurrency: usize = args.get(4).and_then(|v| v.parse().ok()).unwrap_or(50);
+    let run_typed = args.iter().any(|arg| arg == "--typed");
 
     println!("🔐 Console Tell/Ask Client (TLS)");
     println!("================================\n");
@@ -97,8 +113,11 @@ async fn main() -> Result<()> {
         payload: b"tell:hello".to_vec(),
         correlation_id: None,
     };
-    let tell_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&tell_msg)?;
-    conn.tell(tell_bytes.as_slice()).await?;
+    let tell_bytes = Bytes::from(rkyv::api::high::to_bytes_in::<_, rkyv::rancor::Error>(
+        &tell_msg,
+        Vec::new(),
+    )?);
+    conn.tell_bytes(tell_bytes.clone()).await?;
     println!("✅ Tell sent");
 
     // Ask (request-response)
@@ -108,13 +127,33 @@ async fn main() -> Result<()> {
         payload: b"ask:ping".to_vec(),
         correlation_id: None,
     };
-    let ask_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&ask_msg)?;
-    let response = conn.ask(ask_bytes.as_slice()).await?;
+    let ask_bytes = Bytes::from(rkyv::api::high::to_bytes_in::<_, rkyv::rancor::Error>(
+        &ask_msg,
+        Vec::new(),
+    )?);
+    let response = conn.ask_bytes(ask_bytes.clone()).await?;
 
-    println!(
-        "✅ Ask response: {:?}",
-        String::from_utf8_lossy(&response)
-    );
+    println!("✅ Ask response: {:?}", String::from_utf8_lossy(&response));
+
+    if run_typed {
+        #[cfg(debug_assertions)]
+        {
+            // Typed ask (debug-only type hash verification)
+            let typed_response: EchoResponse = conn
+                .ask_typed::<EchoRequest, EchoResponse>(&EchoRequest {
+                    payload: b"ask:typed".to_vec(),
+                })
+                .await?;
+            println!(
+                "✅ Typed ask response: {:?}",
+                String::from_utf8_lossy(&typed_response.payload)
+            );
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            println!("⚠️  Typed ask is disabled in release builds; use a debug build to verify types.");
+        }
+    }
 
     if tell_count > 0 {
         println!("\n🔸 Tell benchmark (count = {})", tell_count);
@@ -123,7 +162,7 @@ async fn main() -> Result<()> {
         let tell_start = Instant::now();
         for _ in 0..tell_count {
             let start = Instant::now();
-            conn.tell(tell_bytes.as_slice()).await?;
+            conn.tell_bytes(tell_bytes.clone()).await?;
             tell_latencies.push(start.elapsed());
         }
         let tell_total = tell_start.elapsed();
@@ -144,8 +183,9 @@ async fn main() -> Result<()> {
             ask_count, ask_concurrency
         );
         let before = alloc_snapshot();
-        let ask_payload = std::sync::Arc::new(ask_bytes.to_vec());
-        let mut in_flight = FuturesUnordered::new();
+        let ask_payload = ask_bytes.clone();
+        let mut in_flight: FuturesUnordered<BoxFuture<'static, Result<Duration, anyhow::Error>>> =
+            FuturesUnordered::new();
         let ask_start = Instant::now();
         let mut remaining = ask_count;
 
@@ -153,11 +193,11 @@ async fn main() -> Result<()> {
         for _ in 0..initial {
             let conn_clone = conn.clone();
             let payload = ask_payload.clone();
-            in_flight.push(async move {
+            in_flight.push(Box::pin(async move {
                 let start = Instant::now();
-                let _ = conn_clone.ask(&payload).await?;
+                let _ = conn_clone.ask_bytes(payload).await?;
                 Ok::<Duration, anyhow::Error>(start.elapsed())
-            });
+            }));
             remaining -= 1;
         }
 
@@ -167,11 +207,11 @@ async fn main() -> Result<()> {
             if remaining > 0 {
                 let conn_clone = conn.clone();
                 let payload = ask_payload.clone();
-                in_flight.push(async move {
+                in_flight.push(Box::pin(async move {
                     let start = Instant::now();
-                    let _ = conn_clone.ask(&payload).await?;
+                    let _ = conn_clone.ask_bytes(payload).await?;
                     Ok::<Duration, anyhow::Error>(start.elapsed())
-                });
+                }));
                 remaining -= 1;
             }
         }
@@ -206,8 +246,7 @@ fn load_node_id(path: &str) -> Result<NodeId> {
         ));
     }
 
-    NodeId::from_bytes(&pub_key_bytes)
-        .map_err(|e| anyhow::anyhow!("Invalid NodeId: {}", e))
+    NodeId::from_bytes(&pub_key_bytes).map_err(|e| anyhow::anyhow!("Invalid NodeId: {}", e))
 }
 
 fn load_or_generate_key(path: &str) -> Result<SecretKey> {

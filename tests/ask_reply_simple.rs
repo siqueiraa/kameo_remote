@@ -3,7 +3,7 @@ use tokio::time::{sleep, Duration};
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
-use kameo_remote::{GossipConfig, GossipRegistryHandle, KeyPair, PeerId};
+use kameo_remote::{GossipConfig, GossipRegistryHandle, KeyPair};
 
 /// Test basic ask() functionality with correlation ID tracking
 #[tokio::test]
@@ -22,33 +22,31 @@ async fn test_basic_ask_correlation() {
     let key_pair_a = KeyPair::new_for_testing("node_a");
     let key_pair_b = KeyPair::new_for_testing("node_b");
 
+    let _peer_id_a = key_pair_a.peer_id();
+    let peer_id_b = key_pair_b.peer_id();
+
     let config_a = GossipConfig {
-        key_pair: Some(key_pair_a),
         gossip_interval: Duration::from_secs(300), // 5 minutes to avoid interference during test
         ..Default::default()
     };
 
     let config_b = GossipConfig {
-        key_pair: Some(key_pair_b),
         gossip_interval: Duration::from_secs(300), // 5 minutes to avoid interference during test
         ..Default::default()
     };
 
     // Start nodes
-    let handle_a = GossipRegistryHandle::new(addr_a, vec![], Some(config_a))
+    let handle_a = GossipRegistryHandle::new_with_keypair(addr_a, key_pair_a, Some(config_a))
         .await
         .unwrap();
 
-    let handle_b = GossipRegistryHandle::new(addr_b, vec![], Some(config_b))
+    let handle_b = GossipRegistryHandle::new_with_keypair(addr_b, key_pair_b, Some(config_b))
         .await
         .unwrap();
 
-    // Connect nodes - both directions
-    let peer_b = handle_a.add_peer(&PeerId::new("node_b")).await;
+    // Connect nodes - single direction to avoid duplicate tie-breaker churn
+    let peer_b = handle_a.add_peer(&peer_id_b).await;
     peer_b.connect(&addr_b).await.unwrap();
-
-    let peer_a = handle_b.add_peer(&PeerId::new("node_a")).await;
-    peer_a.connect(&addr_a).await.unwrap();
 
     // Wait for initial gossip protocol to establish and settle
     sleep(Duration::from_millis(100)).await;
@@ -212,33 +210,33 @@ async fn test_ask_high_throughput() {
     let addr_a: SocketAddr = "127.0.0.1:7913".parse().unwrap();
     let addr_b: SocketAddr = "127.0.0.1:7914".parse().unwrap();
 
+    let key_pair_a = KeyPair::new_for_testing("perf_a");
+    let key_pair_b = KeyPair::new_for_testing("perf_b");
+    let _peer_id_a = key_pair_a.peer_id();
+    let peer_id_b = key_pair_b.peer_id();
+
     let config_a = GossipConfig {
-        key_pair: Some(KeyPair::new_for_testing("perf_a")),
         gossip_interval: Duration::from_secs(300), // 5 minutes to avoid interference during test
         ..Default::default()
     };
 
     let config_b = GossipConfig {
-        key_pair: Some(KeyPair::new_for_testing("perf_b")),
         gossip_interval: Duration::from_secs(300), // 5 minutes to avoid interference during test
         ..Default::default()
     };
 
     // Start nodes
-    let handle_a = GossipRegistryHandle::new(addr_a, vec![], Some(config_a))
+    let handle_a = GossipRegistryHandle::new_with_keypair(addr_a, key_pair_a, Some(config_a))
         .await
         .unwrap();
 
-    let handle_b = GossipRegistryHandle::new(addr_b, vec![], Some(config_b))
+    let handle_b = GossipRegistryHandle::new_with_keypair(addr_b, key_pair_b, Some(config_b))
         .await
         .unwrap();
 
-    // Connect bidirectionally
-    let peer_b = handle_a.add_peer(&PeerId::new("perf_b")).await;
+    // Connect single direction to avoid duplicate tie-breaker churn
+    let peer_b = handle_a.add_peer(&peer_id_b).await;
     peer_b.connect(&addr_b).await.unwrap();
-
-    let peer_a = handle_b.add_peer(&PeerId::new("perf_a")).await;
-    peer_a.connect(&addr_a).await.unwrap();
 
     sleep(Duration::from_millis(500)).await;
 

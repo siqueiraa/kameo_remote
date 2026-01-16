@@ -2,36 +2,6 @@ use kameo_remote::*;
 use std::time::Duration;
 use tokio::time::sleep;
 
-/// Test that demonstrates the deprecated peer initialization and the correct method
-#[tokio::test]
-async fn test_peer_initialization_deprecation_warning() {
-    println!("🧪 Testing deprecated peer initialization");
-
-    let node1_addr = "127.0.0.1:35001".parse().unwrap();
-    let node2_addr = "127.0.0.1:35002".parse().unwrap();
-
-    let config = GossipConfig {
-        key_pair: Some(KeyPair::new_for_testing("node1")),
-        ..Default::default()
-    };
-
-    println!("\n⚠️ Using deprecated method (should show warnings):");
-    let handle1 = GossipRegistryHandle::new(
-        node1_addr,
-        vec![node2_addr], // This will show deprecation warning
-        Some(config.clone()),
-    )
-    .await
-    .unwrap();
-
-    // Check what peers are configured
-    let stats1 = handle1.stats().await;
-    println!("Node1 stats after initialization: {:?}", stats1);
-
-    // Cleanup
-    handle1.shutdown().await;
-}
-
 /// Test the proposed fix: Allow specifying peer names when initializing
 #[tokio::test]
 async fn test_peer_initialization_with_names() {
@@ -41,40 +11,37 @@ async fn test_peer_initialization_with_names() {
     let node2_addr = "127.0.0.1:35004".parse().unwrap();
     let node3_addr = "127.0.0.1:35005".parse().unwrap();
 
-    // Proposed API: Accept tuples of (peer_name, peer_addr)
-    // This would require changing the new() signature or adding a new constructor
+    let node1_keypair = KeyPair::new_for_testing("node1");
+    let node2_keypair = KeyPair::new_for_testing("node2");
+    let node3_keypair = KeyPair::new_for_testing("node3");
 
-    // For now, demonstrate the workaround
-    println!("\n✅ Workaround: Always use empty peer list + manual add");
-
-    // Create all nodes with empty peer lists
-    let handle1 = GossipRegistryHandle::new(
+    let handle1 = GossipRegistryHandle::new_with_tls(
         node1_addr,
-        vec![],
+        node1_keypair.to_secret_key(),
         Some(GossipConfig {
-            key_pair: Some(KeyPair::new_for_testing("node1")),
+            key_pair: Some(node1_keypair.clone()),
             ..Default::default()
         }),
     )
     .await
     .unwrap();
 
-    let handle2 = GossipRegistryHandle::new(
+    let handle2 = GossipRegistryHandle::new_with_tls(
         node2_addr,
-        vec![],
+        node2_keypair.to_secret_key(),
         Some(GossipConfig {
-            key_pair: Some(KeyPair::new_for_testing("node2")),
+            key_pair: Some(node2_keypair.clone()),
             ..Default::default()
         }),
     )
     .await
     .unwrap();
 
-    let handle3 = GossipRegistryHandle::new(
+    let handle3 = GossipRegistryHandle::new_with_tls(
         node3_addr,
-        vec![],
+        node3_keypair.to_secret_key(),
         Some(GossipConfig {
-            key_pair: Some(KeyPair::new_for_testing("node3")),
+            key_pair: Some(node3_keypair.clone()),
             ..Default::default()
         }),
     )
@@ -83,20 +50,20 @@ async fn test_peer_initialization_with_names() {
 
     // Now add peers with correct names
     // Node1 knows Node2 and Node3
-    let peer2_from_1 = handle1.add_peer(&PeerId::new("node2")).await;
-    let peer3_from_1 = handle1.add_peer(&PeerId::new("node3")).await;
+    let peer2_from_1 = handle1.add_peer(&node2_keypair.peer_id()).await;
+    let peer3_from_1 = handle1.add_peer(&node3_keypair.peer_id()).await;
     peer2_from_1.connect(&node2_addr).await.unwrap();
     peer3_from_1.connect(&node3_addr).await.unwrap();
 
     // Node2 knows Node1 and Node3
-    let peer1_from_2 = handle2.add_peer(&PeerId::new("node1")).await;
-    let peer3_from_2 = handle2.add_peer(&PeerId::new("node3")).await;
+    let peer1_from_2 = handle2.add_peer(&node1_keypair.peer_id()).await;
+    let peer3_from_2 = handle2.add_peer(&node3_keypair.peer_id()).await;
     peer1_from_2.connect(&node1_addr).await.unwrap();
     peer3_from_2.connect(&node3_addr).await.unwrap();
 
     // Node3 knows Node1 and Node2
-    let peer1_from_3 = handle3.add_peer(&PeerId::new("node1")).await;
-    let peer2_from_3 = handle3.add_peer(&PeerId::new("node2")).await;
+    let peer1_from_3 = handle3.add_peer(&node1_keypair.peer_id()).await;
+    let peer2_from_3 = handle3.add_peer(&node2_keypair.peer_id()).await;
     peer1_from_3.connect(&node1_addr).await.unwrap();
     peer2_from_3.connect(&node2_addr).await.unwrap();
 

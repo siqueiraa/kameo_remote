@@ -2,7 +2,7 @@
 // Run with: cargo run --example multi_node
 
 use anyhow::Result;
-use kameo_remote::{GossipConfig, GossipRegistryHandle};
+use kameo_remote::{GossipConfig, GossipRegistryHandle, KeyPair};
 use tokio::time::{sleep, Duration};
 use tracing_subscriber::EnvFilter;
 
@@ -18,9 +18,11 @@ async fn main() -> Result<()> {
 
     // Start bootstrap node (node1)
     println!("🚀 Starting bootstrap node (node1) on 127.0.0.1:8000");
-    let node1 = GossipRegistryHandle::new(
+    let key_pair1 = KeyPair::new_for_testing("node1");
+    let peer_id1 = key_pair1.peer_id();
+    let node1 = GossipRegistryHandle::new_with_keypair(
         "127.0.0.1:8000".parse().unwrap(),
-        vec![], // No bootstrap peers for first node
+        key_pair1,
         Some(config.clone()),
     )
     .await?;
@@ -46,12 +48,15 @@ async fn main() -> Result<()> {
     sleep(Duration::from_millis(500)).await;
 
     println!("🚀 Starting node2 on 127.0.0.1:8001 (connecting to node1)");
-    let node2 = GossipRegistryHandle::new(
+    let key_pair2 = KeyPair::new_for_testing("node2");
+    let node2 = GossipRegistryHandle::new_with_keypair(
         "127.0.0.1:8001".parse().unwrap(),
-        vec!["127.0.0.1:8000".parse().unwrap()], // Bootstrap from node1
+        key_pair2,
         Some(config.clone()),
     )
     .await?;
+    let peer1 = node2.add_peer(&peer_id1).await;
+    peer1.connect(&"127.0.0.1:8000".parse().unwrap()).await?;
 
     // Register different services on node2
     node2
@@ -74,12 +79,17 @@ async fn main() -> Result<()> {
     sleep(Duration::from_millis(500)).await;
 
     println!("🚀 Starting node3 on 127.0.0.1:8002 (connecting to node1)");
-    let node3 = GossipRegistryHandle::new(
+    let key_pair3 = KeyPair::new_for_testing("node3");
+    let node3 = GossipRegistryHandle::new_with_keypair(
         "127.0.0.1:8002".parse().unwrap(),
-        vec!["127.0.0.1:8000".parse().unwrap()], // Bootstrap from node1
+        key_pair3,
         Some(config.clone()),
     )
     .await?;
+    let peer1_from_3 = node3.add_peer(&peer_id1).await;
+    peer1_from_3
+        .connect(&"127.0.0.1:8000".parse().unwrap())
+        .await?;
 
     // Register services on node3
     node3

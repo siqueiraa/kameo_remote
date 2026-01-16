@@ -105,16 +105,16 @@ pub enum RegistryMessage {
     },
     /// Full synchronization message
     FullSync {
-        local_actors: Vec<(String, RemoteActorLocation)>, // Use Vec instead of HashMap for rkyv compatibility
-        known_actors: Vec<(String, RemoteActorLocation)>, // Use Vec instead of HashMap for rkyv compatibility
+        local_actors: Vec<(String, RemoteActorLocation)>, // Use Vec for rkyv serialization
+        known_actors: Vec<(String, RemoteActorLocation)>, // Use Vec for rkyv serialization
         sender_peer_id: crate::PeerId,                    // Peer's unique identifier
         sequence: u64,
         wall_clock_time: u64,
     },
     /// Response to full sync
     FullSyncResponse {
-        local_actors: Vec<(String, RemoteActorLocation)>, // Use Vec instead of HashMap for rkyv compatibility
-        known_actors: Vec<(String, RemoteActorLocation)>, // Use Vec instead of HashMap for rkyv compatibility
+        local_actors: Vec<(String, RemoteActorLocation)>, // Use Vec for rkyv serialization
+        known_actors: Vec<(String, RemoteActorLocation)>, // Use Vec for rkyv serialization
         sender_peer_id: crate::PeerId,                    // Peer's unique identifier
         sequence: u64,
         wall_clock_time: u64,
@@ -122,7 +122,7 @@ pub enum RegistryMessage {
     /// Peer health status report
     PeerHealthReport {
         reporter: crate::PeerId,
-        peer_statuses: Vec<(String, PeerHealthStatus)>, // Use Vec instead of HashMap for rkyv compatibility
+        peer_statuses: Vec<(String, PeerHealthStatus)>, // Use Vec for rkyv serialization
         timestamp: u64,
     },
     /// Lightweight ACK for immediate registrations
@@ -183,7 +183,7 @@ pub struct RegistryStats {
 pub struct PeerInfo {
     pub address: SocketAddr,              // Listening address
     pub peer_address: Option<SocketAddr>, // Actual connection address (may be NATed)
-    pub node_id: Option<crate::NodeId>, // NodeId for TLS verification (optional for backward compat)
+    pub node_id: Option<crate::NodeId>,   // NodeId for TLS verification (may be learned on connect)
     pub failures: usize,
     pub last_attempt: u64,
     pub last_success: u64,
@@ -248,10 +248,10 @@ impl PeerInfo {
 }
 
 /// Peer information for gossip (rkyv-serializable version)
-/// Uses String instead of SocketAddr for rkyv compatibility
+/// Uses String instead of SocketAddr for rkyv serialization
 #[derive(Archive, RkyvSerialize, RkyvDeserialize, Debug, Clone)]
 pub struct PeerInfoGossip {
-    /// Listening address (as string for rkyv compatibility)
+    /// Listening address (as string for rkyv serialization)
     pub address: String,
     /// Actual connection address if different (NAT)
     pub peer_address: Option<String>,
@@ -393,12 +393,12 @@ impl StreamAssembly {
 impl GossipRegistry {
     /// Create a new gossip registry
     pub fn new(bind_addr: SocketAddr, config: GossipConfig) -> Self {
-        // Use public key from config, or generate one based on bind address
+        // Use public key from config (required for TLS identity)
         let peer_id = config
             .key_pair
             .as_ref()
-            .map(|kp| kp.peer_id())
-            .unwrap_or_else(|| crate::PeerId::new(format!("node_{}", bind_addr.port())));
+            .expect("GossipConfig.key_pair is required for TLS-only mode")
+            .peer_id();
 
         info!(
             bind_addr = %bind_addr,
@@ -416,7 +416,7 @@ impl GossipRegistry {
             config: config.clone(),
             start_time: current_timestamp(),
             start_instant: crate::current_instant(),
-            tls_config: None, // TLS disabled by default for backward compatibility
+            tls_config: None,
             actor_state: Arc::new(RwLock::new(ActorState {
                 local_actors: HashMap::new(),
                 known_actors: HashMap::new(),
@@ -501,16 +501,12 @@ impl GossipRegistry {
         eprintln!("clear_peer_capabilities addr {}", addr);
         self.peer_capabilities.remove(addr);
         if let Some((_, node_id)) = self.peer_capability_addr_to_node.remove(addr) {
-            self.peer_capabilities_by_node.remove(&node_id);
-
-            let stale_addrs: Vec<_> = self
+            let still_has_addr = self
                 .peer_capability_addr_to_node
                 .iter()
-                .filter(|entry| *entry.value() == node_id)
-                .map(|entry| *entry.key())
-                .collect();
-            for stale_addr in stale_addrs {
-                self.peer_capability_addr_to_node.remove(&stale_addr);
+                .any(|entry| *entry.value() == node_id);
+            if !still_has_addr {
+                self.peer_capabilities_by_node.remove(&node_id);
             }
         }
     }
@@ -757,19 +753,19 @@ impl GossipRegistry {
         }
     }
 
-    /// Configure a peer by node name and its expected connection address
-    pub async fn configure_peer(&self, node_name: String, connect_addr: SocketAddr) {
+    /// Configure a peer by peer ID and its expected connection address
+    pub async fn configure_peer(&self, peer_id: crate::PeerId, connect_addr: SocketAddr) {
         let pool = self.connection_pool.lock().await;
-        let peer_id = crate::PeerId::new(&node_name);
-        pool.peer_id_to_addr.insert(peer_id, connect_addr);
-        info!(node_name = %node_name, addr = %connect_addr, "Configured peer");
+        info!(peer_id = %peer_id, addr = %connect_addr, "Configured peer");
+        pool.peer_id_to_addr.insert(peer_id.clone(), connect_addr);
+        pool.reindex_connection_addr(&peer_id, connect_addr);
     }
 
-    /// Connect to a configured peer by node name
-    pub async fn connect_to_peer(&self, node_name: &str) -> Result<()> {
+    /// Connect to a configured peer by peer ID
+    pub async fn connect_to_peer(&self, peer_id: &crate::PeerId) -> Result<()> {
         let mut pool = self.connection_pool.lock().await;
-        pool.get_connection_to_node(node_name).await?;
-        info!(node_name = %node_name, "Connected to peer");
+        pool.get_connection_to_peer(peer_id).await?;
+        info!(peer_id = %peer_id, "Connected to peer");
         Ok(())
     }
 
@@ -2066,8 +2062,7 @@ impl GossipRegistry {
                 // Also ensure the peer's NodeId is in the gossip state for TLS
                 if let Ok(addr) = location.address.parse::<SocketAddr>() {
                     // Convert PeerId to NodeId for TLS
-                    let node_id =
-                        crate::migration::migrate_peer_id_to_node_id(&location.peer_id).ok();
+                    let node_id = Some(location.peer_id.to_node_id());
                     if node_id.is_some() {
                         // This will be used later when we need to connect to this peer for TLS
                         self.add_peer_with_node_id(addr, node_id).await;
@@ -2449,13 +2444,13 @@ impl GossipRegistry {
         Ok(())
     }
 
-    /// Handle a peer connection failure by node ID instead of address
-    pub async fn handle_peer_connection_failure_by_node_id(
+    /// Handle a peer connection failure by peer ID instead of address
+    pub async fn handle_peer_connection_failure_by_peer_id(
         &self,
-        failed_node_id: &str,
+        failed_peer_id: &crate::PeerId,
     ) -> Result<()> {
         info!(
-            failed_node_id = %failed_node_id,
+            failed_peer_id = %failed_peer_id,
             "node disconnection detected by ID, marking connection as failed (actors remain available)"
         );
 
@@ -2464,18 +2459,14 @@ impl GossipRegistry {
             let pool = self.connection_pool.lock().await;
 
             // Try to find the address from our node ID mapping
-            let failed_peer_id = crate::PeerId::new(failed_node_id);
-            let addr_opt = pool
-                .peer_id_to_addr
-                .get(&failed_peer_id)
-                .map(|entry| *entry);
+            let addr_opt = pool.peer_id_to_addr.get(failed_peer_id).map(|entry| *entry);
 
             match addr_opt {
                 Some(addr) => addr,
                 None => {
                     warn!(
-                        node_id = %failed_node_id,
-                        "cannot find address for failed node ID - may have already been removed"
+                        peer_id = %failed_peer_id,
+                        "cannot find address for failed peer ID - may have already been removed"
                     );
                     return Ok(());
                 }
@@ -2493,19 +2484,19 @@ impl GossipRegistry {
                 pool.remove_connection(failed_peer_addr);
                 info!(
                     addr = %failed_peer_addr,
-                    node_id = %failed_node_id,
+                    node_id = %failed_peer_id,
                     "removed disconnected connection from pool (both address and node ID mappings)"
                 );
             } else {
                 info!(
                     addr = %failed_peer_addr,
-                    node_id = %failed_node_id,
+                    node_id = %failed_peer_id,
                     "connection already removed from pool"
                 );
             }
 
             info!(
-                node_id = %failed_node_id,
+                node_id = %failed_peer_id,
                 addr = %failed_peer_addr,
                 connections_remaining = pool.connection_count(),
                 "connection cleanup complete"
@@ -2521,7 +2512,7 @@ impl GossipRegistry {
                 peer_info.last_attempt = current_time; // Update last_attempt so retry happens after interval
                 info!(
                     peer = %failed_peer_addr,
-                    node_id = %failed_node_id,
+                    node_id = %failed_peer_id,
                     retry_after_secs = self.config.peer_retry_interval.as_secs(),
                     "marked peer as disconnected in local state, will retry after interval"
                 );
@@ -2558,7 +2549,7 @@ impl GossipRegistry {
 
                 info!(
                     failed_peer = %failed_peer_addr,
-                    node_id = %failed_node_id,
+                    node_id = %failed_peer_id,
                     deadline = current_time + 5,
                     "created pending failure record, waiting for consensus on actor invalidation"
                 );
@@ -2925,7 +2916,15 @@ impl GossipRegistry {
             (changes, peers)
         };
 
-        if urgent_changes.is_empty() || critical_peers.is_empty() {
+        if urgent_changes.is_empty() {
+            return Ok(());
+        }
+
+        let urgent_changes_for_retry = urgent_changes.clone();
+
+        if critical_peers.is_empty() {
+            let mut gossip_state = self.gossip_state.lock().await;
+            gossip_state.pending_changes.extend(urgent_changes);
             return Ok(());
         }
 
@@ -2993,8 +2992,7 @@ impl GossipRegistry {
                         precise_timing_nanos,
                     },
                 };
-                let chunk_serialized =
-                    rkyv::to_bytes::<rkyv::rancor::Error>(&chunk_message)?;
+                let chunk_serialized = rkyv::to_bytes::<rkyv::rancor::Error>(&chunk_message)?;
                 serialized_messages.push(Arc::new(chunk_serialized));
                 current_changes.clear();
                 current_changes.push(last);
@@ -3071,6 +3069,14 @@ impl GossipRegistry {
 
             connections_buffers
         };
+
+        if peer_connections_buffers.is_empty() {
+            let mut gossip_state = self.gossip_state.lock().await;
+            gossip_state
+                .pending_changes
+                .extend(urgent_changes_for_retry);
+            return Ok(());
+        }
 
         // Send to all peers concurrently with pre-established connections and buffers
         let mut join_handles = Vec::new();
@@ -3766,11 +3772,15 @@ impl GossipRegistry {
     /// - Higher NodeId keeps inbound connection
     ///
     /// Returns true if this connection should be kept.
-    pub fn should_keep_connection(&self, remote_node_id: &str, is_outbound: bool) -> bool {
-        let local_id = self.peer_id.to_node_id().to_string();
-        let remote_id = remote_node_id.to_string();
+    pub fn should_keep_connection(
+        &self,
+        remote_peer_id: &crate::PeerId,
+        is_outbound: bool,
+    ) -> bool {
+        let local_id = self.peer_id.to_node_id();
+        let remote_id = remote_peer_id.to_node_id();
 
-        match local_id.cmp(&remote_id) {
+        match local_id.as_bytes().cmp(remote_id.as_bytes()) {
             std::cmp::Ordering::Less => is_outbound,
             std::cmp::Ordering::Greater => !is_outbound,
             std::cmp::Ordering::Equal => {
@@ -3781,18 +3791,17 @@ impl GossipRegistry {
         }
     }
 
-    /// Check if we already have a connection to a peer by node ID
-    pub async fn has_connection_to_node(&self, node_id: &str) -> bool {
+    /// Check if we already have a connection to a peer by peer ID
+    pub async fn has_connection_to_peer(&self, peer_id: &crate::PeerId) -> bool {
         let pool = self.connection_pool.lock().await;
-        let peer_id = crate::PeerId::new(node_id);
-        pool.has_connection_by_peer_id(&peer_id)
+        pool.has_connection_by_peer_id(peer_id)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::PeerId;
+    use crate::{KeyPair, PeerId};
     use std::net::{IpAddr, Ipv4Addr};
     use std::time::Duration;
 
@@ -3800,12 +3809,17 @@ mod tests {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port)
     }
 
+    fn test_peer_id(seed: &str) -> PeerId {
+        KeyPair::new_for_testing(seed).peer_id()
+    }
+
     fn test_location(addr: SocketAddr) -> RemoteActorLocation {
-        RemoteActorLocation::new_with_peer(addr, PeerId::new("test_peer"))
+        RemoteActorLocation::new_with_peer(addr, test_peer_id("test_peer"))
     }
 
     fn test_config() -> GossipConfig {
         GossipConfig {
+            key_pair: Some(KeyPair::new_for_testing("registry_tests")),
             gossip_interval: Duration::from_millis(100),
             cleanup_interval: Duration::from_millis(200),
             peer_retry_interval: Duration::from_millis(50),
@@ -3841,7 +3855,7 @@ mod tests {
             since_sequence: 10,
             current_sequence: 15,
             changes: vec![],
-            sender_peer_id: PeerId::new("test_peer"),
+            sender_peer_id: test_peer_id("test_peer"),
             wall_clock_time: 1000,
             precise_timing_nanos: 1_000_000_000_000, // 1000 seconds in nanoseconds
         };
@@ -3852,7 +3866,7 @@ mod tests {
 
         assert_eq!(deserialized.since_sequence, 10);
         assert_eq!(deserialized.current_sequence, 15);
-        assert_eq!(deserialized.sender_peer_id, PeerId::new("test_peer"));
+        assert_eq!(deserialized.sender_peer_id, test_peer_id("test_peer"));
     }
 
     #[test]
@@ -3875,7 +3889,7 @@ mod tests {
             since_sequence: 1,
             current_sequence: 2,
             changes: vec![],
-            sender_peer_id: PeerId::new("test_peer"),
+            sender_peer_id: test_peer_id("test_peer"),
             wall_clock_time: 1000,
             precise_timing_nanos: 1_000_000_000_000, // 1000 seconds in nanoseconds
         };
@@ -3890,7 +3904,7 @@ mod tests {
 
         // Test FullSyncRequest
         let msg = RegistryMessage::FullSyncRequest {
-            sender_peer_id: PeerId::new("test_peer"),
+            sender_peer_id: test_peer_id("test_peer"),
             sequence: 10,
             wall_clock_time: 1000,
         };
@@ -4225,7 +4239,7 @@ mod tests {
                 location,
                 priority: RegistrationPriority::Normal,
             }],
-            sender_peer_id: PeerId::new("node_b"),
+            sender_peer_id: test_peer_id("node_b"),
             wall_clock_time: current_timestamp(),
             precise_timing_nanos: crate::current_timestamp_nanos(),
         };
@@ -4258,7 +4272,7 @@ mod tests {
                 location: remote_location,
                 priority: RegistrationPriority::Normal,
             }],
-            sender_peer_id: PeerId::new("node_b"),
+            sender_peer_id: test_peer_id("node_b"),
             wall_clock_time: current_timestamp(),
             precise_timing_nanos: crate::current_timestamp_nanos(),
         };
@@ -4520,7 +4534,7 @@ mod tests {
         let task = GossipTask {
             peer_addr: test_addr(8081),
             message: RegistryMessage::FullSyncRequest {
-                sender_peer_id: PeerId::new("test_peer"),
+                sender_peer_id: test_peer_id("test_peer"),
                 sequence: 10,
                 wall_clock_time: 1000,
             },
@@ -4706,7 +4720,7 @@ mod tests {
             peer_gossip_interval: None,
             max_peer_gossip_targets: 1,
             allow_loopback_discovery: true,
-            ..Default::default()
+            ..test_config()
         };
 
         let registry = GossipRegistry::new("127.0.0.1:9000".parse().unwrap(), config);
@@ -4730,7 +4744,7 @@ mod tests {
             enable_peer_discovery: true,
             allow_loopback_discovery: true,
             max_peers: 1,
-            ..Default::default()
+            ..test_config()
         };
 
         let registry = GossipRegistry::new("127.0.0.1:9000".parse().unwrap(), config);

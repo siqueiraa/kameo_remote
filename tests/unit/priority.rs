@@ -1,10 +1,13 @@
 use kameo_remote::registry::*;
-use kameo_remote::{ActorLocation, GossipConfig, RegistrationPriority};
+use kameo_remote::{ActorLocation, GossipConfig, KeyPair, RegistrationPriority};
 use std::net::SocketAddr;
 
 fn create_test_registry() -> GossipRegistry {
     let bind_addr = "127.0.0.1:0".parse().unwrap();
-    let config = GossipConfig::default();
+    let config = GossipConfig {
+        key_pair: Some(KeyPair::new_for_testing("unit_priority")),
+        ..Default::default()
+    };
     GossipRegistry::new(bind_addr, config)
 }
 

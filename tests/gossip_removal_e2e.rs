@@ -13,7 +13,7 @@ async fn test_actor_removal_propagates() -> Result<(), Box<dyn std::error::Error
 
     let node_a = create_tls_node(config.clone()).await?;
     let node_b = create_tls_node(config.clone()).await?;
-    connect_bidirectional(&node_a, &node_b).await;
+    connect_bidirectional(&node_a, &node_b).await?;
 
     node_a
         .register_with_priority(

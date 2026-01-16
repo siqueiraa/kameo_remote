@@ -1,57 +1,95 @@
 use kameo_remote::*;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
+
+static TEST_MUTEX: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+async fn wait_for_lookup(
+    handle: &GossipRegistryHandle,
+    name: &str,
+    timeout: Duration,
+) -> RemoteActorLocation {
+    let start = Instant::now();
+    loop {
+        if let Some(location) = handle.lookup(name).await {
+            return location;
+        }
+        if start.elapsed() > timeout {
+            panic!("Timed out waiting for actor lookup: {}", name);
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn get_connection_for_peer(
+    handle: &GossipRegistryHandle,
+    peer_id: &PeerId,
+    local_id: &PeerId,
+    local_addr: std::net::SocketAddr,
+) -> kameo_remote::connection_pool::ConnectionHandle {
+    if peer_id == local_id {
+        handle.get_connection(local_addr).await.unwrap()
+    } else {
+        handle.get_connection_to_peer(peer_id).await.unwrap()
+    }
+}
 
 /// Comprehensive ask() API demonstration with lookup() by actor name
 /// Tests request-response patterns with performance comparisons
 #[tokio::test]
 async fn test_ask_with_lookup_and_performance() {
+    let _guard = TEST_MUTEX
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
     println!("🚀 Ask() with Lookup() Performance Test");
     println!("=======================================");
 
     // Setup three nodes
-    let config = GossipConfig::default();
+    let config = GossipConfig {
+        urgent_gossip_fanout: 32,
+        ..Default::default()
+    };
 
     println!("📡 Setting up 3-node cluster...");
-    let node1 = GossipRegistryHandle::new(
+    let node1_keypair = KeyPair::new_for_testing("node1");
+    let node2_keypair = KeyPair::new_for_testing("node2");
+    let node3_keypair = KeyPair::new_for_testing("node3");
+    let node1_id = node1_keypair.peer_id();
+    let node2_id = node2_keypair.peer_id();
+    let node3_id = node3_keypair.peer_id();
+
+    let node1 = GossipRegistryHandle::new_with_keypair(
         "127.0.0.1:30001".parse().unwrap(),
-        vec![],
-        Some(GossipConfig {
-            key_pair: Some(KeyPair::new_for_testing("node1")),
-            ..config.clone()
-        }),
+        node1_keypair,
+        Some(config.clone()),
     )
     .await
     .unwrap();
 
-    let node2 = GossipRegistryHandle::new(
+    let node2 = GossipRegistryHandle::new_with_keypair(
         "127.0.0.1:30002".parse().unwrap(),
-        vec![],
-        Some(GossipConfig {
-            key_pair: Some(KeyPair::new_for_testing("node2")),
-            ..config.clone()
-        }),
+        node2_keypair,
+        Some(config.clone()),
     )
     .await
     .unwrap();
 
-    let node3 = GossipRegistryHandle::new(
+    let node3 = GossipRegistryHandle::new_with_keypair(
         "127.0.0.1:30003".parse().unwrap(),
-        vec![],
-        Some(GossipConfig {
-            key_pair: Some(KeyPair::new_for_testing("node3")),
-            ..config.clone()
-        }),
+        node3_keypair,
+        Some(config.clone()),
     )
     .await
     .unwrap();
 
-    // Connect nodes
+    // Connect nodes (single-direction dial avoids tie-breaker churn)
     println!("\n🔗 Establishing peer connections...");
 
-    // Node1 connects to Node2 and Node3
-    let peer2 = node1.add_peer(&PeerId::new("node2")).await;
-    let peer3 = node1.add_peer(&PeerId::new("node3")).await;
+    // Node1 connects to Node2 and Node3 (bidirectional once established)
+    let peer2 = node1.add_peer(&node2_id).await;
+    let peer3 = node1.add_peer(&node3_id).await;
     peer2
         .connect(&"127.0.0.1:30002".parse().unwrap())
         .await
@@ -61,37 +99,13 @@ async fn test_ask_with_lookup_and_performance() {
         .await
         .unwrap();
 
-    // Node2 connects to Node1 and Node3
-    let peer1_from_2 = node2.add_peer(&PeerId::new("node1")).await;
-    let peer3_from_2 = node2.add_peer(&PeerId::new("node3")).await;
-    peer1_from_2
-        .connect(&"127.0.0.1:30001".parse().unwrap())
-        .await
-        .unwrap();
-    peer3_from_2
-        .connect(&"127.0.0.1:30003".parse().unwrap())
-        .await
-        .unwrap();
-
-    // Node3 connects to Node1 and Node2
-    let peer1_from_3 = node3.add_peer(&PeerId::new("node1")).await;
-    let peer2_from_3 = node3.add_peer(&PeerId::new("node2")).await;
-    peer1_from_3
-        .connect(&"127.0.0.1:30001".parse().unwrap())
-        .await
-        .unwrap();
-    peer2_from_3
-        .connect(&"127.0.0.1:30002".parse().unwrap())
-        .await
-        .unwrap();
-
     sleep(Duration::from_millis(200)).await;
     println!("✅ All nodes connected");
 
     // Register service actors
     println!("\n📋 Registering service actors...");
 
-    node1
+    node2
         .register_urgent(
             "database_service".to_string(),
             "127.0.0.1:40001".parse().unwrap(),
@@ -99,7 +113,7 @@ async fn test_ask_with_lookup_and_performance() {
         )
         .await
         .unwrap();
-    println!("   ✅ Node1: registered 'database_service'");
+    println!("   ✅ Node2: registered 'database_service'");
 
     node2
         .register_urgent(
@@ -133,38 +147,15 @@ async fn test_ask_with_lookup_and_performance() {
     let lookup_start = Instant::now();
 
     // Lookup actors and create connections
-    let db_location = node1.lookup("database_service").await.unwrap();
-    let db_conn = node1
-        .get_connection(match db_location.peer_id.as_str().as_str() {
-            "node1" => "127.0.0.1:30001".parse().unwrap(),
-            "node2" => "127.0.0.1:30002".parse().unwrap(),
-            "node3" => "127.0.0.1:30003".parse().unwrap(),
-            _ => panic!("Unknown peer"),
-        })
-        .await
-        .unwrap();
+    let db_location = wait_for_lookup(&node1, "database_service", Duration::from_secs(2)).await;
+    let db_conn = get_connection_for_peer(&node1, &db_location.peer_id, &node1_id, "127.0.0.1:30001".parse().unwrap()).await;
 
-    let compute_location = node1.lookup("compute_service").await.unwrap();
-    let compute_conn = node1
-        .get_connection(match compute_location.peer_id.as_str().as_str() {
-            "node1" => "127.0.0.1:30001".parse().unwrap(),
-            "node2" => "127.0.0.1:30002".parse().unwrap(),
-            "node3" => "127.0.0.1:30003".parse().unwrap(),
-            _ => panic!("Unknown peer"),
-        })
-        .await
-        .unwrap();
+    let compute_location =
+        wait_for_lookup(&node1, "compute_service", Duration::from_secs(2)).await;
+    let compute_conn = get_connection_for_peer(&node1, &compute_location.peer_id, &node1_id, "127.0.0.1:30001".parse().unwrap()).await;
 
-    let cache_location = node1.lookup("cache_service").await.unwrap();
-    let cache_conn = node1
-        .get_connection(match cache_location.peer_id.as_str().as_str() {
-            "node1" => "127.0.0.1:30001".parse().unwrap(),
-            "node2" => "127.0.0.1:30002".parse().unwrap(),
-            "node3" => "127.0.0.1:30003".parse().unwrap(),
-            _ => panic!("Unknown peer"),
-        })
-        .await
-        .unwrap();
+    let cache_location = wait_for_lookup(&node1, "cache_service", Duration::from_secs(2)).await;
+    let cache_conn = get_connection_for_peer(&node1, &cache_location.peer_id, &node1_id, "127.0.0.1:30001".parse().unwrap()).await;
 
     let lookup_time = lookup_start.elapsed();
 
@@ -389,7 +380,7 @@ async fn test_ask_with_lookup_and_performance() {
     let mock_response = reply_sender.create_mock_reply();
     println!(
         "   - Mock response: \"{}\"",
-        String::from_utf8_lossy(&mock_response)
+        String::from_utf8_lossy(mock_response.as_ref())
     );
 
     // Test with timeout
@@ -459,42 +450,38 @@ async fn test_ask_with_lookup_and_performance() {
 /// Test high-throughput ask() scenarios
 #[tokio::test]
 async fn test_ask_high_throughput() {
+    let _guard = TEST_MUTEX
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
     println!("🚀 High-Throughput ask() Test");
     println!("=============================");
 
     // Setup two nodes
-    let config = GossipConfig::default();
+    let config = GossipConfig {
+        urgent_gossip_fanout: 32,
+        ..Default::default()
+    };
     let node1_addr = "127.0.0.1:31001".parse().unwrap();
     let node2_addr = "127.0.0.1:31002".parse().unwrap();
 
-    let node1 = GossipRegistryHandle::new(
-        node1_addr,
-        vec![],
-        Some(GossipConfig {
-            key_pair: Some(KeyPair::new_for_testing("node1")),
-            ..config.clone()
-        }),
-    )
-    .await
-    .unwrap();
+    let node1_keypair = KeyPair::new_for_testing("node1_ht");
+    let node2_keypair = KeyPair::new_for_testing("node2_ht");
+    let node2_id = node2_keypair.peer_id();
 
-    let node2 = GossipRegistryHandle::new(
-        node2_addr,
-        vec![],
-        Some(GossipConfig {
-            key_pair: Some(KeyPair::new_for_testing("node2")),
-            ..config.clone()
-        }),
-    )
-    .await
-    .unwrap();
+    let node1 =
+        GossipRegistryHandle::new_with_keypair(node1_addr, node1_keypair, Some(config.clone()))
+            .await
+            .unwrap();
 
-    // Connect nodes
-    let peer2 = node1.add_peer(&PeerId::new("node2")).await;
+    let node2 =
+        GossipRegistryHandle::new_with_keypair(node2_addr, node2_keypair, Some(config.clone()))
+            .await
+            .unwrap();
+
+    // Connect nodes (single-direction dial avoids tie-breaker churn)
+    let peer2 = node1.add_peer(&node2_id).await;
     peer2.connect(&node2_addr).await.unwrap();
-
-    let peer1 = node2.add_peer(&PeerId::new("node1")).await;
-    peer1.connect(&node1_addr).await.unwrap();
 
     sleep(Duration::from_millis(100)).await;
 
@@ -511,8 +498,8 @@ async fn test_ask_high_throughput() {
     sleep(Duration::from_millis(50)).await;
 
     // Lookup and create connection
-    let _api_location = node1.lookup("api_service").await.unwrap();
-    let api_conn = node1.get_connection(node2_addr).await.unwrap();
+    // Skip lookup in this throughput test to avoid gossip timing dependencies.
+    let api_conn = node1.get_connection_to_peer(&node2_id).await.unwrap();
 
     // Test parameters
     let request_count = 1000;

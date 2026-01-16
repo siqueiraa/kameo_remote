@@ -14,6 +14,13 @@ fn create_test_actor_location(addr: SocketAddr) -> ActorLocation {
     }
 }
 
+fn test_config(seed: &str) -> GossipConfig {
+    GossipConfig {
+        key_pair: Some(KeyPair::new_for_testing(seed)),
+        ..Default::default()
+    }
+}
+
 #[test]
 fn test_gossip_error_display() {
     let errors = vec![
@@ -79,6 +86,7 @@ fn test_gossip_config_edge_cases() {
     
     // Test custom config
     let custom = GossipConfig {
+        key_pair: Some(KeyPair::new_for_testing("edge_custom_config")),
         gossip_interval: Duration::from_millis(1),
         max_gossip_peers: 1,
         actor_ttl: Duration::from_secs(1),
@@ -101,7 +109,7 @@ fn test_gossip_config_edge_cases() {
 async fn test_registry_with_empty_data() {
     let registry = GossipRegistry::new(
         "127.0.0.1:0".parse().unwrap(),
-        GossipConfig::default(),
+        test_config("edge_empty_data"),
     );
     
     // Test with no peers
@@ -131,7 +139,7 @@ async fn test_registry_with_empty_data() {
 async fn test_registry_with_invalid_data() {
     let registry = GossipRegistry::new(
         "127.0.0.1:0".parse().unwrap(),
-        GossipConfig::default(),
+        test_config("edge_invalid_data"),
     );
     
     // Test with invalid peer addresses (should be handled gracefully)
@@ -149,7 +157,7 @@ async fn test_registry_with_invalid_data() {
 async fn test_delta_application_edge_cases() {
     let registry = GossipRegistry::new(
         "127.0.0.1:0".parse().unwrap(),
-        GossipConfig::default(),
+        test_config("edge_delta_cases"),
     );
     
     let sender_addr = "127.0.0.1:8001".parse().unwrap();
@@ -193,7 +201,7 @@ async fn test_delta_application_edge_cases() {
 async fn test_registry_concurrent_modifications() {
     let registry = std::sync::Arc::new(GossipRegistry::new(
         "127.0.0.1:0".parse().unwrap(),
-        GossipConfig::default(),
+        test_config("edge_concurrent_mods"),
     ));
     
     let mut handles = vec![];
@@ -254,6 +262,7 @@ async fn test_registry_time_edge_cases() {
     let registry = GossipRegistry::new(
         "127.0.0.1:0".parse().unwrap(),
         GossipConfig {
+            key_pair: Some(KeyPair::new_for_testing("edge_time_cases")),
             actor_ttl: Duration::from_millis(1), // Very short TTL
             ..Default::default()
         },
@@ -285,7 +294,7 @@ async fn test_registry_time_edge_cases() {
 async fn test_registry_shutdown_edge_cases() {
     let registry = GossipRegistry::new(
         "127.0.0.1:0".parse().unwrap(),
-        GossipConfig::default(),
+        test_config("edge_shutdown"),
     );
     
     // Multiple shutdowns should be idempotent
@@ -381,7 +390,7 @@ fn test_current_timestamp_edge_cases() {
 async fn test_registry_with_malformed_addresses() {
     let registry = GossipRegistry::new(
         "127.0.0.1:0".parse().unwrap(),
-        GossipConfig::default(),
+        test_config("edge_malformed_addrs"),
     );
     
     // Test with port 0 (should work)

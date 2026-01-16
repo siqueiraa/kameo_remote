@@ -1,10 +1,11 @@
-use kameo_remote::{registry::GossipRegistry, GossipConfig};
+use kameo_remote::{registry::GossipRegistry, GossipConfig, KeyPair};
 use std::net::SocketAddr;
 use std::time::Duration;
 
 #[tokio::test]
 async fn test_peer_retry_backoff_gate() -> Result<(), Box<dyn std::error::Error>> {
     let config = GossipConfig {
+        key_pair: Some(KeyPair::new_for_testing("backoff_gate")),
         peer_retry_interval: Duration::from_secs(1),
         max_peer_failures: 2,
         gossip_interval: Duration::from_millis(200),

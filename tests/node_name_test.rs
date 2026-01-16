@@ -1,4 +1,4 @@
-use kameo_remote::{GossipConfig, GossipRegistryHandle, PeerId, SecretKey};
+use kameo_remote::{GossipConfig, GossipRegistryHandle, KeyPair};
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -21,10 +21,11 @@ async fn test_node_name_based_connections() {
     };
 
     // Start Node A first with TLS
-    let secret_a = SecretKey::generate();
-    let node_a = GossipRegistryHandle::new_with_tls(
+    let key_pair_a = KeyPair::new_for_testing("test_node_a");
+    let peer_id_a = key_pair_a.peer_id();
+    let node_a = GossipRegistryHandle::new_with_keypair(
         "127.0.0.1:0".parse().unwrap(), // Use port 0 for dynamic allocation
-        secret_a,
+        key_pair_a,
         Some(config_a),
     )
     .await
@@ -34,10 +35,11 @@ async fn test_node_name_based_connections() {
     println!("Node A started at {}", node_a_addr);
 
     // Start Node B with TLS
-    let secret_b = SecretKey::generate();
-    let node_b = GossipRegistryHandle::new_with_tls(
+    let key_pair_b = KeyPair::new_for_testing("test_node_b");
+    let peer_id_b = key_pair_b.peer_id();
+    let node_b = GossipRegistryHandle::new_with_keypair(
         "127.0.0.1:0".parse().unwrap(),
-        secret_b,
+        key_pair_b,
         Some(config_b),
     )
     .await
@@ -47,14 +49,14 @@ async fn test_node_name_based_connections() {
     println!("Node B started at {}", node_b_addr);
 
     // Node B: Add node A as peer and connect
-    let peer_a = node_b.add_peer(&PeerId::new("test_node_a")).await;
+    let peer_a = node_b.add_peer(&peer_id_a).await;
     peer_a
         .connect(&node_a_addr)
         .await
         .expect("Failed to connect to node A");
 
     // Node A: Add node B as peer and connect
-    let peer_b = node_a.add_peer(&PeerId::new("test_node_b")).await;
+    let peer_b = node_a.add_peer(&peer_id_b).await;
     peer_b
         .connect(&node_b_addr)
         .await
@@ -71,9 +73,7 @@ async fn test_node_name_based_connections() {
         println!("  Node mappings: {}", pool.peer_id_to_addr.len());
 
         // Verify Node B knows about Node A
-        assert!(pool
-            .peer_id_to_addr
-            .contains_key(&PeerId::new("test_node_a")));
+        assert!(pool.peer_id_to_addr.contains_key(&peer_id_a));
         assert_eq!(pool.connection_count(), 1);
     }
 
@@ -85,9 +85,7 @@ async fn test_node_name_based_connections() {
         println!("  Node mappings: {}", pool.peer_id_to_addr.len());
 
         // After exchange, Node A should know about Node B
-        assert!(pool
-            .peer_id_to_addr
-            .contains_key(&PeerId::new("test_node_b")));
+        assert!(pool.peer_id_to_addr.contains_key(&peer_id_b));
     }
 
     // Clean shutdown

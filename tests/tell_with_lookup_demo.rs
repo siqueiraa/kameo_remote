@@ -13,35 +13,33 @@ async fn test_tell_with_lookup_and_performance_comparison() {
     let config = GossipConfig::default();
 
     println!("📡 Setting up 3-node cluster...");
-    let node1 = GossipRegistryHandle::new(
+    let node1_keypair = KeyPair::new_for_testing("node1");
+    let node2_keypair = KeyPair::new_for_testing("node2");
+    let node3_keypair = KeyPair::new_for_testing("node3");
+    let node1_id = node1_keypair.peer_id();
+    let node2_id = node2_keypair.peer_id();
+    let node3_id = node3_keypair.peer_id();
+
+    let node1 = GossipRegistryHandle::new_with_keypair(
         "127.0.0.1:29001".parse().unwrap(),
-        vec![],
-        Some(GossipConfig {
-            key_pair: Some(KeyPair::new_for_testing("node1")),
-            ..config.clone()
-        }),
+        node1_keypair,
+        Some(config.clone()),
     )
     .await
     .unwrap();
 
-    let node2 = GossipRegistryHandle::new(
+    let node2 = GossipRegistryHandle::new_with_keypair(
         "127.0.0.1:29002".parse().unwrap(),
-        vec![],
-        Some(GossipConfig {
-            key_pair: Some(KeyPair::new_for_testing("node2")),
-            ..config.clone()
-        }),
+        node2_keypair,
+        Some(config.clone()),
     )
     .await
     .unwrap();
 
-    let node3 = GossipRegistryHandle::new(
+    let node3 = GossipRegistryHandle::new_with_keypair(
         "127.0.0.1:29003".parse().unwrap(),
-        vec![],
-        Some(GossipConfig {
-            key_pair: Some(KeyPair::new_for_testing("node3")),
-            ..config.clone()
-        }),
+        node3_keypair,
+        Some(config.clone()),
     )
     .await
     .unwrap();
@@ -50,8 +48,8 @@ async fn test_tell_with_lookup_and_performance_comparison() {
     println!("\n🔗 Establishing peer connections...");
 
     // Node1 connects to Node2 and Node3
-    let peer2 = node1.add_peer(&PeerId::new("node2")).await;
-    let peer3 = node1.add_peer(&PeerId::new("node3")).await;
+    let peer2 = node1.add_peer(&node2_id).await;
+    let peer3 = node1.add_peer(&node3_id).await;
     peer2
         .connect(&"127.0.0.1:29002".parse().unwrap())
         .await
@@ -62,8 +60,8 @@ async fn test_tell_with_lookup_and_performance_comparison() {
         .unwrap();
 
     // Node2 connects to Node1 and Node3
-    let peer1_from_2 = node2.add_peer(&PeerId::new("node1")).await;
-    let peer3_from_2 = node2.add_peer(&PeerId::new("node3")).await;
+    let peer1_from_2 = node2.add_peer(&node1_id).await;
+    let peer3_from_2 = node2.add_peer(&node3_id).await;
     peer1_from_2
         .connect(&"127.0.0.1:29001".parse().unwrap())
         .await
@@ -74,8 +72,8 @@ async fn test_tell_with_lookup_and_performance_comparison() {
         .unwrap();
 
     // Node3 connects to Node1 and Node2
-    let peer1_from_3 = node3.add_peer(&PeerId::new("node1")).await;
-    let peer2_from_3 = node3.add_peer(&PeerId::new("node2")).await;
+    let peer1_from_3 = node3.add_peer(&node1_id).await;
+    let peer2_from_3 = node3.add_peer(&node2_id).await;
     peer1_from_3
         .connect(&"127.0.0.1:29001".parse().unwrap())
         .await
@@ -167,11 +165,14 @@ async fn test_tell_with_lookup_and_performance_comparison() {
         .await
         .expect("chat_service not found");
     let chat_conn = node1
-        .get_connection(match chat_location.peer_id.as_str().as_str() {
-            "node1" => "127.0.0.1:29001".parse().unwrap(),
-            "node2" => "127.0.0.1:29002".parse().unwrap(),
-            "node3" => "127.0.0.1:29003".parse().unwrap(),
-            _ => panic!("Unknown peer"),
+        .get_connection(if chat_location.peer_id == node1_id {
+            "127.0.0.1:29001".parse().unwrap()
+        } else if chat_location.peer_id == node2_id {
+            "127.0.0.1:29002".parse().unwrap()
+        } else if chat_location.peer_id == node3_id {
+            "127.0.0.1:29003".parse().unwrap()
+        } else {
+            panic!("Unknown peer")
         })
         .await
         .unwrap();
@@ -181,11 +182,14 @@ async fn test_tell_with_lookup_and_performance_comparison() {
         .await
         .expect("auth_service not found");
     let auth_conn = node1
-        .get_connection(match auth_location.peer_id.as_str().as_str() {
-            "node1" => "127.0.0.1:29001".parse().unwrap(),
-            "node2" => "127.0.0.1:29002".parse().unwrap(),
-            "node3" => "127.0.0.1:29003".parse().unwrap(),
-            _ => panic!("Unknown peer"),
+        .get_connection(if auth_location.peer_id == node1_id {
+            "127.0.0.1:29001".parse().unwrap()
+        } else if auth_location.peer_id == node2_id {
+            "127.0.0.1:29002".parse().unwrap()
+        } else if auth_location.peer_id == node3_id {
+            "127.0.0.1:29003".parse().unwrap()
+        } else {
+            panic!("Unknown peer")
         })
         .await
         .unwrap();
@@ -195,11 +199,14 @@ async fn test_tell_with_lookup_and_performance_comparison() {
         .await
         .expect("storage_service not found");
     let storage_conn = node1
-        .get_connection(match storage_location.peer_id.as_str().as_str() {
-            "node1" => "127.0.0.1:29001".parse().unwrap(),
-            "node2" => "127.0.0.1:29002".parse().unwrap(),
-            "node3" => "127.0.0.1:29003".parse().unwrap(),
-            _ => panic!("Unknown peer"),
+        .get_connection(if storage_location.peer_id == node1_id {
+            "127.0.0.1:29001".parse().unwrap()
+        } else if storage_location.peer_id == node2_id {
+            "127.0.0.1:29002".parse().unwrap()
+        } else if storage_location.peer_id == node3_id {
+            "127.0.0.1:29003".parse().unwrap()
+        } else {
+            panic!("Unknown peer")
         })
         .await
         .unwrap();
@@ -647,9 +654,14 @@ async fn test_lookup_error_handling() {
     println!("🔍 Testing lookup error handling");
 
     let config = GossipConfig::default();
-    let node = GossipRegistryHandle::new("127.0.0.1:29100".parse().unwrap(), vec![], Some(config))
-        .await
-        .unwrap();
+    let keypair = KeyPair::new_for_testing("lookup_error_node");
+    let node = GossipRegistryHandle::new_with_keypair(
+        "127.0.0.1:29100".parse().unwrap(),
+        keypair,
+        Some(config),
+    )
+    .await
+    .unwrap();
 
     // Try to lookup non-existent actor
     let result = node.lookup("non_existent_actor").await;

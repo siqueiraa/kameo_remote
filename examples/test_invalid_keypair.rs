@@ -34,12 +34,13 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create config with keypair
     let config = GossipConfig {
-        key_pair: Some(server_keypair),
+        key_pair: Some(server_keypair.clone()),
         ..Default::default()
     };
 
     let server_addr: SocketAddr = "127.0.0.1:28101".parse()?;
-    let registry = GossipRegistryHandle::new(server_addr, vec![], Some(config)).await?;
+    let registry =
+        GossipRegistryHandle::new_with_keypair(server_addr, server_keypair, Some(config)).await?;
 
     // Register a test actor
     registry
@@ -104,12 +105,14 @@ async fn run_client_with_wrong_key() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create config with WRONG keypair
     let config = GossipConfig {
-        key_pair: Some(wrong_client_keypair),
+        key_pair: Some(wrong_client_keypair.clone()),
         ..Default::default()
     };
 
     let client_addr: SocketAddr = "127.0.0.1:28103".parse()?;
-    let registry = GossipRegistryHandle::new(client_addr, vec![], Some(config)).await?;
+    let registry =
+        GossipRegistryHandle::new_with_keypair(client_addr, wrong_client_keypair, Some(config))
+            .await?;
 
     println!(
         "\n✅ Client started on {} with WRONG PeerId: {}",

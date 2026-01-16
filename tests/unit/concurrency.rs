@@ -5,11 +5,18 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 
+fn test_config(seed: &str) -> GossipConfig {
+    GossipConfig {
+        key_pair: Some(KeyPair::new_for_testing(seed)),
+        ..Default::default()
+    }
+}
+
 #[tokio::test]
 async fn test_concurrent_actor_registration() {
     let registry = Arc::new(GossipRegistry::new(
         "127.0.0.1:0".parse().unwrap(),
-        GossipConfig::default(),
+        test_config("concurrency_default"),
     ));
     
     let mut handles = vec![];
@@ -41,7 +48,7 @@ async fn test_concurrent_actor_registration() {
 async fn test_concurrent_actor_lookup() {
     let registry = Arc::new(GossipRegistry::new(
         "127.0.0.1:0".parse().unwrap(),
-        GossipConfig::default(),
+        test_config("concurrency_default"),
     ));
     
     // Register some actors first
@@ -80,7 +87,7 @@ async fn test_concurrent_actor_lookup() {
 async fn test_concurrent_register_and_unregister() {
     let registry = Arc::new(GossipRegistry::new(
         "127.0.0.1:0".parse().unwrap(),
-        GossipConfig::default(),
+        test_config("concurrency_default"),
     ));
     
     let mut handles = vec![];
@@ -120,7 +127,7 @@ async fn test_concurrent_register_and_unregister() {
 async fn test_concurrent_delta_application() {
     let registry = Arc::new(GossipRegistry::new(
         "127.0.0.1:0".parse().unwrap(),
-        GossipConfig::default(),
+        test_config("concurrency_default"),
     ));
     
     let mut handles = vec![];
@@ -167,7 +174,7 @@ async fn test_concurrent_delta_application() {
 async fn test_concurrent_gossip_round_preparation() {
     let registry = Arc::new(GossipRegistry::new(
         "127.0.0.1:0".parse().unwrap(),
-        GossipConfig::default(),
+        test_config("concurrency_default"),
     ));
     
     // Add some peers
@@ -208,7 +215,7 @@ async fn test_concurrent_gossip_round_preparation() {
 async fn test_concurrent_stats_access() {
     let registry = Arc::new(GossipRegistry::new(
         "127.0.0.1:0".parse().unwrap(),
-        GossipConfig::default(),
+        test_config("concurrency_default"),
     ));
     
     // Add some data
@@ -240,7 +247,7 @@ async fn test_concurrent_stats_access() {
 async fn test_concurrent_cleanup_operations() {
     let registry = Arc::new(GossipRegistry::new(
         "127.0.0.1:0".parse().unwrap(),
-        GossipConfig::default(),
+        test_config("concurrency_default"),
     ));
     
     // Add some stale remote actors
@@ -286,7 +293,7 @@ async fn test_concurrent_cleanup_operations() {
 async fn test_concurrent_shutdown_and_operations() {
     let registry = Arc::new(GossipRegistry::new(
         "127.0.0.1:0".parse().unwrap(),
-        GossipConfig::default(),
+        test_config("concurrency_default"),
     ));
     
     let mut handles = vec![];
@@ -345,7 +352,7 @@ async fn test_concurrent_shutdown_and_operations() {
 async fn test_concurrent_peer_management() {
     let registry = Arc::new(GossipRegistry::new(
         "127.0.0.1:0".parse().unwrap(),
-        GossipConfig::default(),
+        test_config("concurrency_default"),
     ));
     
     let mut handles = vec![];
@@ -377,7 +384,7 @@ async fn test_concurrent_peer_management() {
 async fn test_concurrent_full_sync_operations() {
     let registry = Arc::new(GossipRegistry::new(
         "127.0.0.1:0".parse().unwrap(),
-        GossipConfig::default(),
+        test_config("concurrency_default"),
     ));
     
     let mut handles = vec![];
@@ -429,12 +436,13 @@ async fn test_concurrent_full_sync_operations() {
 #[tokio::test]
 async fn test_concurrent_handle_operations() {
     let bind_addr = "127.0.0.1:0".parse().unwrap();
-    let config = GossipConfig::default();
+    let config = test_config("concurrency_default");
     
+    let keypair = KeyPair::new_for_testing("unit_concurrency_handle");
     let handle = Arc::new(
-        GossipRegistryHandle::new(bind_addr, vec![], Some(config))
+        GossipRegistryHandle::new_with_keypair(bind_addr, keypair, Some(config))
             .await
-            .unwrap()
+            .unwrap(),
     );
     
     let mut handles = vec![];
@@ -480,7 +488,7 @@ async fn test_concurrent_handle_operations() {
 async fn test_deadlock_prevention() {
     let registry = Arc::new(GossipRegistry::new(
         "127.0.0.1:0".parse().unwrap(),
-        GossipConfig::default(),
+        test_config("concurrency_default"),
     ));
     
     let mut handles = vec![];
