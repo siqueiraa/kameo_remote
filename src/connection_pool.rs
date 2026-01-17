@@ -3171,6 +3171,29 @@ impl ConnectionPool {
         })
     }
 
+    /// Get the peer ID for a given socket address
+    pub fn get_peer_id_by_addr(&self, addr: &SocketAddr) -> Option<crate::PeerId> {
+        self.addr_to_peer_id.get(addr).map(|e| e.value().clone())
+    }
+
+    /// Add an additional address mapping for a peer ID.
+    /// Used when a peer connects from an ephemeral port that differs from their bind address.
+    pub fn add_addr_to_peer_id(&self, addr: SocketAddr, peer_id: crate::PeerId) {
+        debug!(
+            "CONNECTION POOL: Adding additional address {} -> peer_id {}",
+            addr, peer_id
+        );
+        self.addr_to_peer_id.insert(addr, peer_id);
+    }
+
+    /// Get the shared correlation tracker for a peer ID
+    pub(crate) fn get_shared_correlation_tracker(
+        &self,
+        peer_id: &crate::PeerId,
+    ) -> Option<Arc<CorrelationTracker>> {
+        self.correlation_trackers.get(peer_id).map(|e| e.value().clone())
+    }
+
     /// Get or create a correlation tracker for a peer
     pub(crate) fn get_or_create_correlation_tracker(
         &self,
@@ -3244,6 +3267,19 @@ impl ConnectionPool {
 
         self.connection_counter.fetch_add(1, Ordering::AcqRel);
         true
+    }
+
+    /// Index an existing connection by an additional address.
+    ///
+    /// This is useful for incoming connections where the ephemeral TCP address
+    /// differs from the peer's configured bind address. By indexing both addresses,
+    /// response delivery can find the connection by the ephemeral address.
+    pub fn index_connection_by_addr(&self, addr: SocketAddr, connection: Arc<LockFreeConnection>) {
+        debug!(
+            "CONNECTION POOL: Indexing connection by additional address {}",
+            addr
+        );
+        self.connections_by_addr.insert(addr, connection);
     }
 
     /// Send data to a peer by ID
@@ -6317,14 +6353,17 @@ pub(crate) fn handle_incoming_message(
                             );
                             let payload = bytes::Bytes::from(reply_payload);
 
-                            // Send response back through the same connection
+                            // CRITICAL FIX: Send response back through the SAME connection where
+                            // the request arrived, not to the peer's bind address (which may use
+                            // a different connection). Use _peer_addr (actual TCP source address)
+                            // to ensure the reply goes back on the original connection.
                             let pool = registry.connection_pool.lock().await;
                             if let Err(e) = pool.send_lock_free_parts(
-                                peer_state_addr,
+                                _peer_addr,
                                 bytes::Bytes::copy_from_slice(&header),
                                 payload,
                             ) {
-                                warn!(peer = %peer_state_addr, error = %e, "Failed to send ask reply");
+                                warn!(peer = %_peer_addr, peer_state_addr = %peer_state_addr, error = %e, "Failed to send ask reply");
                             }
                         }
 
