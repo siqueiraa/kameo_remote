@@ -4047,6 +4047,7 @@ impl ConnectionPool {
                     local_actors: actor_state.local_actors.clone().into_iter().collect(),
                     known_actors: actor_state.known_actors.clone().into_iter().collect(),
                     sender_peer_id: registry_arc.peer_id.clone(),
+                    sender_bind_addr: registry_arc.bind_addr.to_string(), // Use our listening address, not ephemeral port
                     sequence: gossip_state.gossip_sequence,
                     wall_clock_time: crate::current_timestamp(),
                 }
@@ -5727,16 +5728,28 @@ pub(crate) fn handle_incoming_message(
                 local_actors,
                 known_actors,
                 sender_peer_id,
+                sender_bind_addr,
                 sequence,
                 wall_clock_time,
             } => {
-                let sender_socket_addr =
-                    resolve_peer_state_addr(&registry, Some(&sender_peer_id), _peer_addr).await;
+                // CRITICAL FIX: Use sender_bind_addr (peer's listening address) instead of _peer_addr (ephemeral TCP source port)
+                // The TCP source address is an ephemeral port that cannot receive connections.
+                // The sender_bind_addr is the peer's actual listening address that we should use for gossip.
+                let sender_socket_addr: std::net::SocketAddr = sender_bind_addr
+                    .parse()
+                    .unwrap_or_else(|_| {
+                        warn!(
+                            "Failed to parse sender_bind_addr '{}', falling back to resolve_peer_state_addr",
+                            sender_bind_addr
+                        );
+                        // Fallback to existing resolution
+                        futures::executor::block_on(resolve_peer_state_addr(&registry, Some(&sender_peer_id), _peer_addr))
+                    });
 
                 // Note: sender_peer_id is now a PeerId (e.g., "node_a"), not an address
                 debug!(
-                    "Received FullSync from node '{}' at address {}",
-                    sender_peer_id, sender_socket_addr
+                    "Received FullSync from node '{}' at bind_addr {} (tcp_source={})",
+                    sender_peer_id, sender_socket_addr, _peer_addr
                 );
 
                 // OPTIMIZATION: Do all peer management in one lock acquisition
@@ -5854,6 +5867,7 @@ pub(crate) fn handle_incoming_message(
                         local_actors: our_local_actors.into_iter().collect(),
                         known_actors: our_known_actors.into_iter().collect(),
                         sender_peer_id: registry.peer_id.clone(), // Use peer ID
+                        sender_bind_addr: registry.bind_addr.to_string(), // Our listening address
                         sequence: our_sequence,
                         wall_clock_time: crate::current_timestamp(),
                     };
@@ -5979,6 +5993,7 @@ pub(crate) fn handle_incoming_message(
             }
             RegistryMessage::FullSyncRequest {
                 sender_peer_id,
+                sender_bind_addr: _, // Not used for requests, but must be present
                 sequence: _,
                 wall_clock_time: _,
             } => {
@@ -6015,18 +6030,29 @@ pub(crate) fn handle_incoming_message(
                 local_actors,
                 known_actors,
                 sender_peer_id,
+                sender_bind_addr,
                 sequence,
                 wall_clock_time,
             } => {
+                // CRITICAL FIX: Use sender_bind_addr (peer's listening address) instead of _peer_addr
+                let sender_socket_addr: std::net::SocketAddr = sender_bind_addr
+                    .parse()
+                    .unwrap_or_else(|_| {
+                        warn!(
+                            "Failed to parse sender_bind_addr '{}', falling back to resolve_peer_state_addr",
+                            sender_bind_addr
+                        );
+                        futures::executor::block_on(resolve_peer_state_addr(&registry, Some(&sender_peer_id), _peer_addr))
+                    });
+
                 debug!(
                     sender = %sender_peer_id,
+                    bind_addr = %sender_socket_addr,
+                    tcp_source = %_peer_addr,
                     local_actors = local_actors.len(),
                     known_actors = known_actors.len(),
-                    "RECEIVED: FullSyncResponse from peer"
+                    "RECEIVED: FullSyncResponse from peer (using bind_addr)"
                 );
-
-                let sender_socket_addr =
-                    resolve_peer_state_addr(&registry, Some(&sender_peer_id), _peer_addr).await;
 
                 registry
                     .merge_full_sync(

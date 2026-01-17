@@ -100,6 +100,7 @@ pub enum RegistryMessage {
     /// Request for full sync (fallback when deltas are unavailable)
     FullSyncRequest {
         sender_peer_id: crate::PeerId, // Peer's unique identifier
+        sender_bind_addr: String,      // Sender's listening address (not ephemeral TCP source port)
         sequence: u64,
         wall_clock_time: u64,
     },
@@ -108,6 +109,7 @@ pub enum RegistryMessage {
         local_actors: Vec<(String, RemoteActorLocation)>, // Use Vec for rkyv serialization
         known_actors: Vec<(String, RemoteActorLocation)>, // Use Vec for rkyv serialization
         sender_peer_id: crate::PeerId,                    // Peer's unique identifier
+        sender_bind_addr: String,                         // Sender's listening address (not ephemeral TCP source port)
         sequence: u64,
         wall_clock_time: u64,
     },
@@ -116,6 +118,7 @@ pub enum RegistryMessage {
         local_actors: Vec<(String, RemoteActorLocation)>, // Use Vec for rkyv serialization
         known_actors: Vec<(String, RemoteActorLocation)>, // Use Vec for rkyv serialization
         sender_peer_id: crate::PeerId,                    // Peer's unique identifier
+        sender_bind_addr: String,                         // Sender's listening address (not ephemeral TCP source port)
         sequence: u64,
         wall_clock_time: u64,
     },
@@ -1494,6 +1497,7 @@ impl GossipRegistry {
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
             sender_peer_id: self.peer_id.clone(), // Use peer ID
+            sender_bind_addr: self.bind_addr.to_string(), // Use our listening address, not ephemeral port
             sequence,
             wall_clock_time: current_timestamp(),
         }
@@ -1516,6 +1520,7 @@ impl GossipRegistry {
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
             sender_peer_id: self.peer_id.clone(), // Use peer ID
+            sender_bind_addr: self.bind_addr.to_string(), // Use our listening address, not ephemeral port
             sequence,
             wall_clock_time: current_timestamp(),
         }
@@ -1863,30 +1868,43 @@ impl GossipRegistry {
                 local_actors,
                 known_actors,
                 sender_peer_id,
+                sender_bind_addr,
                 sequence,
                 wall_clock_time,
             } => {
+                // CRITICAL FIX: Use sender_bind_addr (peer's listening address) instead of addr (ephemeral TCP source)
+                let sender_socket_addr: std::net::SocketAddr = sender_bind_addr
+                    .parse()
+                    .unwrap_or_else(|_| {
+                        warn!(
+                            "Failed to parse sender_bind_addr '{}', falling back to addr {}",
+                            sender_bind_addr, addr
+                        );
+                        addr
+                    });
+
                 info!(
-                    peer = %addr,
+                    tcp_source = %addr,
+                    bind_addr = %sender_socket_addr,
                     sender = %sender_peer_id,
                     sequence = sequence,
                     local_actors = local_actors.len(),
                     known_actors = known_actors.len(),
-                    "📥 GOSSIP: Received full sync response"
+                    "📥 GOSSIP: Received full sync response (using bind_addr, not TCP source)"
                 );
 
-                // Use the peer address we're connected to
+                // Use the peer's BIND address (not ephemeral TCP source port)
                 self.merge_full_sync(
                     local_actors.into_iter().collect(),
                     known_actors.into_iter().collect(),
-                    addr,
+                    sender_socket_addr,
                     sequence,
                     wall_clock_time,
                 )
                 .await;
 
                 let mut gossip_state = self.gossip_state.lock().await;
-                if let Some(peer_info) = gossip_state.peers.get_mut(&addr) {
+                if let Some(peer_info) = gossip_state.peers.get_mut(&sender_socket_addr) {
                     peer_info.consecutive_deltas = 0;
                     peer_info.last_sequence = sequence;
                 }
@@ -3905,6 +3923,7 @@ mod tests {
         // Test FullSyncRequest
         let msg = RegistryMessage::FullSyncRequest {
             sender_peer_id: test_peer_id("test_peer"),
+            sender_bind_addr: "127.0.0.1:9000".to_string(),
             sequence: 10,
             wall_clock_time: 1000,
         };
@@ -4535,6 +4554,7 @@ mod tests {
             peer_addr: test_addr(8081),
             message: RegistryMessage::FullSyncRequest {
                 sender_peer_id: test_peer_id("test_peer"),
+                sender_bind_addr: "127.0.0.1:9000".to_string(),
                 sequence: 10,
                 wall_clock_time: 1000,
             },
