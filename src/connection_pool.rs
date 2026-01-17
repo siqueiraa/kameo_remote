@@ -5746,6 +5746,22 @@ pub(crate) fn handle_incoming_message(
                 {
                     let mut gossip_state = registry.gossip_state.lock().await;
 
+                    // FIX: If the resolved bind address differs from the TCP source address,
+                    // remove any stale entry for the TCP source (ephemeral port) that was
+                    // added during TLS handshake. This prevents gossip retry failures to
+                    // unreachable ephemeral ports.
+                    if sender_socket_addr != _peer_addr && _peer_addr != registry.bind_addr {
+                        if gossip_state.peers.remove(&_peer_addr).is_some() {
+                            info!(
+                                old_addr = %_peer_addr,
+                                new_addr = %sender_socket_addr,
+                                "🔄 Replacing ephemeral TCP source address with bind address from FullSync"
+                            );
+                            // Also clean up pending failures for the old address
+                            gossip_state.pending_peer_failures.remove(&_peer_addr);
+                        }
+                    }
+
                     // Add the sender as a peer (inlined to avoid separate lock)
                     if sender_socket_addr != registry.bind_addr {
                         if let std::collections::hash_map::Entry::Vacant(e) =
@@ -5813,6 +5829,12 @@ pub(crate) fn handle_incoming_message(
                 // This allows bidirectional communication to work properly
                 {
                     let pool = registry.connection_pool.lock().await;
+
+                    // FIX: Clean up any stale mapping for the old ephemeral TCP source address
+                    if sender_socket_addr != _peer_addr {
+                        pool.addr_to_peer_id.remove(&_peer_addr);
+                    }
+
                     pool.peer_id_to_addr
                         .insert(sender_peer_id.clone(), sender_socket_addr);
                     pool.addr_to_peer_id
@@ -6048,6 +6070,22 @@ pub(crate) fn handle_incoming_message(
 
                 // Reset failure state when receiving response
                 let mut gossip_state = registry.gossip_state.lock().await;
+
+                // FIX: If the resolved bind address differs from the TCP source address,
+                // remove any stale entry for the TCP source (ephemeral port) that was
+                // added during TLS handshake. This prevents gossip retry failures to
+                // unreachable ephemeral ports.
+                if sender_socket_addr != _peer_addr && _peer_addr != registry.bind_addr {
+                    if gossip_state.peers.remove(&_peer_addr).is_some() {
+                        info!(
+                            old_addr = %_peer_addr,
+                            new_addr = %sender_socket_addr,
+                            "🔄 Replacing ephemeral TCP source address with bind address from FullSyncResponse"
+                        );
+                        // Also clean up pending failures for the old address
+                        gossip_state.pending_peer_failures.remove(&_peer_addr);
+                    }
+                }
 
                 // Reset failure state for responding peer
                 let need_to_clear_pending =
