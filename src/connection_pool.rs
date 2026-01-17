@@ -5747,22 +5747,27 @@ pub(crate) fn handle_incoming_message(
                     let mut gossip_state = registry.gossip_state.lock().await;
 
                     // FIX: If the resolved bind address differs from the TCP source address,
-                    // remove any stale entry for the TCP source (ephemeral port) that was
-                    // added during TLS handshake. This prevents gossip retry failures to
-                    // unreachable ephemeral ports.
+                    // migrate the PeerInfo from the ephemeral port entry to the bind address.
+                    // This preserves node_id, sequence, and failure state learned during TLS handshake.
                     if sender_socket_addr != _peer_addr && _peer_addr != registry.bind_addr {
-                        if gossip_state.peers.remove(&_peer_addr).is_some() {
+                        if let Some(mut old_peer_info) = gossip_state.peers.remove(&_peer_addr) {
                             info!(
                                 old_addr = %_peer_addr,
                                 new_addr = %sender_socket_addr,
-                                "🔄 Replacing ephemeral TCP source address with bind address from FullSync"
+                                node_id = ?old_peer_info.node_id,
+                                "🔄 Migrating peer info from ephemeral TCP source to bind address from FullSync"
                             );
+                            // Update the address field and preserve the connection address
+                            old_peer_info.address = sender_socket_addr;
+                            old_peer_info.peer_address = Some(_peer_addr);
+                            // Insert with new key (bind address), preserving all state
+                            gossip_state.peers.insert(sender_socket_addr, old_peer_info);
                             // Also clean up pending failures for the old address
                             gossip_state.pending_peer_failures.remove(&_peer_addr);
                         }
                     }
 
-                    // Add the sender as a peer (inlined to avoid separate lock)
+                    // Add the sender as a peer if not already present (inlined to avoid separate lock)
                     if sender_socket_addr != registry.bind_addr {
                         if let std::collections::hash_map::Entry::Vacant(e) =
                             gossip_state.peers.entry(sender_socket_addr)
@@ -5771,7 +5776,7 @@ pub(crate) fn handle_incoming_message(
                             let current_time = crate::current_timestamp();
                             e.insert(crate::registry::PeerInfo {
                                 address: sender_socket_addr,
-                                peer_address: None,
+                                peer_address: Some(_peer_addr), // Remember the actual connection address
                                 node_id: None,
                                 failures: 0,
                                 last_attempt: current_time,
@@ -6068,20 +6073,45 @@ pub(crate) fn handle_incoming_message(
                     )
                     .await;
 
+                // FIX: Update peer_id mappings (mirror the FullSync handler logic)
+                // This prevents stale ephemeral addresses from being reintroduced via resolve_peer_state_addr
+                {
+                    let pool = registry.connection_pool.lock().await;
+
+                    // Clean up any stale mapping for the old ephemeral TCP source address
+                    if sender_socket_addr != _peer_addr {
+                        pool.addr_to_peer_id.remove(&_peer_addr);
+                    }
+
+                    pool.peer_id_to_addr
+                        .insert(sender_peer_id.clone(), sender_socket_addr);
+                    pool.addr_to_peer_id
+                        .insert(sender_socket_addr, sender_peer_id.clone());
+                    debug!(
+                        "BIDIRECTIONAL: Updated connection mapping from FullSyncResponse - peer_id={} addr={}",
+                        sender_peer_id, sender_socket_addr
+                    );
+                }
+
                 // Reset failure state when receiving response
                 let mut gossip_state = registry.gossip_state.lock().await;
 
                 // FIX: If the resolved bind address differs from the TCP source address,
-                // remove any stale entry for the TCP source (ephemeral port) that was
-                // added during TLS handshake. This prevents gossip retry failures to
-                // unreachable ephemeral ports.
+                // migrate the PeerInfo from the ephemeral port entry to the bind address.
+                // This preserves node_id, sequence, and failure state learned during TLS handshake.
                 if sender_socket_addr != _peer_addr && _peer_addr != registry.bind_addr {
-                    if gossip_state.peers.remove(&_peer_addr).is_some() {
+                    if let Some(mut old_peer_info) = gossip_state.peers.remove(&_peer_addr) {
                         info!(
                             old_addr = %_peer_addr,
                             new_addr = %sender_socket_addr,
-                            "🔄 Replacing ephemeral TCP source address with bind address from FullSyncResponse"
+                            node_id = ?old_peer_info.node_id,
+                            "🔄 Migrating peer info from ephemeral TCP source to bind address from FullSyncResponse"
                         );
+                        // Update the address field and preserve the connection address
+                        old_peer_info.address = sender_socket_addr;
+                        old_peer_info.peer_address = Some(_peer_addr);
+                        // Insert with new key (bind address), preserving all state
+                        gossip_state.peers.insert(sender_socket_addr, old_peer_info);
                         // Also clean up pending failures for the old address
                         gossip_state.pending_peer_failures.remove(&_peer_addr);
                     }
