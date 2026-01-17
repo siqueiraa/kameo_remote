@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     current_timestamp, framing,
-    registry::{GossipRegistry, RegistryMessage},
+    registry::{resolve_peer_addr, GossipRegistry, RegistryMessage},
     GossipError, Result,
 };
 
@@ -4047,7 +4047,7 @@ impl ConnectionPool {
                     local_actors: actor_state.local_actors.clone().into_iter().collect(),
                     known_actors: actor_state.known_actors.clone().into_iter().collect(),
                     sender_peer_id: registry_arc.peer_id.clone(),
-                    sender_bind_addr: registry_arc.bind_addr.to_string(), // Use our listening address, not ephemeral port
+                    sender_bind_addr: Some(registry_arc.bind_addr.to_string()), // Use our listening address, not ephemeral port
                     sequence: gossip_state.gossip_sequence,
                     wall_clock_time: crate::current_timestamp(),
                 }
@@ -5732,19 +5732,9 @@ pub(crate) fn handle_incoming_message(
                 sequence,
                 wall_clock_time,
             } => {
-                // CRITICAL FIX: Use sender_bind_addr (peer's listening address) instead of _peer_addr (ephemeral TCP source port)
-                // The TCP source address is an ephemeral port that cannot receive connections.
-                // The sender_bind_addr is the peer's actual listening address that we should use for gossip.
-                let sender_socket_addr: std::net::SocketAddr = sender_bind_addr
-                    .parse()
-                    .unwrap_or_else(|_| {
-                        warn!(
-                            "Failed to parse sender_bind_addr '{}', falling back to resolve_peer_state_addr",
-                            sender_bind_addr
-                        );
-                        // Fallback to existing resolution
-                        futures::executor::block_on(resolve_peer_state_addr(&registry, Some(&sender_peer_id), _peer_addr))
-                    });
+                // Use resolve_peer_addr for safe address resolution with validation
+                // This handles: None, invalid addresses, 0.0.0.0, and falls back to TCP source
+                let sender_socket_addr = resolve_peer_addr(sender_bind_addr.as_deref(), _peer_addr);
 
                 // Note: sender_peer_id is now a PeerId (e.g., "node_a"), not an address
                 debug!(
@@ -5867,7 +5857,7 @@ pub(crate) fn handle_incoming_message(
                         local_actors: our_local_actors.into_iter().collect(),
                         known_actors: our_known_actors.into_iter().collect(),
                         sender_peer_id: registry.peer_id.clone(), // Use peer ID
-                        sender_bind_addr: registry.bind_addr.to_string(), // Our listening address
+                        sender_bind_addr: Some(registry.bind_addr.to_string()), // Our listening address
                         sequence: our_sequence,
                         wall_clock_time: crate::current_timestamp(),
                     };
@@ -6034,16 +6024,8 @@ pub(crate) fn handle_incoming_message(
                 sequence,
                 wall_clock_time,
             } => {
-                // CRITICAL FIX: Use sender_bind_addr (peer's listening address) instead of _peer_addr
-                let sender_socket_addr: std::net::SocketAddr = sender_bind_addr
-                    .parse()
-                    .unwrap_or_else(|_| {
-                        warn!(
-                            "Failed to parse sender_bind_addr '{}', falling back to resolve_peer_state_addr",
-                            sender_bind_addr
-                        );
-                        futures::executor::block_on(resolve_peer_state_addr(&registry, Some(&sender_peer_id), _peer_addr))
-                    });
+                // Use resolve_peer_addr for safe address resolution with validation
+                let sender_socket_addr = resolve_peer_addr(sender_bind_addr.as_deref(), _peer_addr);
 
                 debug!(
                     sender = %sender_peer_id,
