@@ -534,7 +534,6 @@ impl GossipRegistry {
 
     /// Track negotiated peer capabilities for a peer connection
     pub fn set_peer_capabilities(&self, addr: SocketAddr, caps: PeerCapabilities) {
-        eprintln!("set_peer_capabilities addr {}", addr);
         self.peer_capabilities.insert(addr, caps);
     }
 
@@ -551,7 +550,6 @@ impl GossipRegistry {
 
     /// Remove stored capabilities for a peer (e.g., when connection closes)
     pub fn clear_peer_capabilities(&self, addr: &SocketAddr) {
-        eprintln!("clear_peer_capabilities addr {}", addr);
         self.peer_capabilities.remove(addr);
         if let Some((_, node_id)) = self.peer_capability_addr_to_node.remove(addr) {
             let still_has_addr = self
@@ -566,19 +564,6 @@ impl GossipRegistry {
 
     /// Determine whether a peer supports receiving PeerListGossip
     pub async fn peer_supports_peer_list(&self, addr: &SocketAddr) -> bool {
-        eprintln!(
-            "peer_supports called for {} entries {}",
-            addr,
-            self.peer_capabilities.len()
-        );
-        for entry in self.peer_capabilities.iter() {
-            eprintln!(
-                " capability entry addr {} can {}",
-                entry.key(),
-                entry.value().can_send_peer_list()
-            );
-        }
-
         if let Some(entry) = self.peer_capabilities.get(addr) {
             return entry.value().can_send_peer_list();
         }
@@ -1191,8 +1176,6 @@ impl GossipRegistry {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-
-        eprintln!("🔍 RECEIVED_TIMESTAMP: {}ns", received_timestamp);
 
         // Apply changes atomically under write lock
         let applied_count = {

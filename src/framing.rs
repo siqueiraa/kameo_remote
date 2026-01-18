@@ -3,7 +3,7 @@ use crate::MessageType;
 pub const LENGTH_PREFIX_LEN: usize = 4;
 pub const ASK_RESPONSE_HEADER_LEN: usize = 4; // type(1) + correlation_id(2) + pad(1)
 pub const GOSSIP_HEADER_LEN: usize = 4; // type(1) + pad(3)
-pub const ACTOR_HEADER_LEN: usize = 20; // type(1) + correlation_id(2) + pad(1) + actor_id(8) + type_hash(4) + payload_len(4)
+pub const ACTOR_HEADER_LEN: usize = 24; // type(1) + correlation_id(2) + reserved(5) + actor_id(8) + type_hash(4) + payload_len(4)
 pub const STREAM_HEADER_PREFIX_LEN: usize = 8; // type(1) + correlation_id(2) + reserved(5)
 
 pub const ASK_RESPONSE_FRAME_HEADER_LEN: usize = LENGTH_PREFIX_LEN + ASK_RESPONSE_HEADER_LEN;

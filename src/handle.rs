@@ -671,14 +671,7 @@ async fn handle_tls_connection(
     )
     .await
     {
-        Ok(caps) => {
-            eprintln!(
-                "inbound hello capabilities from {} can_send={}",
-                peer_addr,
-                caps.can_send_peer_list()
-            );
-            caps
-        }
+        Ok(caps) => caps,
         Err(err) => {
             warn!(
                 peer = %peer_addr,
@@ -1507,12 +1500,14 @@ where
                         }
 
                         // Parse the actor message envelope
+                        // Wire format (from kameo): [type:1][correlation_id:2][reserved:5][actor_id:8][type_hash:4][payload_len:4][payload:N]
                         let msg_type_byte = msg_data[0];
                         let correlation_id = u16::from_be_bytes([msg_data[1], msg_data[2]]);
-                        let actor_id = u64::from_be_bytes(msg_data[4..12].try_into().unwrap());
-                        let type_hash = u32::from_be_bytes(msg_data[12..16].try_into().unwrap());
+                        // Skip reserved bytes (3-7), actor_id starts at byte 8
+                        let actor_id = u64::from_be_bytes(msg_data[8..16].try_into().unwrap());
+                        let type_hash = u32::from_be_bytes(msg_data[16..20].try_into().unwrap());
                         let payload_len =
-                            u32::from_be_bytes(msg_data[16..20].try_into().unwrap()) as usize;
+                            u32::from_be_bytes(msg_data[20..24].try_into().unwrap()) as usize;
 
                         if msg_data.len() < crate::framing::ACTOR_HEADER_LEN + payload_len {
                             return Ok(MessageReadResult::Raw(msg_data));
