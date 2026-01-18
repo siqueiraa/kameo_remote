@@ -1238,12 +1238,14 @@ where
                 debug!(peer_addr = %peer_addr, "Ignoring raw message payload");
             }
             Err(e) => {
-                debug!(error = %e, "TLS connection closed or error reading message");
+                warn!(peer_addr = %peer_addr, error = %e, "⚠️ TLS connection closed or error reading message - incoming handler exiting");
                 break;
             }
         }
     }
 
+    warn!(peer_addr = %peer_addr, sender_node_id = %sender_node_id,
+        "📤 Incoming TLS connection handler loop exited - peer may need reconnection");
     ConnectionCloseOutcome::Normal {
         node_id: Some(sender_node_id),
     }
