@@ -1104,11 +1104,11 @@ where
                 }
             }
         }
-        Ok(MessageReadResult::Raw(payload)) => {
+        Ok(MessageReadResult::Raw(_payload)) => {
             #[cfg(any(test, feature = "test-helpers", debug_assertions))]
             {
                 if std::env::var("KAMEO_REMOTE_TYPED_TELL_CAPTURE").is_ok() {
-                    crate::test_helpers::record_raw_payload(payload.clone());
+                    crate::test_helpers::record_raw_payload(_payload.clone());
                 }
             }
             debug!(peer_addr = %peer_addr, "Ignoring raw message payload");
@@ -1235,11 +1235,11 @@ where
                     }
                 }
             }
-            Ok(MessageReadResult::Raw(payload)) => {
+            Ok(MessageReadResult::Raw(_payload)) => {
                 #[cfg(any(test, feature = "test-helpers", debug_assertions))]
                 {
                     if std::env::var("KAMEO_REMOTE_TYPED_TELL_CAPTURE").is_ok() {
-                        crate::test_helpers::record_raw_payload(payload.clone());
+                        crate::test_helpers::record_raw_payload(_payload.clone());
                     }
                 }
                 debug!(peer_addr = %peer_addr, "Ignoring raw message payload");

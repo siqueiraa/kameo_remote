@@ -4245,11 +4245,11 @@ impl ConnectionPool {
                     Ok(crate::handle::MessageReadResult::Streaming { .. }) => {
                         // Streaming messages are not handled on outgoing readers yet.
                     }
-                    Ok(crate::handle::MessageReadResult::Raw(payload)) => {
+                    Ok(crate::handle::MessageReadResult::Raw(_payload)) => {
                         #[cfg(any(test, feature = "test-helpers", debug_assertions))]
                         {
                             if std::env::var("KAMEO_REMOTE_TYPED_TELL_CAPTURE").is_ok() {
-                                crate::test_helpers::record_raw_payload(payload.clone());
+                                crate::test_helpers::record_raw_payload(_payload.clone());
                             }
                         }
                         // Raw tell payloads are ignored on outgoing readers.
