@@ -3090,39 +3090,61 @@ impl ConnectionPool {
     /// a different bind address in gossip. We need to update `connections_by_addr` so
     /// that lookups by the advertised address find the connection.
     pub fn reindex_connection_addr(&self, peer_id: &crate::PeerId, new_addr: SocketAddr) {
-        // First, check if the connection is already indexed under new_addr.
-        // This avoids repeated reindexing on every gossip sync.
-        if self.connections_by_addr.contains_key(&new_addr) {
-            // Already indexed under the advertised address, nothing to do
+        // First, check if this peer still has an active connection
+        // This guards against race conditions where disconnect happens between checks
+        let connection = match self.connections_by_peer.get(peer_id) {
+            Some(entry) => entry.value().clone(),
+            None => {
+                // Peer was disconnected, nothing to reindex
+                return;
+            }
+        };
+
+        // Check if new_addr is already indexed
+        if let Some(existing_peer_id) = self.addr_to_peer_id.get(&new_addr) {
+            if existing_peer_id.value() == peer_id {
+                // Already indexed under the advertised address for this peer, nothing to do
+                return;
+            } else {
+                // Stale entry from different peer - remove it before reindexing
+                // This can happen if an old connection wasn't fully cleaned up
+                warn!(
+                    "CONNECTION POOL: Removing stale address mapping {} (was peer {}, now peer {})",
+                    new_addr, existing_peer_id.value(), peer_id
+                );
+                self.connections_by_addr.remove(&new_addr);
+                self.addr_to_peer_id.remove(&new_addr);
+            }
+        }
+
+        let old_addr = connection.addr;
+
+        // Double-check peer still exists (guard against concurrent disconnect)
+        if !self.connections_by_peer.contains_key(peer_id) {
             return;
         }
 
-        if let Some(entry) = self.connections_by_peer.get(peer_id) {
-            let connection = entry.value().clone();
-            let old_addr = connection.addr;
+        // Insert the connection under the new (advertised) address
+        self.connections_by_addr.insert(new_addr, connection.clone());
+        self.addr_to_peer_id.insert(new_addr, peer_id.clone());
+        // Also update peer_id_to_addr so disconnect uses the correct address
+        self.peer_id_to_addr.insert(peer_id.clone(), new_addr);
 
-            // Insert the connection under the new (advertised) address
-            self.connections_by_addr.insert(new_addr, connection.clone());
-            self.addr_to_peer_id.insert(new_addr, peer_id.clone());
-            // Also update peer_id_to_addr so disconnect uses the correct address
-            self.peer_id_to_addr.insert(peer_id.clone(), new_addr);
-
-            // IMPORTANT: Keep the old (ephemeral) address entry as well!
-            // Inbound messages still arrive with the TCP source address (old_addr),
-            // so we need both addresses to point to the same connection.
-            // The old entry is NOT removed - both addresses are valid for this peer.
-            if old_addr != new_addr {
-                // Re-insert connection under old addr to ensure both addresses work
-                self.connections_by_addr.insert(old_addr, connection);
-                // Keep addr_to_peer_id for old_addr so lookups work
-                self.addr_to_peer_id.insert(old_addr, peer_id.clone());
-            }
-
-            debug!(
-                "CONNECTION POOL: Reindexed peer {} - added {} alongside {} (both addresses valid)",
-                peer_id, new_addr, old_addr
-            );
+        // IMPORTANT: Keep the old (ephemeral) address entry as well!
+        // Inbound messages still arrive with the TCP source address (old_addr),
+        // so we need both addresses to point to the same connection.
+        // The old entry is NOT removed - both addresses are valid for this peer.
+        if old_addr != new_addr {
+            // Re-insert connection under old addr to ensure both addresses work
+            self.connections_by_addr.insert(old_addr, connection);
+            // Keep addr_to_peer_id for old_addr so lookups work
+            self.addr_to_peer_id.insert(old_addr, peer_id.clone());
         }
+
+        debug!(
+            "CONNECTION POOL: Reindexed peer {} - added {} alongside {} (both addresses valid)",
+            peer_id, new_addr, old_addr
+        );
     }
 
     /// Get a connection by peer ID
@@ -4391,29 +4413,34 @@ impl ConnectionPool {
 
     /// Clean up stale connections
     pub fn cleanup_stale_connections(&mut self) {
-        let to_remove: Vec<_> = self
-            .connections_by_addr
+        // Find disconnected peers and use peer-id-based removal to clean up all maps
+        let stale_peer_ids: Vec<_> = self
+            .connections_by_peer
             .iter()
             .filter(|entry| !entry.value().is_connected())
-            .map(|entry| *entry.key())
+            .map(|entry| entry.key().clone())
             .collect();
 
-        for addr in to_remove {
-            self.connections_by_addr.remove(&addr);
-            debug!(addr = %addr, "cleaned up disconnected connection");
+        for peer_id in stale_peer_ids {
+            if let Some(_conn) = self.disconnect_connection_by_peer_id(&peer_id) {
+                debug!(peer_id = %peer_id, "cleaned up disconnected connection (all aliases)");
+            }
         }
     }
 
     /// Close all connections (for shutdown)
     pub fn close_all_connections(&mut self) {
-        let addrs: Vec<_> = self
-            .connections_by_addr
+        // Use peer-id-based removal to properly clean up all address aliases
+        // This avoids double-decrement of connection_counter when a connection
+        // has both ephemeral and bind addresses after reindexing
+        let peer_ids: Vec<_> = self
+            .connections_by_peer
             .iter()
-            .map(|entry| *entry.key())
+            .map(|entry| entry.key().clone())
             .collect();
-        let count = addrs.len();
-        for addr in addrs {
-            self.remove_connection(addr);
+        let count = peer_ids.len();
+        for peer_id in peer_ids {
+            self.disconnect_connection_by_peer_id(&peer_id);
         }
         info!("closed all {} connections", count);
     }
