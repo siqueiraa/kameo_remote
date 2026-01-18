@@ -708,8 +708,15 @@ impl LockFreeStreamHandle {
             let flush_pending_for_task = flush_pending.clone();
             let writer_idle_for_task = writer_idle.clone();
             let writer_notify_for_task = writer_notify.clone();
+            let writer_addr = addr;
+            let writer_channel_id = channel_id;
 
             tokio::spawn(async move {
+                info!(
+                    addr = %writer_addr,
+                    channel_id = ?writer_channel_id,
+                    "🚀 Background writer task started"
+                );
                 Self::background_writer_task(
                     tcp_writer,
                     ring_buffer,
@@ -722,6 +729,12 @@ impl LockFreeStreamHandle {
                     streaming_rx,
                 )
                 .await;
+                // CRITICAL: Log when writer exits - this helps diagnose silent writer deaths
+                warn!(
+                    addr = %writer_addr,
+                    channel_id = ?writer_channel_id,
+                    "⚠️ Background writer task EXITED - no more writes possible on this connection!"
+                );
             });
         }
 
@@ -1554,10 +1567,23 @@ impl LockFreeStreamHandle {
             permit: None,
         };
 
-        let _ = self.ring_buffer.try_push(command);
-        self.wake_writer_if_idle();
-        // Don't increment bytes_written here - only increment when actually written to TCP
-        Ok(())
+        // CRITICAL FIX: Don't silently drop messages when ring buffer is full!
+        // Previously used `let _ =` which ignored try_push failures.
+        if self.ring_buffer.try_push(command) {
+            self.wake_writer_if_idle();
+            // Don't increment bytes_written here - only increment when actually written to TCP
+            Ok(())
+        } else {
+            warn!(
+                channel_id = ?self.channel_id,
+                sequence = sequence,
+                "Ring buffer full - message dropped!"
+            );
+            Err(GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "write buffer full",
+            )))
+        }
     }
 
     /// Write header + payload without concatenating (single ring-buffer entry).
@@ -1575,9 +1601,21 @@ impl LockFreeStreamHandle {
             permit: None,
         };
 
-        let _ = self.ring_buffer.try_push(command);
-        self.wake_writer_if_idle();
-        Ok(())
+        // CRITICAL FIX: Don't silently drop messages when ring buffer is full!
+        if self.ring_buffer.try_push(command) {
+            self.wake_writer_if_idle();
+            Ok(())
+        } else {
+            warn!(
+                channel_id = ?self.channel_id,
+                sequence = sequence,
+                "Ring buffer full (header+payload) - message dropped!"
+            );
+            Err(GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "write buffer full",
+            )))
+        }
     }
 
     /// Write Bytes to the ring buffer; returns WouldBlock if full.
