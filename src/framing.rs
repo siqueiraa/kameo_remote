@@ -3,7 +3,7 @@ use crate::MessageType;
 pub const LENGTH_PREFIX_LEN: usize = 4;
 pub const ASK_RESPONSE_HEADER_LEN: usize = 4; // type(1) + correlation_id(2) + pad(1)
 pub const GOSSIP_HEADER_LEN: usize = 4; // type(1) + pad(3)
-pub const ACTOR_HEADER_LEN: usize = 20; // type(1) + correlation_id(2) + pad(1) + actor_id(8) + type_hash(4) + payload_len(4)
+pub const ACTOR_HEADER_LEN: usize = 24; // type(1) + correlation_id(2) + reserved(5) + actor_id(8) + type_hash(4) + payload_len(4)
 pub const STREAM_HEADER_PREFIX_LEN: usize = 8; // type(1) + correlation_id(2) + reserved(5)
 
 pub const ASK_RESPONSE_FRAME_HEADER_LEN: usize = LENGTH_PREFIX_LEN + ASK_RESPONSE_HEADER_LEN;
@@ -60,9 +60,15 @@ mod tests {
     }
 
     #[test]
-    fn actor_payload_offset_aligned_with_length_prefix() {
+    fn actor_payload_offset_with_length_prefix() {
+        // NOTE: Actor payload is NOT 8-byte aligned with the current wire format.
+        // Wire format (from kameo): [len:4][type:1][corr:2][reserved:5][actor_id:8][type_hash:4][payload_len:4][payload:N]
+        // Payload offset = 4 + 24 = 28, and 28 % 8 = 4 (not aligned)
+        // The runtime code handles this by copying to an aligned buffer when needed
+        // (see decode_registry_message in handle.rs).
         let offset = LENGTH_PREFIX_LEN + ACTOR_HEADER_LEN;
-        assert!(is_aligned(offset));
+        assert_eq!(offset, 28);
+        assert_eq!(offset % ALIGNMENT, 4); // Documents that it's NOT 8-byte aligned
     }
 
     #[test]
@@ -120,7 +126,8 @@ mod tests {
 
             assert!(is_aligned(LENGTH_PREFIX_LEN + ASK_RESPONSE_HEADER_LEN));
             assert!(is_aligned(LENGTH_PREFIX_LEN + GOSSIP_HEADER_LEN));
-            assert!(is_aligned(LENGTH_PREFIX_LEN + ACTOR_HEADER_LEN));
+            // Note: Actor header is NOT 8-byte aligned (28 % 8 = 4), handled at runtime
+            assert_eq!((LENGTH_PREFIX_LEN + ACTOR_HEADER_LEN) % ALIGNMENT, 4);
         }
     }
 }

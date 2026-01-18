@@ -3084,27 +3084,67 @@ impl ConnectionPool {
         );
     }
 
-    /// Reindex an existing connection under a new logical address for the peer
+    /// Reindex an existing connection under a new logical address for the peer.
+    ///
+    /// This is needed when a peer connects FROM an ephemeral TCP port but advertises
+    /// a different bind address in gossip. We need to update `connections_by_addr` so
+    /// that lookups by the advertised address find the connection.
     pub fn reindex_connection_addr(&self, peer_id: &crate::PeerId, new_addr: SocketAddr) {
-        if let Some(entry) = self.connections_by_peer.get(peer_id) {
-            let connection = entry.value().clone();
-            let old_addr = connection.addr;
-
-            if old_addr == new_addr {
+        // First, check if this peer still has an active connection
+        // This guards against race conditions where disconnect happens between checks
+        let connection = match self.connections_by_peer.get(peer_id) {
+            Some(entry) => entry.value().clone(),
+            None => {
+                // Peer was disconnected, nothing to reindex
                 return;
             }
+        };
 
-            self.connections_by_addr.insert(new_addr, connection);
-            self.addr_to_peer_id.insert(new_addr, peer_id.clone());
-
-            self.connections_by_addr.remove(&old_addr);
-            self.addr_to_peer_id.remove(&old_addr);
-
-            debug!(
-                "CONNECTION POOL: Reindexed peer {} from {} to {}",
-                peer_id, old_addr, new_addr
-            );
+        // Check if new_addr is already indexed
+        if let Some(existing_peer_id) = self.addr_to_peer_id.get(&new_addr) {
+            if existing_peer_id.value() == peer_id {
+                // Already indexed under the advertised address for this peer, nothing to do
+                return;
+            } else {
+                // Stale entry from different peer - remove it before reindexing
+                // This can happen if an old connection wasn't fully cleaned up
+                warn!(
+                    "CONNECTION POOL: Removing stale address mapping {} (was peer {}, now peer {})",
+                    new_addr, existing_peer_id.value(), peer_id
+                );
+                self.connections_by_addr.remove(&new_addr);
+                self.addr_to_peer_id.remove(&new_addr);
+            }
         }
+
+        let old_addr = connection.addr;
+
+        // Double-check peer still exists (guard against concurrent disconnect)
+        if !self.connections_by_peer.contains_key(peer_id) {
+            return;
+        }
+
+        // Insert the connection under the new (advertised) address
+        self.connections_by_addr.insert(new_addr, connection.clone());
+        self.addr_to_peer_id.insert(new_addr, peer_id.clone());
+        // Also update peer_id_to_addr so disconnect uses the correct address
+        self.peer_id_to_addr.insert(peer_id.clone(), new_addr);
+
+        // IMPORTANT: Keep the old (ephemeral) address entry as well!
+        // Inbound messages still arrive with the TCP source address (old_addr),
+        // so we need both addresses to point to the same connection.
+        // The old entry is NOT removed - both addresses are valid for this peer.
+        if old_addr != new_addr {
+            // Re-insert connection under old addr to ensure both addresses work
+            self.connections_by_addr.insert(old_addr, connection);
+            // Keep addr_to_peer_id for old_addr so lookups work
+            self.addr_to_peer_id.insert(old_addr, peer_id.clone());
+        }
+
+        debug!(
+            "CONNECTION POOL: Reindexed peer {} - added {} alongside {} (both addresses valid)",
+            peer_id, new_addr, old_addr
+        );
     }
 
     /// Get a connection by peer ID
@@ -3515,11 +3555,25 @@ impl ConnectionPool {
         peer_id: &crate::PeerId,
     ) -> Option<Arc<LockFreeConnection>> {
         if let Some((_, connection)) = self.connections_by_peer.remove(peer_id) {
-            let addr = connection.addr;
-            self.connections_by_addr.remove(&addr);
-            self.addr_to_peer_id.remove(&addr);
+            // Remove peer_id_to_addr entry
+            self.peer_id_to_addr.remove(peer_id);
+
+            // Remove ALL addr_to_peer_id entries for this peer
+            // (may have multiple due to reindexing keeping both ephemeral and bind addresses)
+            let addrs_to_remove: Vec<SocketAddr> = self
+                .addr_to_peer_id
+                .iter()
+                .filter(|entry| entry.value() == peer_id)
+                .map(|entry| *entry.key())
+                .collect();
+
+            for addr in &addrs_to_remove {
+                self.addr_to_peer_id.remove(addr);
+                self.connections_by_addr.remove(addr);
+                self.clear_capabilities_for_addr(addr);
+            }
+
             self.connection_counter.fetch_sub(1, Ordering::AcqRel);
-            self.clear_capabilities_for_addr(&addr);
             Some(connection)
         } else {
             None
@@ -3965,14 +4019,7 @@ impl ConnectionPool {
                         )
                         .await
                         {
-                            Ok(caps) => {
-                                eprintln!(
-                                    "outbound hello capabilities to {} can_send={}",
-                                    addr,
-                                    caps.can_send_peer_list()
-                                );
-                                caps
-                            }
+                            Ok(caps) => caps,
                             Err(err) => {
                                 warn!(
                                     addr = %addr,
@@ -4366,29 +4413,34 @@ impl ConnectionPool {
 
     /// Clean up stale connections
     pub fn cleanup_stale_connections(&mut self) {
-        let to_remove: Vec<_> = self
-            .connections_by_addr
+        // Find disconnected peers and use peer-id-based removal to clean up all maps
+        let stale_peer_ids: Vec<_> = self
+            .connections_by_peer
             .iter()
             .filter(|entry| !entry.value().is_connected())
-            .map(|entry| *entry.key())
+            .map(|entry| entry.key().clone())
             .collect();
 
-        for addr in to_remove {
-            self.connections_by_addr.remove(&addr);
-            debug!(addr = %addr, "cleaned up disconnected connection");
+        for peer_id in stale_peer_ids {
+            if let Some(_conn) = self.disconnect_connection_by_peer_id(&peer_id) {
+                debug!(peer_id = %peer_id, "cleaned up disconnected connection (all aliases)");
+            }
         }
     }
 
     /// Close all connections (for shutdown)
     pub fn close_all_connections(&mut self) {
-        let addrs: Vec<_> = self
-            .connections_by_addr
+        // Use peer-id-based removal to properly clean up all address aliases
+        // This avoids double-decrement of connection_counter when a connection
+        // has both ephemeral and bind addresses after reindexing
+        let peer_ids: Vec<_> = self
+            .connections_by_peer
             .iter()
-            .map(|entry| *entry.key())
+            .map(|entry| entry.key().clone())
             .collect();
-        let count = addrs.len();
-        for addr in addrs {
-            self.remove_connection(addr);
+        let count = peer_ids.len();
+        for peer_id in peer_ids {
+            self.disconnect_connection_by_peer_id(&peer_id);
         }
         info!("closed all {} connections", count);
     }
@@ -4719,30 +4771,33 @@ impl ConnectionPool {
                                                         debug!(peer = %peer_addr, correlation_id = correlation_id, payload_len = payload.len(),
                                                       "Received non-RegistryMessage Ask request, checking if it's from kameo");
 
-                                                        // Try to parse binary format from kameo: [actor_id:8][type_hash:4][payload_len:4][payload:N]
-                                                        if payload.len() >= 16 {
+                                                        // Try to parse binary format from kameo:
+                                                        // Full: [type:1][correlation_id:2][reserved:5][actor_id:8][type_hash:4][payload_len:4][payload:N]
+                                                        // After ASK_RESPONSE_HEADER_LEN (4) slice, payload starts with reserved(4)
+                                                        // Actor fields start at offset 4 (skipping 4 bytes of reserved)
+                                                        if payload.len() >= 20 {
                                                             let actor_id = u64::from_be_bytes([
-                                                                payload[0], payload[1], payload[2],
-                                                                payload[3], payload[4], payload[5],
-                                                                payload[6], payload[7],
+                                                                payload[4], payload[5], payload[6],
+                                                                payload[7], payload[8], payload[9],
+                                                                payload[10], payload[11],
                                                             ]);
                                                             let type_hash = u32::from_be_bytes([
-                                                                payload[8],
-                                                                payload[9],
-                                                                payload[10],
-                                                                payload[11],
-                                                            ]);
-                                                            let payload_len = u32::from_be_bytes([
                                                                 payload[12],
                                                                 payload[13],
                                                                 payload[14],
                                                                 payload[15],
+                                                            ]);
+                                                            let payload_len = u32::from_be_bytes([
+                                                                payload[16],
+                                                                payload[17],
+                                                                payload[18],
+                                                                payload[19],
                                                             ])
                                                                 as usize;
 
-                                                            if payload.len() >= 16 + payload_len {
+                                                            if payload.len() >= 20 + payload_len {
                                                                 let inner_payload =
-                                                                    &payload[16..16 + payload_len];
+                                                                    &payload[20..20 + payload_len];
 
                                                                 debug!(peer = %peer_addr, correlation_id = correlation_id,
                                                                actor_id = actor_id, type_hash = type_hash,
@@ -4840,11 +4895,11 @@ impl ConnectionPool {
                                                             } else {
                                                                 debug!(peer = %peer_addr, correlation_id = correlation_id,
                                                                "Binary message payload too short: expected {} bytes but got {}",
-                                                               16 + payload_len, payload.len());
+                                                               20 + payload_len, payload.len());
                                                             }
                                                         } else {
                                                             debug!(peer = %peer_addr, correlation_id = correlation_id,
-                                                           "Ask payload too short for binary format: {} bytes (need at least 16)",
+                                                           "Ask payload too short for binary format: {} bytes (need at least 20)",
                                                            payload.len());
                                                         }
                                                     }
@@ -4894,24 +4949,26 @@ impl ConnectionPool {
                                             // Gossip messages can arrive here, just ignore them
                                         }
                                         crate::MessageType::ActorTell => {
-                                            // Direct actor tell message format:
-                                            // Already parsed: [type:1][correlation_id:2][pad:1]
-                                            // Payload: [actor_id:8][type_hash:4][payload_len:4][payload:N]
-                                            if payload.len() >= 16 {
+                                            // Direct actor tell message format (from kameo):
+                                            // Full header: [type:1][correlation_id:2][reserved:5][actor_id:8][type_hash:4][payload_len:4][payload:N]
+                                            // After ASK_RESPONSE_HEADER_LEN (4) slice, payload starts with reserved(4)
+                                            // Actor fields start at offset 4 into payload (skipping 4 bytes of reserved)
+                                            if payload.len() >= 20 {
+                                                // Skip 4 reserved bytes, then read actor fields
                                                 let actor_id = u64::from_be_bytes(
-                                                    payload[0..8].try_into().unwrap(),
+                                                    payload[4..12].try_into().unwrap(),
                                                 );
                                                 let type_hash = u32::from_be_bytes(
-                                                    payload[8..12].try_into().unwrap(),
+                                                    payload[12..16].try_into().unwrap(),
                                                 );
                                                 let payload_len = u32::from_be_bytes(
-                                                    payload[12..16].try_into().unwrap(),
+                                                    payload[16..20].try_into().unwrap(),
                                                 )
                                                     as usize;
 
-                                                if payload.len() >= 16 + payload_len {
+                                                if payload.len() >= 20 + payload_len {
                                                     let actor_payload =
-                                                        &payload[16..16 + payload_len];
+                                                        &payload[20..20 + payload_len];
 
                                                     // Log large ActorTell messages
                                                     if payload_len > 1024 * 1024 {
@@ -4969,32 +5026,34 @@ impl ConnectionPool {
                                                         warn!(peer = %peer_addr, "No registry weak reference available");
                                                     }
                                                 } else {
-                                                    warn!(peer = %peer_addr, expected = 16 + payload_len, actual = payload.len(),
+                                                    warn!(peer = %peer_addr, expected = 20 + payload_len, actual = payload.len(),
                                                       "ActorTell payload too short");
                                                 }
                                             } else {
-                                                warn!(peer = %peer_addr, payload_len = payload.len(), "ActorTell header too short");
+                                                warn!(peer = %peer_addr, payload_len = payload.len(), "ActorTell header too short (need at least 20)");
                                             }
                                         }
                                         crate::MessageType::ActorAsk => {
-                                            // Direct actor ask message format:
-                                            // Already parsed: [type:1][correlation_id:2][pad:1]
-                                            // Payload: [actor_id:8][type_hash:4][payload_len:4][payload:N]
-                                            if payload.len() >= 16 {
+                                            // Direct actor ask message format (from kameo):
+                                            // Full header: [type:1][correlation_id:2][reserved:5][actor_id:8][type_hash:4][payload_len:4][payload:N]
+                                            // After ASK_RESPONSE_HEADER_LEN (4) slice, payload starts with reserved(4)
+                                            // Actor fields start at offset 4 into payload (skipping 4 bytes of reserved)
+                                            if payload.len() >= 20 {
+                                                // Skip 4 reserved bytes, then read actor fields
                                                 let actor_id = u64::from_be_bytes(
-                                                    payload[0..8].try_into().unwrap(),
+                                                    payload[4..12].try_into().unwrap(),
                                                 );
                                                 let type_hash = u32::from_be_bytes(
-                                                    payload[8..12].try_into().unwrap(),
+                                                    payload[12..16].try_into().unwrap(),
                                                 );
                                                 let payload_len = u32::from_be_bytes(
-                                                    payload[12..16].try_into().unwrap(),
+                                                    payload[16..20].try_into().unwrap(),
                                                 )
                                                     as usize;
 
-                                                if payload.len() >= 16 + payload_len {
+                                                if payload.len() >= 20 + payload_len {
                                                     let actor_payload =
-                                                        &payload[16..16 + payload_len];
+                                                        &payload[20..20 + payload_len];
 
                                                     if let Some(ref registry_weak) = registry_weak {
                                                         if let Some(registry) =
@@ -5086,11 +5145,11 @@ impl ConnectionPool {
                                                         warn!(peer = %peer_addr, "No registry weak reference available");
                                                     }
                                                 } else {
-                                                    warn!(peer = %peer_addr, expected = 16 + payload_len, actual = payload.len(),
+                                                    warn!(peer = %peer_addr, expected = 20 + payload_len, actual = payload.len(),
                                                       "ActorAsk payload too short");
                                                 }
                                             } else {
-                                                warn!(peer = %peer_addr, payload_len = payload.len(), "ActorAsk header too short");
+                                                warn!(peer = %peer_addr, payload_len = payload.len(), "ActorAsk header too short (need at least 20)");
                                             }
                                         }
                                         crate::MessageType::StreamStart => {
@@ -5895,6 +5954,21 @@ pub(crate) fn handle_incoming_message(
                         .insert(sender_peer_id.clone(), sender_socket_addr);
                     pool.addr_to_peer_id
                         .insert(sender_socket_addr, sender_peer_id.clone());
+
+                    // CRITICAL FIX: Reindex the connection from ephemeral TCP port to bind address
+                    // Without this, get_connection(bind_addr) fails because the connection is
+                    // still indexed under the ephemeral port the peer connected FROM.
+                    // This allows messages to be sent back to the peer using their advertised address.
+                    if sender_socket_addr != _peer_addr {
+                        info!(
+                            old_addr = %_peer_addr,
+                            new_addr = %sender_socket_addr,
+                            peer_id = %sender_peer_id,
+                            "📍 Reindexing connection from ephemeral port to bind address"
+                        );
+                        pool.reindex_connection_addr(&sender_peer_id, sender_socket_addr);
+                    }
+
                     debug!(
                         "BIDIRECTIONAL: Registered incoming connection - peer_id={} addr={}",
                         sender_peer_id, sender_socket_addr
@@ -6138,6 +6212,19 @@ pub(crate) fn handle_incoming_message(
                         .insert(sender_peer_id.clone(), sender_socket_addr);
                     pool.addr_to_peer_id
                         .insert(sender_socket_addr, sender_peer_id.clone());
+
+                    // CRITICAL FIX: Reindex the connection from ephemeral TCP port to bind address
+                    // Mirror the FullSync handler fix - allows sending to advertised address
+                    if sender_socket_addr != _peer_addr {
+                        info!(
+                            old_addr = %_peer_addr,
+                            new_addr = %sender_socket_addr,
+                            peer_id = %sender_peer_id,
+                            "📍 Reindexing connection from ephemeral port to bind address (FullSyncResponse)"
+                        );
+                        pool.reindex_connection_addr(&sender_peer_id, sender_socket_addr);
+                    }
+
                     debug!(
                         "BIDIRECTIONAL: Updated connection mapping from FullSyncResponse - peer_id={} addr={}",
                         sender_peer_id, sender_socket_addr
@@ -6353,17 +6440,40 @@ pub(crate) fn handle_incoming_message(
                             );
                             let payload = bytes::Bytes::from(reply_payload);
 
-                            // CRITICAL FIX: Send response back through the SAME connection where
-                            // the request arrived, not to the peer's bind address (which may use
-                            // a different connection). Use _peer_addr (actual TCP source address)
-                            // to ensure the reply goes back on the original connection.
+                            // CRITICAL FIX: Try the ephemeral TCP source address first, then fall back
+                            // to the bind address if the connection was reindexed after FullSync.
                             let pool = registry.connection_pool.lock().await;
-                            if let Err(e) = pool.send_lock_free_parts(
+                            let header_bytes = bytes::Bytes::copy_from_slice(&header);
+
+                            // First try: use original TCP source address (ephemeral port)
+                            if let Err(_e1) = pool.send_lock_free_parts(
                                 _peer_addr,
-                                bytes::Bytes::copy_from_slice(&header),
-                                payload,
+                                header_bytes.clone(),
+                                payload.clone(),
                             ) {
-                                warn!(peer = %_peer_addr, peer_state_addr = %peer_state_addr, error = %e, "Failed to send ask reply");
+                                // Second try: use bind address (connection may have been reindexed)
+                                if _peer_addr != peer_state_addr {
+                                    if let Err(e2) = pool.send_lock_free_parts(
+                                        peer_state_addr,
+                                        header_bytes,
+                                        payload,
+                                    ) {
+                                        warn!(
+                                            peer = %_peer_addr,
+                                            peer_state_addr = %peer_state_addr,
+                                            error = %e2,
+                                            "Failed to send ask reply (tried both ephemeral and bind addresses)"
+                                        );
+                                    } else {
+                                        debug!(
+                                            peer = %_peer_addr,
+                                            peer_state_addr = %peer_state_addr,
+                                            "Ask reply sent via bind address (ephemeral port was reindexed)"
+                                        );
+                                    }
+                                } else {
+                                    warn!(peer = %_peer_addr, error = %_e1, "Failed to send ask reply");
+                                }
                             }
                         }
 

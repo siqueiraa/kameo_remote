@@ -534,7 +534,6 @@ impl GossipRegistry {
 
     /// Track negotiated peer capabilities for a peer connection
     pub fn set_peer_capabilities(&self, addr: SocketAddr, caps: PeerCapabilities) {
-        eprintln!("set_peer_capabilities addr {}", addr);
         self.peer_capabilities.insert(addr, caps);
     }
 
@@ -551,7 +550,6 @@ impl GossipRegistry {
 
     /// Remove stored capabilities for a peer (e.g., when connection closes)
     pub fn clear_peer_capabilities(&self, addr: &SocketAddr) {
-        eprintln!("clear_peer_capabilities addr {}", addr);
         self.peer_capabilities.remove(addr);
         if let Some((_, node_id)) = self.peer_capability_addr_to_node.remove(addr) {
             let still_has_addr = self
@@ -566,19 +564,6 @@ impl GossipRegistry {
 
     /// Determine whether a peer supports receiving PeerListGossip
     pub async fn peer_supports_peer_list(&self, addr: &SocketAddr) -> bool {
-        eprintln!(
-            "peer_supports called for {} entries {}",
-            addr,
-            self.peer_capabilities.len()
-        );
-        for entry in self.peer_capabilities.iter() {
-            eprintln!(
-                " capability entry addr {} can {}",
-                entry.key(),
-                entry.value().can_send_peer_list()
-            );
-        }
-
         if let Some(entry) = self.peer_capabilities.get(addr) {
             return entry.value().can_send_peer_list();
         }
@@ -1191,8 +1176,6 @@ impl GossipRegistry {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-
-        eprintln!("🔍 RECEIVED_TIMESTAMP: {}ns", received_timestamp);
 
         // Apply changes atomically under write lock
         let applied_count = {
@@ -2424,11 +2407,18 @@ impl GossipRegistry {
         let current_time = current_timestamp();
 
         // IMMEDIATELY mark the connection as failed and remove from pool
+        // Use disconnect_connection_by_peer_id when possible to clean up ALL address aliases
         {
             let pool = self.connection_pool.lock().await;
-            if pool.has_connection(&failed_peer_addr) {
+            // Try to find peer_id for proper cleanup of all aliases
+            if let Some(peer_id) = pool.get_peer_id_by_addr(&failed_peer_addr) {
+                if let Some(_conn) = pool.disconnect_connection_by_peer_id(&peer_id) {
+                    info!(addr = %failed_peer_addr, peer_id = %peer_id, "removed disconnected connection from pool (all address aliases cleaned up)");
+                }
+            } else if pool.has_connection(&failed_peer_addr) {
+                // Fallback: no peer_id found, remove by address only
                 pool.remove_connection(failed_peer_addr);
-                info!(addr = %failed_peer_addr, "removed disconnected connection from pool");
+                info!(addr = %failed_peer_addr, "removed disconnected connection from pool (by address only)");
             }
         }
 
@@ -2536,16 +2526,16 @@ impl GossipRegistry {
         let current_time = current_timestamp();
 
         // IMMEDIATELY remove the connection from pool
-        // remove_connection handles both address and node ID mappings
+        // Use disconnect_connection_by_peer_id to clean up ALL address aliases
+        // (ephemeral port + bind address mappings created during reindex)
         {
             let pool = self.connection_pool.lock().await;
 
-            if pool.has_connection(&failed_peer_addr) {
-                pool.remove_connection(failed_peer_addr);
+            if let Some(_conn) = pool.disconnect_connection_by_peer_id(failed_peer_id) {
                 info!(
                     addr = %failed_peer_addr,
                     node_id = %failed_peer_id,
-                    "removed disconnected connection from pool (both address and node ID mappings)"
+                    "removed disconnected connection from pool (all address aliases cleaned up)"
                 );
             } else {
                 info!(

@@ -671,14 +671,7 @@ async fn handle_tls_connection(
     )
     .await
     {
-        Ok(caps) => {
-            eprintln!(
-                "inbound hello capabilities from {} can_send={}",
-                peer_addr,
-                caps.can_send_peer_list()
-            );
-            caps
-        }
+        Ok(caps) => caps,
         Err(err) => {
             warn!(
                 peer = %peer_addr,
@@ -1500,19 +1493,21 @@ where
                     }
                     crate::MessageType::ActorTell | crate::MessageType::ActorAsk => {
                         // This is an actor message with envelope format:
-                        // [type:1][correlation_id:2][pad:1][actor_id:8][type_hash:4][payload_len:4][payload:N]
+                        // [type:1][correlation_id:2][reserved:5][actor_id:8][type_hash:4][payload_len:4][payload:N]
                         if msg_data.len() < crate::framing::ACTOR_HEADER_LEN {
                             // Need at least 24 bytes for header
                             return Ok(MessageReadResult::Raw(msg_data));
                         }
 
                         // Parse the actor message envelope
+                        // Wire format (from kameo): [type:1][correlation_id:2][reserved:5][actor_id:8][type_hash:4][payload_len:4][payload:N]
                         let msg_type_byte = msg_data[0];
                         let correlation_id = u16::from_be_bytes([msg_data[1], msg_data[2]]);
-                        let actor_id = u64::from_be_bytes(msg_data[4..12].try_into().unwrap());
-                        let type_hash = u32::from_be_bytes(msg_data[12..16].try_into().unwrap());
+                        // Skip reserved bytes (3-7), actor_id starts at byte 8
+                        let actor_id = u64::from_be_bytes(msg_data[8..16].try_into().unwrap());
+                        let type_hash = u32::from_be_bytes(msg_data[16..20].try_into().unwrap());
                         let payload_len =
-                            u32::from_be_bytes(msg_data[16..20].try_into().unwrap()) as usize;
+                            u32::from_be_bytes(msg_data[20..24].try_into().unwrap()) as usize;
 
                         if msg_data.len() < crate::framing::ACTOR_HEADER_LEN + payload_len {
                             return Ok(MessageReadResult::Raw(msg_data));
@@ -1646,16 +1641,17 @@ mod framing_tests {
         let actor_id = 0x0102030405060708u64;
         let type_hash = 0x11223344u32;
 
+        // Wire format: [len:4][type:1][correlation_id:2][reserved:5][actor_id:8][type_hash:4][payload_len:4][payload:N]
         let total_len = framing::ACTOR_HEADER_LEN + payload_bytes.len();
         let mut frame = Vec::with_capacity(framing::LENGTH_PREFIX_LEN + total_len);
-        frame.extend_from_slice(&(total_len as u32).to_be_bytes());
-        frame.push(MessageType::ActorTell as u8);
-        frame.extend_from_slice(&0u16.to_be_bytes());
-        frame.push(0u8);
-        frame.extend_from_slice(&actor_id.to_be_bytes());
-        frame.extend_from_slice(&type_hash.to_be_bytes());
-        frame.extend_from_slice(&(payload_bytes.len() as u32).to_be_bytes());
-        frame.extend_from_slice(payload_bytes);
+        frame.extend_from_slice(&(total_len as u32).to_be_bytes()); // 4 bytes: length prefix
+        frame.push(MessageType::ActorTell as u8);                   // 1 byte: message type
+        frame.extend_from_slice(&0u16.to_be_bytes());               // 2 bytes: correlation_id
+        frame.extend_from_slice(&[0u8; 5]);                         // 5 bytes: reserved (was 1 byte pad)
+        frame.extend_from_slice(&actor_id.to_be_bytes());           // 8 bytes: actor_id
+        frame.extend_from_slice(&type_hash.to_be_bytes());          // 4 bytes: type_hash
+        frame.extend_from_slice(&(payload_bytes.len() as u32).to_be_bytes()); // 4 bytes: payload_len
+        frame.extend_from_slice(payload_bytes);                     // N bytes: payload
 
         match read_frame(frame).await {
             MessageReadResult::Actor {
