@@ -5945,10 +5945,9 @@ pub(crate) fn handle_incoming_message(
                 {
                     let pool = registry.connection_pool.lock().await;
 
-                    // FIX: Clean up any stale mapping for the old ephemeral TCP source address
-                    if sender_socket_addr != _peer_addr {
-                        pool.addr_to_peer_id.remove(&_peer_addr);
-                    }
+                    // NOTE: Do NOT remove addr_to_peer_id for the ephemeral address here.
+                    // The reindex_connection_addr function preserves both addresses,
+                    // and disconnect_connection_by_peer_id needs both entries to clean up properly.
 
                     pool.peer_id_to_addr
                         .insert(sender_peer_id.clone(), sender_socket_addr);
@@ -6203,10 +6202,9 @@ pub(crate) fn handle_incoming_message(
                 {
                     let pool = registry.connection_pool.lock().await;
 
-                    // Clean up any stale mapping for the old ephemeral TCP source address
-                    if sender_socket_addr != _peer_addr {
-                        pool.addr_to_peer_id.remove(&_peer_addr);
-                    }
+                    // NOTE: Do NOT remove addr_to_peer_id for the ephemeral address here.
+                    // The reindex_connection_addr function preserves both addresses,
+                    // and disconnect_connection_by_peer_id needs both entries to clean up properly.
 
                     pool.peer_id_to_addr
                         .insert(sender_peer_id.clone(), sender_socket_addr);
