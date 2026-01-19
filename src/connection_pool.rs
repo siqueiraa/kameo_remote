@@ -1347,11 +1347,50 @@ impl LockFreeStreamHandle {
     }
 
     async fn acquire_control_permit(&self) -> OwnedSemaphorePermit {
-        self.control_permits
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("control permit semaphore closed")
+        // Track permit acquisition for debugging stalls
+        static ACQUIRE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let count = ACQUIRE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        let available = self.control_permits.available_permits();
+        if count % 1000 == 0 || available == 0 {
+            eprintln!(
+                "🎫 [PERMIT] #{} acquiring control permit (available: {}/{})",
+                count,
+                available,
+                self.buffer_config.ring_buffer_slots() / 4 // roughly the reserved amount
+            );
+        }
+
+        // Add timeout to detect permit stalls
+        let start = std::time::Instant::now();
+        let permit = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.control_permits.clone().acquire_owned()
+        ).await;
+
+        match permit {
+            Ok(Ok(p)) => {
+                let elapsed = start.elapsed();
+                if elapsed > std::time::Duration::from_millis(100) {
+                    warn!(
+                        elapsed_ms = elapsed.as_millis(),
+                        available_after = self.control_permits.available_permits(),
+                        "⚠️ Control permit acquisition was slow"
+                    );
+                }
+                p
+            }
+            Ok(Err(_)) => panic!("control permit semaphore closed"),
+            Err(_) => {
+                // Timeout after 5 seconds - this is a fatal stall
+                eprintln!(
+                    "💀 [PERMIT TIMEOUT] #{} timed out after 5s waiting for control permit (available: {})",
+                    count,
+                    self.control_permits.available_permits()
+                );
+                panic!("control permit acquisition timed out - writer likely stalled");
+            }
+        }
     }
 
     #[cfg(test)]
