@@ -1844,8 +1844,8 @@ impl LockFreeStreamHandle {
 
         // Helper to serialize message with type and header
         fn serialize_stream_message(msg_type: MessageType, header: &StreamHeader) -> Vec<u8> {
-            // Message format: [length:4][type:1][correlation_id:2][reserved:5][header:36]
-            let inner_size = 8 + StreamHeader::SERIALIZED_SIZE;
+            // Message format: [length:4][type:1][correlation_id:2][reserved:9][header:36]
+            let inner_size = 12 + StreamHeader::SERIALIZED_SIZE; // type(1) + corr(2) + reserved(9) + header
             let mut message = Vec::with_capacity(4 + inner_size);
 
             // Length prefix (required by protocol)
@@ -1854,7 +1854,7 @@ impl LockFreeStreamHandle {
             // Header
             message.push(msg_type as u8);
             message.extend_from_slice(&[0, 0]); // correlation_id (not used for streaming)
-            message.extend_from_slice(&[0, 0, 0, 0, 0]); // reserved
+            message.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0]); // 9 reserved bytes for 32-byte alignment
             message.extend_from_slice(&header.to_bytes());
             message
         }
@@ -1886,8 +1886,8 @@ impl LockFreeStreamHandle {
             };
 
             // Create combined message with proper length prefix
-            // Message format: [length:4][type:1][correlation_id:2][reserved:5][header:36][chunk_data:N]
-            let inner_size = 8 + StreamHeader::SERIALIZED_SIZE + chunk.len();
+            // Message format: [length:4][type:1][correlation_id:2][reserved:9][header:36][chunk_data:N]
+            let inner_size = 12 + StreamHeader::SERIALIZED_SIZE + chunk.len(); // type(1) + corr(2) + reserved(9) + header + data
             let mut chunk_msg = Vec::with_capacity(4 + inner_size);
 
             // Length prefix (includes header + chunk data)
@@ -1896,7 +1896,7 @@ impl LockFreeStreamHandle {
             // Header
             chunk_msg.push(MessageType::StreamData as u8);
             chunk_msg.extend_from_slice(&[0, 0]); // correlation_id
-            chunk_msg.extend_from_slice(&[0, 0, 0, 0, 0]); // reserved
+            chunk_msg.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0]); // 9 reserved bytes for 32-byte alignment
             chunk_msg.extend_from_slice(&data_header.to_bytes());
 
             // Chunk data
@@ -3659,6 +3659,14 @@ impl ConnectionPool {
             // Remove peer_id_to_addr entry
             self.peer_id_to_addr.remove(peer_id);
 
+            // Remove correlation tracker to prevent memory leak (LEAK-001 fix)
+            if self.correlation_trackers.remove(peer_id).is_some() {
+                debug!(
+                    peer_id = %peer_id,
+                    "Cleaned up correlation tracker for disconnected peer"
+                );
+            }
+
             // Remove ALL addr_to_peer_id entries for this peer
             // (may have multiple due to reindexing keeping both ephemeral and bind addresses)
             let addrs_to_remove: Vec<SocketAddr> = self
@@ -4873,32 +4881,32 @@ impl ConnectionPool {
                                                       "Received non-RegistryMessage Ask request, checking if it's from kameo");
 
                                                         // Try to parse binary format from kameo:
-                                                        // Full: [type:1][correlation_id:2][reserved:5][actor_id:8][type_hash:4][payload_len:4][payload:N]
-                                                        // After ASK_RESPONSE_HEADER_LEN (4) slice, payload starts with reserved(4)
-                                                        // Actor fields start at offset 4 (skipping 4 bytes of reserved)
-                                                        if payload.len() >= 20 {
+                                                        // Full: [type:1][correlation_id:2][reserved:9][actor_id:8][type_hash:4][payload_len:4][payload:N]
+                                                        // After ASK_RESPONSE_HEADER_LEN (4) slice, payload starts with reserved(8)
+                                                        // Actor fields start at offset 8 (skipping 8 bytes of reserved)
+                                                        if payload.len() >= 24 {
                                                             let actor_id = u64::from_be_bytes([
-                                                                payload[4], payload[5], payload[6],
-                                                                payload[7], payload[8], payload[9],
-                                                                payload[10], payload[11],
+                                                                payload[8], payload[9], payload[10],
+                                                                payload[11], payload[12], payload[13],
+                                                                payload[14], payload[15],
                                                             ]);
                                                             let type_hash = u32::from_be_bytes([
-                                                                payload[12],
-                                                                payload[13],
-                                                                payload[14],
-                                                                payload[15],
-                                                            ]);
-                                                            let payload_len = u32::from_be_bytes([
                                                                 payload[16],
                                                                 payload[17],
                                                                 payload[18],
                                                                 payload[19],
+                                                            ]);
+                                                            let payload_len = u32::from_be_bytes([
+                                                                payload[20],
+                                                                payload[21],
+                                                                payload[22],
+                                                                payload[23],
                                                             ])
                                                                 as usize;
 
-                                                            if payload.len() >= 20 + payload_len {
+                                                            if payload.len() >= 24 + payload_len {
                                                                 let inner_payload =
-                                                                    &payload[20..20 + payload_len];
+                                                                    &payload[24..24 + payload_len];
 
                                                                 debug!(peer = %peer_addr, correlation_id = correlation_id,
                                                                actor_id = actor_id, type_hash = type_hash,
@@ -4996,11 +5004,11 @@ impl ConnectionPool {
                                                             } else {
                                                                 debug!(peer = %peer_addr, correlation_id = correlation_id,
                                                                "Binary message payload too short: expected {} bytes but got {}",
-                                                               20 + payload_len, payload.len());
+                                                               24 + payload_len, payload.len());
                                                             }
                                                         } else {
                                                             debug!(peer = %peer_addr, correlation_id = correlation_id,
-                                                           "Ask payload too short for binary format: {} bytes (need at least 20)",
+                                                           "Ask payload too short for binary format: {} bytes (need at least 24)",
                                                            payload.len());
                                                         }
                                                     }
@@ -5051,25 +5059,25 @@ impl ConnectionPool {
                                         }
                                         crate::MessageType::ActorTell => {
                                             // Direct actor tell message format (from kameo):
-                                            // Full header: [type:1][correlation_id:2][reserved:5][actor_id:8][type_hash:4][payload_len:4][payload:N]
-                                            // After ASK_RESPONSE_HEADER_LEN (4) slice, payload starts with reserved(4)
-                                            // Actor fields start at offset 4 into payload (skipping 4 bytes of reserved)
-                                            if payload.len() >= 20 {
-                                                // Skip 4 reserved bytes, then read actor fields
+                                            // Full header: [type:1][correlation_id:2][reserved:9][actor_id:8][type_hash:4][payload_len:4][payload:N]
+                                            // After ASK_RESPONSE_HEADER_LEN (4) slice, payload starts with reserved(8)
+                                            // Actor fields start at offset 8 into payload (skipping 8 bytes of reserved)
+                                            if payload.len() >= 24 {
+                                                // Skip 8 reserved bytes, then read actor fields
                                                 let actor_id = u64::from_be_bytes(
-                                                    payload[4..12].try_into().unwrap(),
+                                                    payload[8..16].try_into().unwrap(),
                                                 );
                                                 let type_hash = u32::from_be_bytes(
-                                                    payload[12..16].try_into().unwrap(),
+                                                    payload[16..20].try_into().unwrap(),
                                                 );
                                                 let payload_len = u32::from_be_bytes(
-                                                    payload[16..20].try_into().unwrap(),
+                                                    payload[20..24].try_into().unwrap(),
                                                 )
                                                     as usize;
 
-                                                if payload.len() >= 20 + payload_len {
+                                                if payload.len() >= 24 + payload_len {
                                                     let actor_payload =
-                                                        &payload[20..20 + payload_len];
+                                                        &payload[24..24 + payload_len];
 
                                                     // Log large ActorTell messages
                                                     if payload_len > 1024 * 1024 {
@@ -5127,34 +5135,34 @@ impl ConnectionPool {
                                                         warn!(peer = %peer_addr, "No registry weak reference available");
                                                     }
                                                 } else {
-                                                    warn!(peer = %peer_addr, expected = 20 + payload_len, actual = payload.len(),
+                                                    warn!(peer = %peer_addr, expected = 24 + payload_len, actual = payload.len(),
                                                       "ActorTell payload too short");
                                                 }
                                             } else {
-                                                warn!(peer = %peer_addr, payload_len = payload.len(), "ActorTell header too short (need at least 20)");
+                                                warn!(peer = %peer_addr, payload_len = payload.len(), "ActorTell header too short (need at least 24)");
                                             }
                                         }
                                         crate::MessageType::ActorAsk => {
                                             // Direct actor ask message format (from kameo):
-                                            // Full header: [type:1][correlation_id:2][reserved:5][actor_id:8][type_hash:4][payload_len:4][payload:N]
-                                            // After ASK_RESPONSE_HEADER_LEN (4) slice, payload starts with reserved(4)
-                                            // Actor fields start at offset 4 into payload (skipping 4 bytes of reserved)
-                                            if payload.len() >= 20 {
-                                                // Skip 4 reserved bytes, then read actor fields
+                                            // Full header: [type:1][correlation_id:2][reserved:9][actor_id:8][type_hash:4][payload_len:4][payload:N]
+                                            // After ASK_RESPONSE_HEADER_LEN (4) slice, payload starts with reserved(8)
+                                            // Actor fields start at offset 8 into payload (skipping 8 bytes of reserved)
+                                            if payload.len() >= 24 {
+                                                // Skip 8 reserved bytes, then read actor fields
                                                 let actor_id = u64::from_be_bytes(
-                                                    payload[4..12].try_into().unwrap(),
+                                                    payload[8..16].try_into().unwrap(),
                                                 );
                                                 let type_hash = u32::from_be_bytes(
-                                                    payload[12..16].try_into().unwrap(),
+                                                    payload[16..20].try_into().unwrap(),
                                                 );
                                                 let payload_len = u32::from_be_bytes(
-                                                    payload[16..20].try_into().unwrap(),
+                                                    payload[20..24].try_into().unwrap(),
                                                 )
                                                     as usize;
 
-                                                if payload.len() >= 20 + payload_len {
+                                                if payload.len() >= 24 + payload_len {
                                                     let actor_payload =
-                                                        &payload[20..20 + payload_len];
+                                                        &payload[24..24 + payload_len];
 
                                                     if let Some(ref registry_weak) = registry_weak {
                                                         if let Some(registry) =
@@ -5246,19 +5254,19 @@ impl ConnectionPool {
                                                         warn!(peer = %peer_addr, "No registry weak reference available");
                                                     }
                                                 } else {
-                                                    warn!(peer = %peer_addr, expected = 20 + payload_len, actual = payload.len(),
+                                                    warn!(peer = %peer_addr, expected = 24 + payload_len, actual = payload.len(),
                                                       "ActorAsk payload too short");
                                                 }
                                             } else {
-                                                warn!(peer = %peer_addr, payload_len = payload.len(), "ActorAsk header too short (need at least 20)");
+                                                warn!(peer = %peer_addr, payload_len = payload.len(), "ActorAsk header too short (need at least 24)");
                                             }
                                         }
                                         crate::MessageType::StreamStart => {
                                             // Parse stream header from payload
-                                            // Wire format: [type:1][correlation_id:2][reserved:5][StreamHeader:36]
-                                            // After ASK_RESPONSE_HEADER_LEN (4) slice, payload has reserved(4) then StreamHeader
-                                            // So we need to skip 4 bytes to get to StreamHeader
-                                            const RESERVED_BYTES: usize = 4;
+                                            // Wire format: [type:1][correlation_id:2][reserved:9][StreamHeader:36]
+                                            // After ASK_RESPONSE_HEADER_LEN (4) slice, payload has reserved(8) then StreamHeader
+                                            // So we need to skip 8 bytes to get to StreamHeader
+                                            const RESERVED_BYTES: usize = 8;
                                             if payload.len() >= RESERVED_BYTES + crate::StreamHeader::SERIALIZED_SIZE
                                             {
                                                 if let Some(header) =
@@ -5283,9 +5291,9 @@ impl ConnectionPool {
                                         }
                                         crate::MessageType::StreamData => {
                                             // Parse stream header and data
-                                            // Wire format: [type:1][correlation_id:2][reserved:5][StreamHeader:36][chunk_data:N]
-                                            // After ASK_RESPONSE_HEADER_LEN (4) slice, payload has reserved(4) then StreamHeader
-                                            const RESERVED_BYTES: usize = 4;
+                                            // Wire format: [type:1][correlation_id:2][reserved:9][StreamHeader:36][chunk_data:N]
+                                            // After ASK_RESPONSE_HEADER_LEN (4) slice, payload has reserved(8) then StreamHeader
+                                            const RESERVED_BYTES: usize = 8;
                                             if payload.len() >= RESERVED_BYTES + crate::StreamHeader::SERIALIZED_SIZE
                                             {
                                                 if let Some(header) =
@@ -5324,9 +5332,9 @@ impl ConnectionPool {
                                         }
                                         crate::MessageType::StreamEnd => {
                                             // Parse stream header and complete assembly
-                                            // Wire format: [type:1][correlation_id:2][reserved:5][StreamHeader:36]
-                                            // After ASK_RESPONSE_HEADER_LEN (4) slice, payload has reserved(4) then StreamHeader
-                                            const RESERVED_BYTES: usize = 4;
+                                            // Wire format: [type:1][correlation_id:2][reserved:9][StreamHeader:36]
+                                            // After ASK_RESPONSE_HEADER_LEN (4) slice, payload has reserved(8) then StreamHeader
+                                            const RESERVED_BYTES: usize = 8;
                                             if payload.len() >= RESERVED_BYTES + crate::StreamHeader::SERIALIZED_SIZE
                                             {
                                                 if let Some(header) =
