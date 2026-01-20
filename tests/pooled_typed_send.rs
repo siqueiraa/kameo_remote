@@ -13,7 +13,7 @@ kameo_remote::wire_type!(WireMsg, "tests::WireMsg");
 #[tokio::test]
 async fn test_pooled_typed_send_matches_wire_bytes() {
     let (writer, mut reader) = tokio::io::duplex(64 * 1024);
-    let handle = LockFreeStreamHandle::new(
+    let (handle, _writer_task) = LockFreeStreamHandle::new(
         writer,
         "127.0.0.1:0".parse().unwrap(),
         ChannelId::TellAsk,
@@ -51,7 +51,7 @@ async fn test_pooled_typed_send_matches_wire_bytes() {
 #[tokio::test]
 async fn test_write_ask_progresses_under_load() {
     let (writer, mut reader) = tokio::io::duplex(64 * 1024);
-    let handle = LockFreeStreamHandle::new(
+    let (handle, _writer_task) = LockFreeStreamHandle::new(
         writer,
         "127.0.0.1:0".parse().unwrap(),
         ChannelId::TellAsk,
