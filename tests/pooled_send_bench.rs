@@ -91,7 +91,7 @@ async fn run_bench(
 #[tokio::test]
 async fn test_pooled_send_benchmarks() {
     let (writer, mut reader) = tokio::io::duplex(4 * 1024 * 1024);
-    let handle = LockFreeStreamHandle::new(
+    let (handle, _writer_task) = LockFreeStreamHandle::new(
         writer,
         "127.0.0.1:0".parse().unwrap(),
         ChannelId::TellAsk,

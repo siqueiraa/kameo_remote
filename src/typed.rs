@@ -22,6 +22,9 @@ impl SerializerCtx {
 }
 
 struct SerializerPool {
+    // Boxing is intentional: pool returns Box<SerializerCtx> to callers
+    // who may hold them across await points with stable addresses
+    #[allow(clippy::vec_box)]
     inner: Mutex<Vec<Box<SerializerCtx>>>,
 }
 
