@@ -961,9 +961,7 @@ where
         connection.update_last_used();
 
         // Track the writer task handle (H-004)
-        if let Ok(mut tracker) = connection.task_tracker.lock() {
-            tracker.set_writer(writer_task_handle);
-        }
+        connection.task_tracker.lock().set_writer(writer_task_handle);
 
         let connection_arc = Arc::new(connection);
 

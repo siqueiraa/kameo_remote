@@ -331,7 +331,9 @@ pub struct LockFreeConnection {
     pub(crate) correlation: Option<Arc<CorrelationTracker>>,
     pub direction: ConnectionDirection,
     /// Task tracker for background tasks (writer and reader)
-    pub task_tracker: std::sync::Mutex<TaskTracker>,
+    /// Uses parking_lot::Mutex for better performance than std::sync::Mutex
+    /// (no poisoning overhead, faster lock acquisition)
+    pub task_tracker: parking_lot::Mutex<TaskTracker>,
 }
 
 impl Clone for LockFreeConnection {
@@ -349,7 +351,7 @@ impl Clone for LockFreeConnection {
             // Note: TaskTracker is not cloned - each clone gets a fresh tracker
             // This is intentional: clones are typically used for metadata snapshots,
             // not to transfer task ownership
-            task_tracker: std::sync::Mutex::new(TaskTracker::new()),
+            task_tracker: parking_lot::Mutex::new(TaskTracker::new()),
         }
     }
 }
@@ -366,8 +368,14 @@ impl LockFreeConnection {
             stream_handle: None,
             correlation: Some(CorrelationTracker::new()),
             direction,
-            task_tracker: std::sync::Mutex::new(TaskTracker::new()),
+            task_tracker: parking_lot::Mutex::new(TaskTracker::new()),
         }
+    }
+
+    /// Abort all tracked background tasks (writer, reader).
+    /// Call this when tearing down the connection to prevent resource leaks.
+    pub fn abort_tasks(&self) {
+        self.task_tracker.lock().abort_all();
     }
 
     pub fn get_state(&self) -> ConnectionState {
@@ -825,6 +833,7 @@ impl LockFreeStreamHandle {
 
     /// Background writer task - truly lock-free with exclusive TCP access
     /// OPTIMIZED FOR MAXIMUM THROUGHPUT - NO MUTEX NEEDED!
+    #[allow(clippy::too_many_arguments)]
     async fn background_writer_task<W>(
         tcp_writer: W,
         ring_buffer: Arc<LockFreeRingBuffer>,
@@ -1418,7 +1427,7 @@ impl LockFreeStreamHandle {
         let count = ACQUIRE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let available = self.control_permits.available_permits();
-        if count % 1000 == 0 || available == 0 {
+        if count.is_multiple_of(1000) || available == 0 {
             eprintln!(
                 "🎫 [PERMIT] #{} acquiring control permit (available: {}/{})",
                 count,
@@ -1448,8 +1457,7 @@ impl LockFreeStreamHandle {
             }
             Ok(Err(_)) => {
                 error!("control permit semaphore closed unexpectedly");
-                Err(GossipError::Network(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                Err(GossipError::Network(std::io::Error::other(
                     "control permit semaphore closed",
                 )))
             }
@@ -3593,9 +3601,7 @@ impl ConnectionPool {
         connection.update_last_used();
 
         // Track the writer task handle (H-004)
-        if let Ok(mut tracker) = connection.task_tracker.lock() {
-            tracker.set_writer(writer_task_handle);
-        }
+        connection.task_tracker.lock().set_writer(writer_task_handle);
 
         let connection_arc = Arc::new(connection);
 
@@ -3611,9 +3617,7 @@ impl ConnectionPool {
         });
 
         // Track the reader task handle (H-004)
-        if let Ok(mut tracker) = connection_arc.task_tracker.lock() {
-            tracker.set_reader(reader_task_handle);
-        }
+        connection_arc.task_tracker.lock().set_reader(reader_task_handle);
 
         // Insert into lock-free hash map
         self.connections_by_addr
@@ -3721,6 +3725,10 @@ impl ConnectionPool {
 
             self.connection_counter.fetch_sub(1, Ordering::AcqRel);
             self.clear_capabilities_for_addr(&addr);
+
+            // H-004: Abort background tasks (writer, reader) to prevent resource leaks
+            connection.abort_tasks();
+
             Some(connection)
         } else {
             None
@@ -3760,6 +3768,10 @@ impl ConnectionPool {
             }
 
             self.connection_counter.fetch_sub(1, Ordering::AcqRel);
+
+            // H-004: Abort background tasks (writer, reader) to prevent resource leaks
+            connection.abort_tasks();
+
             Some(connection)
         } else {
             None
@@ -4279,9 +4291,7 @@ impl ConnectionPool {
         conn.update_last_used();
 
         // Track the writer task handle (H-004)
-        if let Ok(mut tracker) = conn.task_tracker.lock() {
-            tracker.set_writer(writer_task_handle);
-        }
+        conn.task_tracker.lock().set_writer(writer_task_handle);
 
         // For outgoing connections, we might know the peer ID from configuration
         let peer_id_opt = self
@@ -4505,9 +4515,7 @@ impl ConnectionPool {
         });
 
         // Track the reader task handle (H-004)
-        if let Ok(mut tracker) = connection_arc.task_tracker.lock() {
-            tracker.set_reader(reader_task_handle);
-        }
+        connection_arc.task_tracker.lock().set_reader(reader_task_handle);
 
         // Reset failure state for this peer since we successfully connected
         if let Some(ref registry_weak) = registry_weak {
@@ -4577,7 +4585,10 @@ impl ConnectionPool {
 
     /// Remove a connection from the pool by address
     pub fn remove_connection_mut(&mut self, addr: SocketAddr) {
-        if let Some(_conn) = self.connections_by_addr.remove(&addr) {
+        if let Some((_, conn)) = self.connections_by_addr.remove(&addr) {
+            // H-004: Abort background tasks (writer, reader) to prevent resource leaks
+            conn.abort_tasks();
+
             info!(addr = %addr, "removed connection from pool");
             // Dropping the sender will cause the receiver to return None,
             // signaling the connection handler to shut down
