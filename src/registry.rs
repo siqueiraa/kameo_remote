@@ -234,9 +234,13 @@ pub struct RegistryStats {
 /// Peer information with failure tracking and delta state
 #[derive(Debug, Clone)]
 pub struct PeerInfo {
-    pub address: SocketAddr,              // Listening address
+    pub address: SocketAddr,              // Listening address (resolved from DNS or direct IP)
     pub peer_address: Option<SocketAddr>, // Actual connection address (may be NATed)
     pub node_id: Option<crate::NodeId>,   // NodeId for TLS verification (may be learned on connect)
+    /// DNS name for this peer (e.g., "data-feeder-kameo:9400").
+    /// When set, the address will be re-resolved via DNS on reconnection attempts.
+    /// This handles Kubernetes pod restarts where the IP changes but DNS stays the same.
+    pub dns_name: Option<String>,
     pub failures: usize,
     pub last_attempt: u64,
     pub last_success: u64,
@@ -258,6 +262,7 @@ impl PeerInfo {
             address: advertise_addr,
             peer_address: None,
             node_id: None,
+            dns_name: None,
             failures: 0,
             last_attempt: now,
             last_success: now, // Important: prevents pruning
@@ -266,6 +271,48 @@ impl PeerInfo {
             consecutive_deltas: 0,
             last_failure_time: None,
         }
+    }
+
+    /// Create a new PeerInfo with a DNS name for automatic re-resolution on reconnect.
+    ///
+    /// When a peer is configured with a DNS name, the gossip system will re-resolve
+    /// the DNS name to get the current IP address when attempting to reconnect
+    /// after a connection failure. This handles Kubernetes pod restarts where
+    /// the pod IP changes but the service DNS name stays the same.
+    ///
+    /// # Arguments
+    /// * `address` - The currently resolved IP address
+    /// * `dns_name` - The DNS name to re-resolve on reconnect (e.g., "data-feeder-kameo:9400")
+    pub fn with_dns(address: SocketAddr, dns_name: String) -> Self {
+        let now = crate::current_timestamp();
+        Self {
+            address,
+            peer_address: None,
+            node_id: None,
+            dns_name: Some(dns_name),
+            failures: 0,
+            last_attempt: now,
+            last_success: 0,
+            last_sequence: 0,
+            last_sent_sequence: 0,
+            consecutive_deltas: 0,
+            last_failure_time: None,
+        }
+    }
+
+    /// Check if this peer has a DNS name configured for re-resolution
+    pub fn has_dns_name(&self) -> bool {
+        self.dns_name.is_some()
+    }
+
+    /// Get the DNS name if configured
+    pub fn get_dns_name(&self) -> Option<&str> {
+        self.dns_name.as_deref()
+    }
+
+    /// Update the resolved address (called after DNS re-resolution)
+    pub fn update_address(&mut self, new_addr: SocketAddr) {
+        self.address = new_addr;
     }
 
     /// Convert to gossip-serializable format
@@ -289,6 +336,7 @@ impl PeerInfo {
             address,
             peer_address,
             node_id: gossip.node_id,
+            dns_name: None, // DNS names are not gossiped; each node configures its own
             failures: gossip.failures,
             last_attempt: gossip.last_attempt,
             last_success: gossip.last_success,
@@ -603,6 +651,7 @@ impl GossipRegistry {
                     address: addr,
                     peer_address: None,
                     node_id: Some(node_id),
+                    dns_name: None,
                     failures: 0,
                     last_attempt: current_timestamp(),
                     last_success: current_timestamp(),
@@ -760,6 +809,7 @@ impl GossipRegistry {
                     address: peer_addr,
                     peer_address: None,
                     node_id,
+                    dns_name: None,
                     failures: 0,
                     last_attempt: current_time,
                     last_success: current_time,
@@ -799,6 +849,138 @@ impl GossipRegistry {
         info!(peer_id = %peer_id, addr = %connect_addr, "Configured peer");
         pool.peer_id_to_addr.insert(peer_id.clone(), connect_addr);
         pool.reindex_connection_addr(&peer_id, connect_addr);
+    }
+
+    /// Set the DNS name for a peer. When a peer has a DNS name configured,
+    /// the gossip system will re-resolve the DNS to get the current IP address
+    /// when attempting to reconnect after a connection failure.
+    ///
+    /// This is essential for Kubernetes deployments where pods may restart
+    /// and get new IP addresses, but the Service DNS name remains stable.
+    ///
+    /// # Arguments
+    /// * `peer_addr` - The current socket address of the peer
+    /// * `dns_name` - The DNS name to use for re-resolution (e.g., "data-feeder-kameo:9400")
+    pub async fn set_peer_dns_name(&self, peer_addr: SocketAddr, dns_name: String) {
+        let mut gossip_state = self.gossip_state.lock().await;
+        if let Some(peer_info) = gossip_state.peers.get_mut(&peer_addr) {
+            info!(peer = %peer_addr, dns_name = %dns_name, "Set DNS name for peer");
+            peer_info.dns_name = Some(dns_name);
+        } else {
+            warn!(peer = %peer_addr, dns_name = %dns_name, "Peer not found when setting DNS name");
+        }
+    }
+
+    /// Re-resolve DNS for a peer and update its address if changed.
+    /// Returns the new address if resolution succeeded and the IP changed, None otherwise.
+    ///
+    /// This is called automatically by the gossip retry logic when a peer with
+    /// a DNS name fails to connect.
+    pub async fn refresh_peer_dns(&self, peer_addr: SocketAddr) -> Option<SocketAddr> {
+        let dns_name = {
+            let gossip_state = self.gossip_state.lock().await;
+            gossip_state
+                .peers
+                .get(&peer_addr)
+                .and_then(|p| p.dns_name.clone())
+        };
+
+        let dns_name = match dns_name {
+            Some(name) => name,
+            None => return None, // No DNS name configured
+        };
+
+        // Resolve DNS to get current IP - extract immediately to avoid lifetime issues
+        let resolved_addr: Option<SocketAddr> = match tokio::net::lookup_host(&dns_name).await {
+            Ok(mut addrs) => addrs.next(),
+            Err(e) => {
+                warn!(
+                    dns_name = %dns_name,
+                    error = %e,
+                    "Failed to resolve DNS for peer"
+                );
+                return None;
+            }
+        };
+
+        let new_addr = match resolved_addr {
+            Some(addr) => addr,
+            None => {
+                warn!(dns_name = %dns_name, "DNS resolution returned no addresses");
+                return None;
+            }
+        };
+
+        if new_addr == peer_addr {
+            debug!(
+                addr = %peer_addr,
+                dns_name = %dns_name,
+                "DNS re-resolution: IP unchanged"
+            );
+            return None;
+        }
+
+        info!(
+            old_addr = %peer_addr,
+            new_addr = %new_addr,
+            dns_name = %dns_name,
+            "🔄 DNS re-resolution: peer IP changed"
+        );
+
+        // Update the peer entry with the new address
+        // Note: We need to handle several edge cases:
+        // 1. The peer may have been removed between DNS lookup and this update
+        // 2. The new address may already be used by another peer (address collision)
+        // 3. We need to update all address-keyed maps atomically
+        let peer_id_opt = {
+            let mut gossip_state = self.gossip_state.lock().await;
+
+            // Check if the new address is already used by another peer
+            if gossip_state.peers.contains_key(&new_addr) {
+                warn!(
+                    old_addr = %peer_addr,
+                    new_addr = %new_addr,
+                    dns_name = %dns_name,
+                    "DNS re-resolution: new address already in use by another peer, skipping update"
+                );
+                return None;
+            }
+
+            // Try to move the peer entry from old address to new address
+            if let Some(mut peer_info) = gossip_state.peers.remove(&peer_addr) {
+                peer_info.address = new_addr;
+                peer_info.failures = 0; // Reset failures on DNS change
+                peer_info.last_failure_time = None;
+                gossip_state.peers.insert(new_addr, peer_info);
+
+                // Also update peer_to_actors mapping if it exists
+                if let Some(actors) = gossip_state.peer_to_actors.remove(&peer_addr) {
+                    gossip_state.peer_to_actors.insert(new_addr, actors);
+                }
+
+                // Get peer_id while we have the lock, for connection pool update
+                Some(self.connection_pool.lock().await.get_peer_id_by_addr(&peer_addr))
+            } else {
+                // Peer was removed between DNS lookup and update - don't proceed
+                debug!(
+                    old_addr = %peer_addr,
+                    dns_name = %dns_name,
+                    "DNS re-resolution: peer was removed, skipping update"
+                );
+                return None;
+            }
+        };
+
+        // Update connection pool mappings
+        if let Some(Some(peer_id)) = peer_id_opt {
+            let pool = self.connection_pool.lock().await;
+            // Update peer_id_to_addr mapping
+            pool.peer_id_to_addr.insert(peer_id.clone(), new_addr);
+            // Add new address to addr_to_peer_id mapping (keep old for graceful transition)
+            pool.add_addr_to_peer_id(new_addr, peer_id);
+        }
+
+        Some(new_addr)
     }
 
     /// Connect to a configured peer by peer ID
@@ -1739,6 +1921,7 @@ impl GossipRegistry {
                         address: peer_addr,
                         peer_address: None,
                         node_id: None,
+                        dns_name: None,
                         failures: 0,
                         last_attempt: 0,
                         last_success: 0,
@@ -4057,6 +4240,7 @@ mod tests {
             address: test_addr(8080),
             peer_address: Some(test_addr(8081)),
             node_id: None,
+            dns_name: None,
             failures: 0,
             last_attempt: 100,
             last_success: 100,
@@ -4398,6 +4582,7 @@ mod tests {
             address: test_addr(8081),
             peer_address: None,
             node_id: None,
+            dns_name: None,
             failures: 0,
             last_attempt: 0,
             last_success: 0,
@@ -4413,6 +4598,7 @@ mod tests {
             address: test_addr(8081),
             peer_address: None,
             node_id: None,
+            dns_name: None,
             failures: 0,
             last_attempt: 100,
             last_success: 100,
@@ -4543,6 +4729,7 @@ mod tests {
                     address: test_addr(8081),
                     peer_address: None,
                     node_id: None,
+                    dns_name: None,
                     failures: 3,
                     last_attempt: 0,
                     last_success: 0,
@@ -4907,6 +5094,7 @@ mod tests {
             address: addr,
             peer_address: Some(test_addr(8081)),
             node_id: None,
+            dns_name: None,
             failures: 3,
             last_attempt: 1000,
             last_success: 900,

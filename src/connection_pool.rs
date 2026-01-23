@@ -5530,6 +5530,7 @@ pub(crate) fn handle_incoming_message(
                                 address: sender_socket_addr,
                                 peer_address: None,
                                 node_id: None,
+                                dns_name: None,
                                 failures: 0,
                                 last_attempt: current_time,
                                 last_success: current_time,
@@ -6007,6 +6008,7 @@ pub(crate) fn handle_incoming_message(
                                 address: sender_socket_addr,
                                 peer_address: Some(_peer_addr), // Remember the actual connection address
                                 node_id: None,
+                                dns_name: None,
                                 failures: 0,
                                 last_attempt: current_time,
                                 last_success: current_time,
