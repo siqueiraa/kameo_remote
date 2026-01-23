@@ -324,6 +324,7 @@ impl PeerInfo {
             failures: self.failures,
             last_attempt: self.last_attempt,
             last_success: self.last_success,
+            dns_name: self.dns_name.clone(),
         }
     }
 
@@ -336,7 +337,7 @@ impl PeerInfo {
             address,
             peer_address,
             node_id: gossip.node_id,
-            dns_name: None, // DNS names are not gossiped; each node configures its own
+            dns_name: gossip.dns_name.clone(), // DNS names are now gossiped for fault tolerance
             failures: gossip.failures,
             last_attempt: gossip.last_attempt,
             last_success: gossip.last_success,
@@ -364,6 +365,9 @@ pub struct PeerInfoGossip {
     pub last_attempt: u64,
     /// Last successful connection timestamp
     pub last_success: u64,
+    /// DNS name for this peer (e.g., "data-feeder.default.svc.cluster.local:9000")
+    /// Used to re-resolve the address if the underlying IP changes
+    pub dns_name: Option<String>,
 }
 
 /// Historical delta for efficient incremental updates
@@ -803,13 +807,20 @@ impl GossipRegistry {
                 return;
             }
 
+            // Check if we have a dns_name from known_peers (discovered via gossip)
+            // Do this before the entry check to avoid borrow conflicts
+            let dns_name = gossip_state
+                .known_peers
+                .peek(&peer_addr)
+                .and_then(|p| p.dns_name.clone());
+
             if let Entry::Vacant(e) = gossip_state.peers.entry(peer_addr) {
                 let current_time = current_timestamp();
                 e.insert(PeerInfo {
                     address: peer_addr,
                     peer_address: None,
                     node_id,
-                    dns_name: None,
+                    dns_name,
                     failures: 0,
                     last_attempt: current_time,
                     last_success: current_time,
@@ -3684,7 +3695,9 @@ impl GossipRegistry {
 
         // Include self (using advertised address or bind address)
         let self_addr = self.config.advertise_address.unwrap_or(self.bind_addr);
-        let self_info = PeerInfo::local(self_addr);
+        let mut self_info = PeerInfo::local(self_addr);
+        // Include our DNS name in gossip so peers can re-resolve us on reconnect
+        self_info.dns_name = self.config.advertise_dns.clone();
         peers.push(self_info.to_gossip());
 
         // Include active peers
@@ -3876,6 +3889,11 @@ impl GossipRegistry {
                             existing.last_success = peer_gossip.last_success;
                             existing.last_attempt = peer_gossip.last_attempt;
                             // Don't overwrite local failure count
+                        }
+                        // Always update dns_name if gossip provides one and we don't have it
+                        // (or update to latest if provided)
+                        if peer_info.dns_name.is_some() {
+                            existing.dns_name = peer_info.dns_name.clone();
                         }
                     } else {
                         // New peer, add to cache
