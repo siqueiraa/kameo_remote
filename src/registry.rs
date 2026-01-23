@@ -1045,6 +1045,9 @@ impl GossipRegistry {
             }
         } // gossip_state lock released
 
+        // Track if we need to reconnect after releasing the pool lock
+        let mut needs_reconnect: Option<crate::PeerId> = None;
+
         {
             let pool = self.connection_pool.lock().await;
 
@@ -1053,22 +1056,62 @@ impl GossipRegistry {
                 // Update peer_id_to_addr mapping
                 pool.peer_id_to_addr.insert(peer_id.clone(), new_addr);
                 // Add new address to addr_to_peer_id mapping
-                pool.add_addr_to_peer_id(new_addr, peer_id);
+                pool.add_addr_to_peer_id(new_addr, peer_id.clone());
 
                 // Migrate connections_by_addr: move connection from old addr to new addr
+                // ONLY if the connection is still connected - dead connections should be removed
                 if let Some((_, connection)) = pool.connections_by_addr.remove(&peer_addr) {
-                    pool.connections_by_addr.insert(new_addr, connection);
-                    debug!(
-                        old_addr = %peer_addr,
-                        new_addr = %new_addr,
-                        "DNS refresh: migrated connection from old to new address"
-                    );
+                    if connection.is_connected() {
+                        // Connection is alive - migrate it to new address
+                        pool.connections_by_addr.insert(new_addr, connection.clone());
+                        // Also update connections_by_peer to point to the same connection
+                        pool.connections_by_peer.insert(peer_id.clone(), connection);
+                        debug!(
+                            old_addr = %peer_addr,
+                            new_addr = %new_addr,
+                            "DNS refresh: migrated live connection from old to new address"
+                        );
+                    } else {
+                        // Connection is dead - remove it from connections_by_peer too
+                        // This ensures the next send attempt will trigger reconnection
+                        pool.connections_by_peer.remove(&peer_id);
+                        needs_reconnect = Some(peer_id.clone());
+                        info!(
+                            old_addr = %peer_addr,
+                            new_addr = %new_addr,
+                            "DNS refresh: removed dead connection, will establish new connection"
+                        );
+                    }
                 }
 
                 // Clean up old addr_to_peer_id mapping
                 pool.addr_to_peer_id.remove(&peer_addr);
             }
         } // connection_pool lock released here
+
+        // Proactively establish new connection to the new address
+        // This prevents message failures while waiting for on-demand reconnection
+        if let Some(peer_id) = needs_reconnect {
+            info!(
+                peer_id = %peer_id,
+                new_addr = %new_addr,
+                "DNS refresh: proactively reconnecting to peer at new address"
+            );
+            if let Err(e) = self.connect_to_peer(&peer_id).await {
+                warn!(
+                    peer_id = %peer_id,
+                    new_addr = %new_addr,
+                    error = %e,
+                    "DNS refresh: failed to reconnect to peer, will retry on next message"
+                );
+            } else {
+                info!(
+                    peer_id = %peer_id,
+                    new_addr = %new_addr,
+                    "DNS refresh: successfully reconnected to peer at new address"
+                );
+            }
+        }
 
         // PHASE 3: Migrate DashMap-based state (lock-free, no deadlock risk)
         // Re-check peer existence to avoid reintroducing stale entries

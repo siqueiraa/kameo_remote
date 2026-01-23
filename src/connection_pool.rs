@@ -2090,7 +2090,7 @@ macro_rules! tell_msg {
 pub struct ConnectionPool {
     /// PRIMARY: Mapping Peer ID -> LockFreeConnection
     /// This is the main storage - we identify connections by peer ID, not address
-    connections_by_peer: dashmap::DashMap<crate::PeerId, Arc<LockFreeConnection>>,
+    pub connections_by_peer: dashmap::DashMap<crate::PeerId, Arc<LockFreeConnection>>,
     /// SECONDARY: Mapping SocketAddr -> Peer ID (for incoming connection identification)
     pub addr_to_peer_id: dashmap::DashMap<SocketAddr, crate::PeerId>,
     /// Configuration: Peer ID -> Expected SocketAddr (where to connect)
