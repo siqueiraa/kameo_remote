@@ -5054,6 +5054,7 @@ mod tests {
             failures: 0,
             last_attempt: 1000,
             last_success: 1000,
+            dns_name: None,
         };
         let peer2 = PeerInfoGossip {
             address: "127.0.0.1:8081".to_string(),
@@ -5062,6 +5063,7 @@ mod tests {
             failures: 2,
             last_attempt: 2000,
             last_success: 1500,
+            dns_name: None,
         };
 
         let msg = RegistryMessage::PeerListGossip {
@@ -5146,6 +5148,7 @@ mod tests {
                 failures: 0,
                 last_attempt: 1,
                 last_success: 1,
+                dns_name: None,
             },
             PeerInfoGossip {
                 address: "127.0.0.1:9002".to_string(),
@@ -5154,6 +5157,7 @@ mod tests {
                 failures: 0,
                 last_attempt: 1,
                 last_success: 1,
+                dns_name: None,
             },
         ];
 
@@ -5233,6 +5237,7 @@ mod tests {
             failures: 5,
             last_attempt: 5000,
             last_success: 4000,
+            dns_name: Some("my-service.default.svc.cluster.local:9000".to_string()),
         };
 
         // Serialize
@@ -5250,6 +5255,10 @@ mod tests {
         assert_eq!(deserialized.failures, 5);
         assert_eq!(deserialized.last_attempt, 5000);
         assert_eq!(deserialized.last_success, 4000);
+        assert_eq!(
+            deserialized.dns_name,
+            Some("my-service.default.svc.cluster.local:9000".to_string())
+        );
     }
 
     // Tests for resolve_peer_addr function

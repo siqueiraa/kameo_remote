@@ -260,7 +260,13 @@ impl GossipRegistryHandle {
         // Connection monitoring is now done in the gossip timer
         let monitor_handle = None;
 
-        info!(bind_addr = %actual_bind_addr, "TLS-enabled gossip registry started");
+        // Log startup with DNS gossip mode status
+        let dns_mode = config.advertise_dns.as_ref().map(|s| s.as_str()).unwrap_or("disabled");
+        info!(
+            bind_addr = %actual_bind_addr,
+            advertise_dns = dns_mode,
+            "TLS-enabled gossip registry started"
+        );
 
         Ok(Self {
             registry,
