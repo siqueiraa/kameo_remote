@@ -3257,6 +3257,11 @@ impl ConnectionHandle {
     /// waiting for a response. Used by kameo for large actor messages that exceed
     /// the streaming threshold.
     ///
+    /// NOTE: This method performs a single copy of the payload to convert it to Bytes,
+    /// then delegates to `ask_streaming_bytes()` which uses zero-copy chunking.
+    /// If you already have a Bytes buffer, use `ask_streaming_bytes()` directly
+    /// to avoid this copy.
+    ///
     /// # Arguments
     /// * `payload` - The message payload to stream
     /// * `type_hash` - The type hash for the message
@@ -3272,143 +3277,14 @@ impl ConnectionHandle {
         actor_id: u64,
         timeout: Duration,
     ) -> Result<bytes::Bytes> {
-        use crate::{current_timestamp_nanos, MessageType, StreamHeader};
-
-        const CHUNK_SIZE: usize = STREAM_CHUNK_SIZE;
-
-        // Allocate correlation ID for the response
-        let correlation_id = self.correlation.allocate();
-
-        // Acquire streaming mode atomically
-        while self
-            .stream_handle
-            .streaming_active
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            tokio::task::yield_now().await;
-        }
-
-        // Ensure we release streaming mode on exit
-        let _guard = StreamingGuard {
-            flag: self.stream_handle.streaming_active.clone(),
-        };
-
-        // Generate unique stream ID using nanoseconds to avoid collisions
-        // between concurrent streams from different peers
-        let stream_id = current_timestamp_nanos();
-
-        // Helper to serialize stream message with correlation ID for ask
-        fn serialize_stream_ask_message(
-            msg_type: MessageType,
-            header: &StreamHeader,
-            correlation_id: u16,
-        ) -> Vec<u8> {
-            // Message format: [length:4][type:1][correlation_id:2][reserved:9][header:36]
-            let inner_size = 12 + StreamHeader::SERIALIZED_SIZE;
-            let mut message = Vec::with_capacity(4 + inner_size);
-
-            // Length prefix
-            message.extend_from_slice(&(inner_size as u32).to_be_bytes());
-
-            // Header with correlation ID
-            message.push(msg_type as u8);
-            message.extend_from_slice(&correlation_id.to_be_bytes());
-            message.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0]); // 9 reserved bytes
-            message.extend_from_slice(&header.to_bytes());
-            message
-        }
-
-        // Send StreamStart header with correlation ID
-        let start_header = StreamHeader {
-            stream_id,
-            total_size: payload.len() as u64,
-            chunk_size: 0,
-            chunk_index: 0,
+        // Delegate to zero-copy implementation with a single copy at the entry point
+        self.ask_streaming_bytes(
+            bytes::Bytes::copy_from_slice(payload),
             type_hash,
             actor_id,
-        };
-
-        let start_msg =
-            serialize_stream_ask_message(MessageType::StreamStart, &start_header, correlation_id);
-        if self
-            .stream_handle
-            .streaming_tx
-            .send(StreamingCommand::WriteBytes(start_msg.into()))
-            .is_err()
-        {
-            self.correlation.cancel(correlation_id);
-            return Err(GossipError::Shutdown);
-        }
-
-        // Stream chunks directly
-        for (idx, chunk) in payload.chunks(CHUNK_SIZE).enumerate() {
-            let data_header = StreamHeader {
-                stream_id,
-                total_size: payload.len() as u64,
-                chunk_size: chunk.len() as u32,
-                chunk_index: idx as u32,
-                type_hash,
-                actor_id,
-            };
-
-            // Message format: [length:4][type:1][correlation_id:2][reserved:9][header:36][chunk_data:N]
-            let inner_size = 12 + StreamHeader::SERIALIZED_SIZE + chunk.len();
-            let mut chunk_msg = Vec::with_capacity(4 + inner_size);
-
-            // Length prefix
-            chunk_msg.extend_from_slice(&(inner_size as u32).to_be_bytes());
-
-            // Header with correlation ID
-            chunk_msg.push(MessageType::StreamData as u8);
-            chunk_msg.extend_from_slice(&correlation_id.to_be_bytes());
-            chunk_msg.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0]); // 9 reserved bytes
-            chunk_msg.extend_from_slice(&data_header.to_bytes());
-
-            // Chunk data
-            chunk_msg.extend_from_slice(chunk);
-
-            if self
-                .stream_handle
-                .streaming_tx
-                .send(StreamingCommand::WriteBytes(chunk_msg.into()))
-                .is_err()
-            {
-                self.correlation.cancel(correlation_id);
-                return Err(GossipError::Shutdown);
-            }
-
-            // Yield periodically to prevent blocking
-            if idx % 10 == 0 {
-                let _ = self.stream_handle.streaming_tx.send(StreamingCommand::Flush);
-                tokio::task::yield_now().await;
-            }
-        }
-
-        // Send StreamEnd with correlation ID
-        let end_msg =
-            serialize_stream_ask_message(MessageType::StreamEnd, &start_header, correlation_id);
-        if self
-            .stream_handle
-            .streaming_tx
-            .send(StreamingCommand::WriteBytes(end_msg.into()))
-            .is_err()
-        {
-            self.correlation.cancel(correlation_id);
-            return Err(GossipError::Shutdown);
-        }
-        let _ = self.stream_handle.streaming_tx.send(StreamingCommand::Flush);
-
-        debug!(
-            "✅ STREAMING ASK: Streamed {} bytes in {} chunks, waiting for response",
-            payload.len(),
-            payload.len().div_ceil(CHUNK_SIZE)
-        );
-
-        // Wait for response
-        self.correlation
-            .wait_for_response(correlation_id, timeout)
-            .await
+            timeout,
+        )
+        .await
     }
 
     /// Zero-copy streaming ask that takes Bytes directly.
