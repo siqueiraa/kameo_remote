@@ -14,55 +14,49 @@ pub struct ReplyTo {
 }
 
 impl ReplyTo {
-    /// Send reply back to the original requester
+    /// Send reply back to the original requester.
+    ///
+    /// This method automatically uses streaming for large responses (>1MB),
+    /// preventing ring buffer overflow. For small responses, it uses the
+    /// efficient ring buffer path.
     pub async fn reply(self, response: &[u8]) -> Result<()> {
-        let result = self
-            .connection
-            .send_response_bytes(self.correlation_id, Bytes::copy_from_slice(response))
-            .await;
-
-        match &result {
-            Ok(_) => tracing::info!("ReplyTo::reply: successfully sent response"),
-            Err(e) => tracing::error!("ReplyTo::reply: failed to send response: {}", e),
-        }
-
-        result
-    }
-
-    /// Reply using owned bytes without copying the payload.
-    pub async fn reply_bytes(self, response: Bytes) -> Result<()> {
-        self.connection
-            .send_response_bytes(self.correlation_id, response)
-            .await
-    }
-
-    /// Reply with automatic streaming for large responses.
-    ///
-    /// This method automatically uses streaming for responses that exceed
-    /// the connection's streaming threshold, preventing ring buffer overflow
-    /// for large replies. For small responses, it uses the efficient ring buffer path.
-    ///
-    /// Use this method when the response might be large (e.g., query results,
-    /// large state snapshots, or any response that could exceed 1MB).
-    pub async fn reply_auto(self, response: &[u8]) -> Result<()> {
         let result = self
             .connection
             .send_response_auto(self.correlation_id, response)
             .await;
 
         match &result {
-            Ok(_) => tracing::info!(
-                "ReplyTo::reply_auto: successfully sent response ({} bytes)",
+            Ok(_) => tracing::debug!(
+                "ReplyTo::reply: successfully sent response ({} bytes)",
                 response.len()
             ),
             Err(e) => tracing::error!(
-                "ReplyTo::reply_auto: failed to send response ({} bytes): {}",
+                "ReplyTo::reply: failed to send response ({} bytes): {}",
                 response.len(),
                 e
             ),
         }
 
         result
+    }
+
+    /// Reply using owned bytes with automatic streaming for large responses.
+    ///
+    /// This uses zero-copy streaming for responses exceeding the threshold,
+    /// avoiding payload copies entirely.
+    pub async fn reply_bytes(self, response: Bytes) -> Result<()> {
+        self.connection
+            .send_response_auto_bytes(self.correlation_id, response)
+            .await
+    }
+
+    /// Reply with automatic streaming for large responses (legacy alias).
+    ///
+    /// NOTE: This is now equivalent to `reply()` since all reply methods
+    /// automatically use streaming when needed.
+    #[deprecated(since = "0.2.0", note = "Use reply() instead - it now auto-streams")]
+    pub async fn reply_auto(self, response: &[u8]) -> Result<()> {
+        self.reply(response).await
     }
 
     /// Reply with a typed payload (rkyv) and debug-only type hash verification.
@@ -121,13 +115,13 @@ impl TimeoutReplyTo {
         self.inner.reply(response).await
     }
 
-    /// Reply with auto-streaming if not timed out.
-    /// Uses streaming for large responses (> threshold).
+    /// Reply with auto-streaming if not timed out (legacy alias).
+    ///
+    /// NOTE: This is now equivalent to `reply()` since all reply methods
+    /// automatically use streaming when needed.
+    #[deprecated(since = "0.2.0", note = "Use reply() instead - it now auto-streams")]
     pub async fn reply_auto(self, response: &[u8]) -> Result<()> {
-        if Instant::now() > self.deadline {
-            return Err(GossipError::Timeout);
-        }
-        self.inner.reply_auto(response).await
+        self.reply(response).await
     }
 
     /// Reply with a serializable type if not timed out
