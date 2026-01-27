@@ -1159,17 +1159,20 @@ where
                     if let Ok(Some((complete_data, corr_id))) =
                         streaming_state.add_chunk_with_correlation(stream_header, chunk_data)
                     {
-                        // Complete message assembled - route to actor
+                        // Complete message assembled - route to actor and send response
                         if let Some(handler) = &*registry.actor_message_handler.lock().await {
                             let actor_id_str = stream_header.actor_id.to_string();
-                            let _ = handler
+                            if let Ok(Some(response)) = handler
                                 .handle_actor_message(
                                     &actor_id_str,
                                     stream_header.type_hash,
                                     &complete_data,
                                     Some(corr_id),
                                 )
-                                .await;
+                                .await
+                            {
+                                send_streaming_response(&registry, peer_addr, corr_id, response).await;
+                            }
                         }
                     }
                 }
@@ -1294,17 +1297,20 @@ where
                         if let Ok(Some((complete_data, corr_id))) =
                             streaming_state.add_chunk_with_correlation(stream_header, chunk_data)
                         {
-                            // Complete message assembled - route to actor
+                            // Complete message assembled - route to actor and send response
                             if let Some(handler) = &*registry.actor_message_handler.lock().await {
                                 let actor_id_str = stream_header.actor_id.to_string();
-                                let _ = handler
+                                if let Ok(Some(response)) = handler
                                     .handle_actor_message(
                                         &actor_id_str,
                                         stream_header.type_hash,
                                         &complete_data,
                                         Some(corr_id),
                                     )
-                                    .await;
+                                    .await
+                                {
+                                    send_streaming_response(&registry, peer_addr, corr_id, response).await;
+                                }
                             }
                         }
                     }
@@ -1314,17 +1320,20 @@ where
                         if let Ok(Some((complete_data, corr_id))) =
                             streaming_state.finalize_stream_with_correlation(stream_header.stream_id)
                         {
-                            // Complete message assembled - route to actor
+                            // Complete message assembled - route to actor and send response
                             if let Some(handler) = &*registry.actor_message_handler.lock().await {
                                 let actor_id_str = stream_header.actor_id.to_string();
-                                let _ = handler
+                                if let Ok(Some(response)) = handler
                                     .handle_actor_message(
                                         &actor_id_str,
                                         stream_header.type_hash,
                                         &complete_data,
                                         Some(corr_id),
                                     )
-                                    .await;
+                                    .await
+                                {
+                                    send_streaming_response(&registry, peer_addr, corr_id, response).await;
+                                }
                             }
                         }
                     }
@@ -1438,6 +1447,46 @@ pub(crate) async fn handle_raw_ask_request(
             correlation_id = correlation_id,
             "Received raw Ask request - not supported"
         );
+    }
+}
+
+/// Send a response back to the peer for a streaming ask request.
+/// This is called after handle_actor_message returns with a response.
+pub(crate) async fn send_streaming_response(
+    registry: &Arc<GossipRegistry>,
+    peer_addr: SocketAddr,
+    correlation_id: u16,
+    response: Vec<u8>,
+) {
+    let conn = {
+        let pool = registry.connection_pool.lock().await;
+        pool.get_connection_by_addr(&peer_addr)
+    };
+
+    if let Some(conn) = conn {
+        if let Some(ref stream_handle) = conn.stream_handle {
+            let header = crate::framing::write_ask_response_header(
+                crate::MessageType::Response,
+                correlation_id,
+                response.len(),
+            );
+
+            if let Err(e) = stream_handle
+                .write_header_and_payload_control(
+                    bytes::Bytes::copy_from_slice(&header),
+                    bytes::Bytes::from(response),
+                )
+                .await
+            {
+                warn!(peer = %peer_addr, error = %e, correlation_id = correlation_id, "Failed to send streaming response");
+            } else {
+                debug!(peer = %peer_addr, correlation_id = correlation_id, "Sent streaming response");
+            }
+        } else {
+            warn!(peer = %peer_addr, correlation_id = correlation_id, "No stream handle for streaming response");
+        }
+    } else {
+        warn!(peer = %peer_addr, correlation_id = correlation_id, "No connection found for streaming response");
     }
 }
 
