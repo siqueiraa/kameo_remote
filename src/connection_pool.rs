@@ -890,14 +890,39 @@ impl LockFreeStreamHandle {
                         bytes_since_flush = 0;
                     }
                     StreamingCommand::VectoredWrite(cmd) => {
+                        // Handle short writes by falling back to sequential write_all
+                        // TCP can return partial writes under backpressure
+                        let total_len = cmd.header.len() + cmd.payload.len();
                         let header_slice = std::io::IoSlice::new(&cmd.header);
                         let payload_slice = std::io::IoSlice::new(&cmd.payload);
                         let bufs = &[header_slice, payload_slice];
 
                         match writer.write_vectored(bufs).await {
-                            Ok(n) => {
+                            Ok(n) if n == total_len => {
                                 bytes_written_counter.fetch_add(n, Ordering::Relaxed);
                                 total_bytes_written += n;
+                            }
+                            Ok(n) => {
+                                // Short write - write remaining bytes sequentially
+                                bytes_written_counter.fetch_add(n, Ordering::Relaxed);
+                                total_bytes_written += n;
+                                let mut remaining = total_len - n;
+                                let combined: Vec<u8> = cmd.header.iter().chain(cmd.payload.iter()).copied().collect();
+                                let mut offset = n;
+                                while remaining > 0 {
+                                    match writer.write(&combined[offset..]).await {
+                                        Ok(written) => {
+                                            bytes_written_counter.fetch_add(written, Ordering::Relaxed);
+                                            total_bytes_written += written;
+                                            offset += written;
+                                            remaining -= written;
+                                        }
+                                        Err(e) => {
+                                            error!("Vectored write completion error: {}", e);
+                                            return;
+                                        }
+                                    }
+                                }
                             }
                             Err(e) => {
                                 error!("Vectored write error: {}", e);
@@ -906,15 +931,39 @@ impl LockFreeStreamHandle {
                         }
                     }
                     StreamingCommand::OwnedChunks(chunks) => {
+                        // Handle short writes for owned chunks
+                        let total_len: usize = chunks.iter().map(|c| c.len()).sum();
                         let slices: Vec<std::io::IoSlice> = chunks
                             .iter()
                             .map(|chunk| std::io::IoSlice::new(chunk))
                             .collect();
 
                         match writer.write_vectored(&slices).await {
-                            Ok(n) => {
+                            Ok(n) if n == total_len => {
                                 bytes_written_counter.fetch_add(n, Ordering::Relaxed);
                                 total_bytes_written += n;
+                            }
+                            Ok(n) => {
+                                // Short write - write remaining bytes sequentially
+                                bytes_written_counter.fetch_add(n, Ordering::Relaxed);
+                                total_bytes_written += n;
+                                let combined: Vec<u8> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
+                                let mut remaining = total_len - n;
+                                let mut offset = n;
+                                while remaining > 0 {
+                                    match writer.write(&combined[offset..]).await {
+                                        Ok(written) => {
+                                            bytes_written_counter.fetch_add(written, Ordering::Relaxed);
+                                            total_bytes_written += written;
+                                            offset += written;
+                                            remaining -= written;
+                                        }
+                                        Err(e) => {
+                                            error!("Chunk batch write completion error: {}", e);
+                                            return;
+                                        }
+                                    }
+                                }
                             }
                             Err(e) => {
                                 error!("Chunk batch write error: {}", e);
@@ -1325,28 +1374,56 @@ impl LockFreeStreamHandle {
                                     last_flush = std::time::Instant::now();
                                 }
                                 StreamingCommand::VectoredWrite(cmd) => {
+                                    // Handle short writes with fallback to sequential write
+                                    let total_len = cmd.header.len() + cmd.payload.len();
                                     let header_slice = std::io::IoSlice::new(&cmd.header);
                                     let payload_slice = std::io::IoSlice::new(&cmd.payload);
                                     let bufs = &[header_slice, payload_slice];
-                                    if let Ok(n) = writer.write_vectored(bufs).await {
-                                        bytes_written_counter.fetch_add(n, Ordering::Relaxed);
-                                        bytes_since_flush += n;
-                                        last_flush = std::time::Instant::now();
-                                    } else {
-                                        return;
+                                    match writer.write_vectored(bufs).await {
+                                        Ok(n) if n == total_len => {
+                                            bytes_written_counter.fetch_add(n, Ordering::Relaxed);
+                                            bytes_since_flush += n;
+                                            last_flush = std::time::Instant::now();
+                                        }
+                                        Ok(n) => {
+                                            bytes_written_counter.fetch_add(n, Ordering::Relaxed);
+                                            bytes_since_flush += n;
+                                            let combined: Vec<u8> = cmd.header.iter().chain(cmd.payload.iter()).copied().collect();
+                                            if writer.write_all(&combined[n..]).await.is_err() {
+                                                return;
+                                            }
+                                            bytes_written_counter.fetch_add(total_len - n, Ordering::Relaxed);
+                                            bytes_since_flush += total_len - n;
+                                            last_flush = std::time::Instant::now();
+                                        }
+                                        Err(_) => return,
                                     }
                                 }
                                 StreamingCommand::OwnedChunks(chunks) => {
+                                    // Handle short writes with fallback
+                                    let total_len: usize = chunks.iter().map(|c| c.len()).sum();
                                     let slices: Vec<std::io::IoSlice> = chunks
                                         .iter()
                                         .map(|chunk| std::io::IoSlice::new(chunk))
                                         .collect();
-                                    if let Ok(n) = writer.write_vectored(&slices).await {
-                                        bytes_written_counter.fetch_add(n, Ordering::Relaxed);
-                                        bytes_since_flush += n;
-                                        last_flush = std::time::Instant::now();
-                                    } else {
-                                        return;
+                                    match writer.write_vectored(&slices).await {
+                                        Ok(n) if n == total_len => {
+                                            bytes_written_counter.fetch_add(n, Ordering::Relaxed);
+                                            bytes_since_flush += n;
+                                            last_flush = std::time::Instant::now();
+                                        }
+                                        Ok(n) => {
+                                            bytes_written_counter.fetch_add(n, Ordering::Relaxed);
+                                            bytes_since_flush += n;
+                                            let combined: Vec<u8> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
+                                            if writer.write_all(&combined[n..]).await.is_err() {
+                                                return;
+                                            }
+                                            bytes_written_counter.fetch_add(total_len - n, Ordering::Relaxed);
+                                            bytes_since_flush += total_len - n;
+                                            last_flush = std::time::Instant::now();
+                                        }
+                                        Err(_) => return,
                                     }
                                 }
                             }
@@ -1378,28 +1455,57 @@ impl LockFreeStreamHandle {
                                     last_flush = std::time::Instant::now();
                                 }
                                 StreamingCommand::VectoredWrite(cmd) => {
+                                    // Handle short writes with fallback
+                                    let total_len = cmd.header.len() + cmd.payload.len();
                                     let header_slice = std::io::IoSlice::new(&cmd.header);
                                     let payload_slice = std::io::IoSlice::new(&cmd.payload);
                                     let bufs = &[header_slice, payload_slice];
-                                    if let Ok(n) = writer.write_vectored(bufs).await {
-                                        bytes_written_counter.fetch_add(n, Ordering::Relaxed);
-                                        bytes_since_flush += n;
-                                        last_flush = std::time::Instant::now();
-                                    } else {
-                                        return;
+                                    match writer.write_vectored(bufs).await {
+                                        Ok(n) if n == total_len => {
+                                            bytes_written_counter.fetch_add(n, Ordering::Relaxed);
+                                            bytes_since_flush += n;
+                                            last_flush = std::time::Instant::now();
+                                        }
+                                        Ok(n) => {
+                                            bytes_written_counter.fetch_add(n, Ordering::Relaxed);
+                                            bytes_since_flush += n;
+                                            let combined: Vec<u8> = cmd.header.iter().chain(cmd.payload.iter()).copied().collect();
+                                            if writer.write_all(&combined[n..]).await.is_err() {
+                                                return;
+                                            }
+                                            bytes_written_counter.fetch_add(total_len - n, Ordering::Relaxed);
+                                            bytes_since_flush += total_len - n;
+                                            last_flush = std::time::Instant::now();
+                                        }
+                                        Err(_) => return,
                                     }
                                 }
                                 StreamingCommand::OwnedChunks(chunks) => {
+                                    // Handle short writes with fallback
+                                    let total_len: usize = chunks.iter().map(|c| c.len()).sum();
                                     let slices: Vec<std::io::IoSlice> = chunks
                                         .iter()
                                         .map(|chunk| std::io::IoSlice::new(chunk))
                                         .collect();
-                                    if let Ok(n) = writer.write_vectored(&slices).await {
-                                        bytes_written_counter.fetch_add(n, Ordering::Relaxed);
-                                        bytes_since_flush += n;
-                                        last_flush = std::time::Instant::now();
-                                    } else {
-                                        return;
+                                    match writer.write_vectored(&slices).await {
+                                        Ok(n) if n == total_len => {
+                                            bytes_written_counter.fetch_add(n, Ordering::Relaxed);
+                                            bytes_since_flush += n;
+                                            last_flush = std::time::Instant::now();
+                                        }
+                                        Ok(n) => {
+                                            // Short write - write remaining bytes sequentially
+                                            bytes_written_counter.fetch_add(n, Ordering::Relaxed);
+                                            bytes_since_flush += n;
+                                            let combined: Vec<u8> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
+                                            if writer.write_all(&combined[n..]).await.is_err() {
+                                                return;
+                                            }
+                                            bytes_written_counter.fetch_add(total_len - n, Ordering::Relaxed);
+                                            bytes_since_flush += total_len - n;
+                                            last_flush = std::time::Instant::now();
+                                        }
+                                        Err(_) => return,
                                     }
                                 }
                             }
