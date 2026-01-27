@@ -3429,6 +3429,35 @@ impl ConnectionHandle {
             .await
     }
 
+    /// Streaming ask that accepts a byte slice.
+    ///
+    /// NOTE: This performs one copy of the payload to convert to Bytes.
+    /// The chunking itself is zero-copy via Bytes::slice().
+    ///
+    /// # Arguments
+    /// * `payload` - The message payload as a byte slice (will be copied to Bytes)
+    /// * `type_hash` - The type hash for the message
+    /// * `actor_id` - The target actor ID
+    /// * `timeout` - How long to wait for a response
+    ///
+    /// # Returns
+    /// The response bytes from the actor
+    pub async fn ask_streaming(
+        &self,
+        payload: &[u8],
+        type_hash: u32,
+        actor_id: u64,
+        timeout: Duration,
+    ) -> Result<bytes::Bytes> {
+        self.ask_streaming_bytes(
+            bytes::Bytes::copy_from_slice(payload),
+            type_hash,
+            actor_id,
+            timeout,
+        )
+        .await
+    }
+
     /// Ask method that returns a ReplyTo handle for delegated replies
     pub async fn ask_with_reply_to(&self, request: &[u8]) -> Result<crate::ReplyTo> {
         // Allocate correlation ID
