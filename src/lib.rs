@@ -24,7 +24,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
-use tracing::error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub use config::GossipConfig;
